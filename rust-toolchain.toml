@@ -1,0 +1,5 @@
+# Zamčený toolchain — konkrétní verze, ne "stable" (stejný jako WinSent).
+[toolchain]
+channel = "1.97.0"
+targets = ["x86_64-pc-windows-msvc"]
+components = ["rustfmt", "clippy"]

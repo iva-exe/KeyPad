@@ -1,0 +1,56 @@
+[package]
+name = "installer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "KeyPadSetup.exe — instalace, aktualizace a odinstalace KeyPadu"
+
+# Jediný soubor, který se posílá kamarádovi. Stáhne aktuální KeyPad.exe
+# z repozitáře a nainstaluje ho do profilu uživatele (bez práv správce).
+# Druhé spuštění = aktualizace na to, co je v repu teď.
+#
+# Na rozdíl od WinSentu tu `test = false` NENÍ: manifest žádá
+# `asInvoker`, takže testovací binárka se spustí bez výzvy UAC (ve
+# WinSentu ji `requireAdministrator` shazoval chybou 740). Rozhodovací
+# logika (plán instalace, příkaz úklidu, stav okna) je čistá a testy má.
+[[bin]]
+name = "KeyPadSetup"
+path = "src/main.rs"
+
+[build-dependencies]
+winresource = { workspace = true }
+
+[dependencies]
+# Veškerá síť (commit, version.txt, KeyPad.exe) jde přes sdílený kanál
+# vydání — aplikace kontroluje verzi týmž kódem, takže se nemůže stát,
+# že by každá strana hledala vydání jinde.
+updater = { workspace = true }
+
+[dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    # RegCreateKeyExW má v podpisu SECURITY_ATTRIBUTES — bez téhle
+    # feature ho windows-rs vůbec nevygeneruje.
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+    "Win32_System_Threading",
+    # Výčet procesů: běžící KeyPad se hledá podle cesty k binárce,
+    # ne jen podle jména (viz proc.rs).
+    "Win32_System_Diagnostics_ToolHelp",
+    # Vlastní okno instalátoru (src/gui.rs) — kreslí se přes GDI,
+    # aby binárka zůstala malá a bez cizích knihoven. A slušné zavírání
+    # běžícího KeyPadu (src/proc.rs): EnumWindows najde jeho hlavní okno
+    # a PostMessageW mu pošle WM_CLOSE (taskkill bez /F ho minul).
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_UI_HiDpi",
+    # Enter/Esc v okně a zhasnutí zvýraznění po odjezdu myši.
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Console",
+]

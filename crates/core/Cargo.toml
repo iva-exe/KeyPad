@@ -1,0 +1,21 @@
+[package]
+# Balíček se jmenuje `core` (příkazy `cargo test -p core`), knihovna ale
+# `keypad_core`: crate pojmenovaný `core` by v závislých crates zastínil
+# vestavěný `::core` a rozbil makra, která na něj odkazují (serde derive,
+# format_args…). Viz CLAUDE.md, „Pravidla workspace".
+name = "core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "KeyPad — čistá logika: klávesy, akce, mapování, engine, stav gamepadu"
+
+[lib]
+name = "keypad_core"
+
+# ŽÁDNÉ `windows`, `vigem-client` ani `tauri` (princip 4, hlídá CI).
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

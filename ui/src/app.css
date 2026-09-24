@@ -1,0 +1,167 @@
+/* ═══ Designové tokeny — převzaté z WinSentu (jeho DESIGN.md) ═══
+ * KeyPad má vypadat jako sourozenec WinSentu: tmavý, klidný,
+ * tech-industriální. Tokeny jsou schválně 1:1 — kdo sáhne na barvu
+ * tady, má ji změnit i tam, jinak se dvě aplikace jednoho autora
+ * začnou rozcházet. Barvy natvrdo v komponentách nepatří nikam.
+ *
+ * Zásady v kostce: akcent čistě bílá, glow jen u významových barev,
+ * žádné glossy, gradient jen na zadním pozadí okna.
+ */
+
+:root {
+	/* povrchy — vrstvení jako Win11 */
+	--bg: #0e0f12;
+	/* Panely poloprůhledné — prosvítá blur okna (windowEffects). */
+	--panel: rgba(22, 23, 28, 0.6);
+	--surface: rgba(255, 255, 255, 0.04);
+	--surface-hover: rgba(255, 255, 255, 0.07);
+	--border: rgba(255, 255, 255, 0.08);
+	--border-strong: rgba(255, 255, 255, 0.16);
+
+	/* text */
+	--text: #ececef;
+	--text-dim: #9a9aa1;
+	--text-faint: #5c5c63;
+
+	/* akcent — čistě bílá, střídmě */
+	--accent: #ffffff;
+
+	/* Funkční barvy — výhradně podle významu. Zelená jen tam, kde
+	   něco opravdu běží: tečka stavu padu smí zezelenat teprve ve
+	   chvíli, kdy virtuální ovladač skutečně existuje. */
+	--ok: #4ade80;
+	--danger: #ef4444;
+	--warn: #f59e0b;
+
+	/* glow — jen významové barvy a akcent */
+	--glow-ok: 0 0 8px color-mix(in srgb, var(--ok) 55%, transparent);
+	--glow-danger: 0 0 8px color-mix(in srgb, var(--danger) 55%, transparent);
+	--glow-warn: 0 0 8px color-mix(in srgb, var(--warn) 55%, transparent);
+
+	/* geometrie */
+	--radius-sm: 4px;
+	--radius: 6px;
+	--radius-lg: 10px;
+
+	/* typografie */
+	--font-ui: 'Space Grotesk', 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
+	--font-mono: 'Fira Mono', 'Cascadia Mono', 'Consolas', monospace;
+
+	/* Stupnice tělového textu — stejná jako ve WinSentu, ať se dá
+	   ladit čitelnost na jednom místě a ne v každé komponentě. */
+	--fs-3xs: 0.66rem;
+	--fs-2xs: 0.72rem;
+	--fs-xs: 0.78rem;
+	--fs-sm: 0.84rem;
+	--fs-md: 0.88rem;
+	--fs-lg: 0.92rem;
+	--fs-xl: 0.98rem;
+	--fs-2xl: 1.05rem;
+
+	/* Pohyb: jen krátké ease-out přechody (hover, objevení prvku).
+	   Delší animace by u nástroje, na který se kouká mezi dvěma
+	   tahy ve hře, působily líně. */
+	--ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+	--t-fast: 130ms;
+}
+
+* {
+	box-sizing: border-box;
+}
+
+html,
+body {
+	margin: 0;
+	height: 100%;
+	overflow: hidden;
+	/* Okno je průhledné (blur dělá Windows) — barvu dává až kořenový
+	   kontejner aplikace. Kdyby ji měl body, blur by nebyl vidět. */
+	background: transparent;
+	color: var(--text);
+	font-family: var(--font-ui);
+	font-size: 16px;
+	line-height: 1.45;
+	-webkit-font-smoothing: antialiased;
+	/* Nástroj, ne dokument: výběr textu tažením by se pletl s tažením
+	   okna za titulek. */
+	user-select: none;
+	cursor: default;
+}
+
+/* Pozadí nese #app, ne komponenta: #app je v index.html od první
+   milisekundy, takže okno je tmavé hned, i když se Svelte ještě
+   nepřipojil (čeká na písma, viz main.ts). Poloprůhledné, ať prosvítá
+   blur okna — jediný povolený gradient je tahle zadní plocha. */
+#app {
+	height: 100%;
+	background: radial-gradient(
+		120% 90% at 20% 0%,
+		rgba(20, 21, 26, 0.85) 0%,
+		rgba(14, 15, 18, 0.82) 55%,
+		rgba(11, 12, 15, 0.87) 100%
+	);
+}
+
+button {
+	font: inherit;
+	color: inherit;
+}
+
+/* Fokus z klávesnice musí být vidět (Tab přes tlačítka), ale klik
+   myší rámeček kreslit nemá — proto :focus-visible, ne :focus. */
+:focus-visible {
+	outline: 1px solid var(--border-strong);
+	outline-offset: 2px;
+}
+
+/* ── industrial utility ── */
+
+/* technický popisek: mono, uppercase, prostrkané */
+.label-tech {
+	font-family: var(--font-mono);
+	font-size: var(--fs-2xs);
+	text-transform: uppercase;
+	letter-spacing: 0.08em;
+	color: var(--text-faint);
+}
+
+/* tečkovaná dělicí linka */
+.rule-dotted {
+	border: 0;
+	border-top: 1px dotted var(--border-strong);
+	margin: 0;
+}
+
+/* datové hodnoty */
+.value-mono {
+	font-family: var(--font-mono);
+	font-variant-numeric: tabular-nums;
+}
+
+/* ── scrollbar (Win11 decentní) ── */
+::-webkit-scrollbar {
+	width: 10px;
+	height: 10px;
+}
+::-webkit-scrollbar-thumb {
+	background: rgba(255, 255, 255, 0.14);
+	border-radius: 5px;
+	border: 3px solid transparent;
+	background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+	background-color: rgba(255, 255, 255, 0.22);
+}
+::-webkit-scrollbar-track {
+	background: transparent;
+}
+
+/* CSS přechody vypne tohle pravidlo. Přechody Svelte (transition:)
+   jedou přes Web Animations API, na které CSS nedosáhne — ty hlídá
+   lib/motion.ts. */
+@media (prefers-reduced-motion: reduce) {
+	* {
+		transition: none !important;
+		animation: none !important;
+	}
+}

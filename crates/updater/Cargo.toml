@@ -1,0 +1,16 @@
+[package]
+name = "updater"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "KeyPad — kanál vydání na GitHubu (WinHttp) a cesty instalace; sdílí ho instalátor i aplikace"
+
+# Stahování jde přes WinHttp (součást Windows) — žádná TLS knihovna
+# navíc, žádné vlastní úložiště certifikátů, menší binárky.
+[dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinHttp",
+]

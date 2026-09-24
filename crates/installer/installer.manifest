@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="KeyPad.Setup" version="1.0.0.0" />
+  <!-- KeyPad se instaluje do profilu uživatele (%LOCALAPPDATA%\Programs)
+       a zapisuje jen do HKCU, takže práva správce nepotřebuje nikdy
+       (princip: žádný admin). `asInvoker` to říká Windows výslovně.
+
+       Výslovný requestedExecutionLevel má i druhý důvod: soubor se
+       jmenuje „…Setup.exe" a Windows u 32bitových programů BEZ tohoto
+       záznamu hádají podle jména, že jde o instalátor, a samy si řeknou
+       o UAC (Installer Detection). Dnešní build je 64bitový, ale manifest
+       to hádání vypíná tak jako tak — pojistka pro případný x86 build. -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <!-- Okno se kreslí ručně podle DPI (GetDpiForWindow), takže se
+       hlásíme jako per-monitor aware. Bez tohohle by Windows okno
+       roztáhly bitmapově a text by byl rozmazaný. -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">permonitorv2</dpiAwareness>
+    </windowsSettings>
+  </application>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 a 11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" />
+    </application>
+  </compatibility>
+</assembly>

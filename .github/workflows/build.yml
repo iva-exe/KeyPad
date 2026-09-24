@@ -1,0 +1,154 @@
+# CI: brány kvality + release build obou .exe na čistém Windows runneru.
+#
+# Kroky kopírují tools\check.ps1 a kroky 1–5 tools\publish.ps1 (brány,
+# build aplikace a instalátoru, frontend v binárce, importy), aby
+# „prošlo u mě" a „prošlo v CI" znamenalo totéž. Z publish.ps1 tu
+# chybí jen kontrola gitu a zápis a push release/. Navíc tady běží
+# strážce izolace crates/core a všude --locked.
+name: build
+
+on:
+  push:
+    # Commit vydání (tools\publish.ps1) mění jen release/ — binárky
+    # postavené z kódu, který už na GitHubu je: publish.ps1 odmítne
+    # vydávat necommitnutý nebo nepushnutý zdroj, takže ho CI dostalo
+    # dřív. Stavět ho znovu by jen pálilo minuty. Když se v jednom
+    # pushi sejde kód i vydání, CI poběží normálně (rozhoduje součet
+    # změn celého pushe).
+    paths-ignore:
+      - 'release/**'
+  workflow_dispatch:
+
+# Nový push do stejné větve zruší rozběhnutý build — výsledek starého
+# commitu už nikoho nezajímá.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Stejný toolchain jako rust-toolchain.toml (a jako WinSent).
+      # Konkrétní verze, ne "stable": nový clippy umí přidat lint
+      # a CI by zčervenalo bez jediné změny v kódu.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.0
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+
+      # Cache target/ a registru: studený build Tauri trvá mnohem déle
+      # než ten s cache. Klíčem je Cargo.lock, takže změna závislostí
+      # cache sama zneplatní.
+      - uses: Swatinem/rust-cache@v2
+
+      # Verze bunu stejná jako u vývojáře — jiná major verze může
+      # zapisovat bun.lock jinak a --frozen-lockfile by pak selhal.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.20
+
+      # --frozen-lockfile: přesně verze z ui/bun.lock. Když lockfile
+      # neodpovídá package.json, je to chyba (zapomenutý commit), ne
+      # důvod tiše instalovat něco jiného.
+      - name: bun install
+        working-directory: ui
+        run: bun install --frozen-lockfile
+
+      - name: svelte-check
+        working-directory: ui
+        run: bun run check
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      # --locked: přesně verze z Cargo.lock, žádný drift. Neaktuální
+      # Cargo.lock tady spadne, místo aby se tiše přepsal.
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --locked
+
+      # Princip 4 (ROADMAP.md): crates/core je čistá logika bez Windows
+      # API — jen tak jde engine testovat bez hooku a bez ViGEmu.
+      # Hlídá se strom normálních závislostí (-e normal): proptest
+      # v dev-dependencies je v pořádku, windows/winapi/vigem/tauri
+      # kdekoli v produkčním stromu ne — ani tranzitivně. winapi zvlášť:
+      # je to starší, samostatná sada bindingů Windows API, kterou
+      # „windows" v regexu nechytí.
+      - name: izolace crates/core
+        shell: pwsh
+        run: |
+          [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+          $tree = cargo tree -p core -e normal --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $bad = $tree | Select-String -Pattern '\b(windows|winapi|vigem|tauri)[\w-]* v\d'
+          if ($bad) {
+            $bad | ForEach-Object { Write-Host $_.Line }
+            Write-Output "::error title=Izolace core::crates/core závisí na windows / winapi / vigem / tauri. Porušuje to princip 4 v ROADMAP.md: čistá logika nesmí záviset na Windows API ani na GUI."
+            exit 1
+          }
+          Write-Host "crates/core je izolovaný — OK"
+
+      # Aplikace jen přes Tauri CLI: holý `cargo build` by do binárky
+      # vestavěl jen adresu vývojového serveru místo frontendu (viz
+      # komentář v tools\publish.ps1). CLI samo pustí vite build.
+      # Argumenty za `--` předá CLI cargu (`tauri build --help`: „[ARGS]
+      # … passed to the runner"), takže i tady platí --locked. Ověřeno
+      # s CLI 2.11.5: cargo dostane `build --locked --bins --features
+      # tauri/custom-protocol --release`.
+      # Skripty z tools\ běží jako samostatný proces (-File), stejně jako
+      # z publish.ps1 — jejich `exit` a Set-Location se nepletou do kroku.
+      - name: build aplikace (Tauri)
+        shell: pwsh
+        run: pwsh -NoProfile -File tools/tauri.ps1 build --no-bundle -- --locked
+
+      - name: build instalátoru
+        run: cargo build --release --locked -p installer
+
+      # Krok 4/7 z publish.ps1 (Test-EmbeddedFrontend), stejné hledání:
+      # klíče assetů z Vite („assets/index-…") leží v binárce jako
+      # obyčejné řetězce, jen když ji postavilo Tauri CLI. Bez nich by
+      # artefakt ukázal „localhost se odmítl připojit". Latin-1 převede
+      # bajty na znaky 1:1, takže hledání v textu = hledání v bajtech.
+      - name: frontend vestavěný v KeyPad.exe
+        shell: pwsh
+        run: |
+          $bytes = [IO.File]::ReadAllBytes('target/release/KeyPad.exe')
+          $text = [Text.Encoding]::GetEncoding(28591).GetString($bytes)
+          if ($text.IndexOf('assets/index-', [StringComparison]::Ordinal) -lt 0) {
+            Write-Output "::error title=Frontend chybí::KeyPad.exe neobsahuje soubory frontendu — aplikace se musí stavět přes tools/tauri.ps1 build, ne přes cargo build -p keypad."
+            exit 1
+          }
+          Write-Host "KeyPad.exe obsahuje vestavěný frontend — OK"
+
+      # Runner má Visual Studio, takže chybějící VCRUNTIME140.dll by se
+      # tu při spuštění neprojevila — stejně jako na vývojářském PC.
+      # Rozhoduje importní tabulka, ne to, že binárka tady naběhne.
+      # -RequireDependentLoadFlag: obě .exe musí mít /DEPENDENTLOADFLAG:0x800
+      # (statické importy jen ze System32). Bez něj by si KeyPadSetup.exe
+      # spuštěný ze Stažených souborů načetl podvrženou dwmapi.dll nebo
+      # winhttp.dll ze stejné složky — nejsou mezi KnownDLLs. Podrobnosti
+      # v tools\check-imports.ps1.
+      - name: kontrola importů
+        shell: pwsh
+        run: pwsh -NoProfile -File tools/check-imports.ps1 -RequireDependentLoadFlag target/release/KeyPad.exe target/release/KeyPadSetup.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KeyPad-${{ github.sha }}
+          path: |
+            target/release/KeyPad.exe
+            target/release/KeyPadSetup.exe
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,38 @@
+[package]
+name = "keypad"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "KeyPad — klávesnice jako virtuální Xbox ovladač (Tauri 2)"
+
+[[bin]]
+name = "KeyPad"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { workspace = true }
+
+[dependencies]
+keypad-core = { workspace = true }
+updater = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+crossbeam-channel = { workspace = true }
+tauri = { workspace = true }
+# Druhé spuštění nevyrobí další proces — jen ukáže okno toho běžícího.
+tauri-plugin-single-instance = { workspace = true }
+
+# Win32 zatím jen pro okno a drobnosti kolem něj: zaoblené rohy a tmavý
+# rámeček (DWM), místní čas do logu (Time) a hláška, když se aplikace
+# nespustí (MessageBox — release nemá konzoli). Hook, ViGEm a zbytek
+# přibydou ve Fázi 2+ (platform/windows).
+[dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_System_Time",
+    "Win32_UI_WindowsAndMessaging",
+]

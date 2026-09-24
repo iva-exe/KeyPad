@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Oprávnění hlavního okna — výčtem, ne core:default (to by frontendu otevřelo ~70 příkazů: menu, tray, cesty, události…). Jen to, co vlastní titulek opravdu potřebuje: minimalizovat, zavřít a tahat za titulek. internal-toggle-maximize volá Tauri samo při dvojkliku na titulek; okno maximalizaci nemá (maximizable false), příkaz tedy nic neudělá, ale bez oprávnění by každý dvojklik skončil chybou v konzoli. Vždy navrchu je tu dopředu pro kompaktní režim (Fáze 4). Vlastní příkazy aplikace (app_info, check_update…) oprávnění nepotřebují. Až GUI začne poslouchat události z backendu (Fáze 2+), přibude core:event:allow-listen a core:event:allow-unlisten.",
+  "windows": ["main"],
+  "permissions": [
+    "core:window:allow-minimize",
+    "core:window:allow-close",
+    "core:window:allow-start-dragging",
+    "core:window:allow-internal-toggle-maximize",
+    "core:window:allow-set-always-on-top"
+  ]
+}

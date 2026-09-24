@@ -1,0 +1,51 @@
+# KeyPad — Cargo workspace.
+#
+# Tvrdé pravidlo závislostí: crates/core je čistá logika a NESMÍ záviset
+# na `windows`, `vigem-client` ani `tauri` (hlídá CI, viz build.yml).
+[workspace]
+resolver = "2"
+members = [
+    # čistá logika: KeyId, Action, Mapping, Engine, PadState
+    "crates/core",
+    # stahování z GitHubu (WinHttp) — sdílí instalátor i aplikace
+    "crates/updater",
+    # KeyPadSetup.exe — instalace a aktualizace
+    "crates/installer",
+    # aplikace (Tauri 2), frontend žije v ui/
+    "src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+
+[workspace.dependencies]
+# interní
+keypad-core = { package = "core", path = "crates/core" }
+updater = { path = "crates/updater" }
+
+# externí — verze zamčené přes Cargo.lock, tady jen semver rozsahy
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+crossbeam-channel = "0.5"
+windows = "0.61"
+tauri = "2"
+tauri-build = "2"
+tauri-plugin-single-instance = "2"
+winresource = "0.1"
+proptest = "1"
+
+[profile.dev]
+# Plné ladicí symboly dělají z target/ desítky GB (windows-rs); řádkové
+# tabulky stačí na čitelné backtraces v logu.
+debug = "line-tables-only"
+
+[profile.release]
+lto = "thin"
+# panic ZŮSTÁVÁ "unwind" (výchozí) — schválně NE "abort" jako ve WinSentu.
+# Hook callback (Fáze 3) běží v catch_unwind: panika v něm se musí dát
+# chytit, klávesa propustit a režim přepnout na Klávesnici (princip 1).
+# S panic=abort by panika shodila proces dřív, než by se to stihlo.

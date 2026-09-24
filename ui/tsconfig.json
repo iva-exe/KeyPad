@@ -1,0 +1,18 @@
+{
+	"extends": "@tsconfig/svelte/tsconfig.json",
+	"compilerOptions": {
+		"target": "ES2022",
+		"module": "ESNext",
+		"lib": ["ES2022", "DOM", "DOM.Iterable"],
+		"useDefineForClassFields": true,
+		"noEmit": true,
+		"allowJs": true,
+		"checkJs": true,
+		"isolatedModules": true,
+		"moduleDetection": "force",
+		"noUnusedLocals": true,
+		"noUnusedParameters": true,
+		"noFallthroughCasesInSwitch": true
+	},
+	"include": ["src/**/*.ts", "src/**/*.svelte", "vite.config.ts", "svelte.config.js"]
+}

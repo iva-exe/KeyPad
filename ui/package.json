@@ -1,0 +1,26 @@
+{
+  "name": "keypad-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "check": "svelte-check --tsconfig ./tsconfig.json"
+  },
+  "dependencies": {
+    "@fontsource/fira-mono": "^5.2.7",
+    "@fontsource/space-grotesk": "^5.2.10",
+    "@tauri-apps/api": "^2.11.1",
+    "lucide-svelte": "^1.0.1"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^5.1.1",
+    "@tauri-apps/cli": "^2.11.4",
+    "@tsconfig/svelte": "^5.0.8",
+    "svelte": "^5.56.5",
+    "svelte-check": "^4.7.6",
+    "typescript": "^5.9.3",
+    "vite": "^6.4.3"
+  }
+}

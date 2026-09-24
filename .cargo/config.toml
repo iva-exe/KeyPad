@@ -1,0 +1,17 @@
+# Statické linkování CRT.
+#
+# Změřeno (README_CZ.md, „Závislosti binárky"): bez tohohle importuje
+# VCRUNTIME140.dll instalátor KeyPadSetup.exe a každý holý `cargo build`
+# aplikace. VCRUNTIME140.dll NENÍ součástí Windows — je z Visual C++
+# Redistributable, takže by se na čistém stroji nespustily.
+#
+# KeyPad.exe postavený přes `tauri build` by to zvládl i bez tohohle
+# řádku (tauri-build linkuje vcruntime staticky), ale jen když CLI
+# nastaví STATIC_VCRUNTIME a cache build skriptu se nepovede přechytračit.
+# Tady je to jistota pro všechny binárky za pár set kB u instalátoru.
+#
+# Hlídá to tools\check-imports.ps1 v publish.ps1 i v CI.
+# POZOR: jakákoli nastavená proměnná RUSTFLAGS (i prázdná) tenhle řádek
+# celý přebije.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

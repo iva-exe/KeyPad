@@ -1,0 +1,46 @@
+{
+  "$schema": "../ui/node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "KeyPad",
+  "version": "0.1.0",
+  "identifier": "cz.hexel.keypad",
+  "build": {
+    "beforeDevCommand": { "script": "bun run dev", "cwd": "../ui" },
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": { "script": "bun run build", "cwd": "../ui" },
+    "frontendDist": "../ui/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "KeyPad",
+        "width": 440,
+        "height": 620,
+        "minWidth": 380,
+        "minHeight": 480,
+        "center": true,
+        "preventOverflow": true,
+        "maximizable": false,
+        "decorations": false,
+        "shadow": false,
+        "transparent": true,
+        "windowEffects": {
+          "effects": ["blur"],
+          "color": "#0e0f1299"
+        }
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'"
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ]
+  }
+}
