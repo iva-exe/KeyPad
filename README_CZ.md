@@ -14,16 +14,20 @@ Mezi režimy **Klávesnice** a **Gamepad** se přepíná klávesou
 ovladače jen namapované klávesy (WASD, šipky…), všechno ostatní funguje
 dál normálně — Alt+Tab, Win, Alt+F4.
 
-> **Poctivě: tahle verze je zatím kostra.** Instalace, okno
-> a aktualizace fungují, samotný převod kláves na gamepad přibude
-> v dalších verzích. Nic nemusíš stahovat znovu — nové verze ti
-> KeyPad nabídne sám (viz [Aktualizace](#aktualizace)).
+> **Poctivě: tahle verze ještě klávesy nepřevádí.** Instalace, okno,
+> aktualizace a virtuální ovladač fungují (v okně ho vyzkoušíš tlačítkem
+> **Vyzkoušet páčku**), samotné přepínání kláves na gamepad přibude
+> v dalších verzích. Nic nemusíš stahovat znovu — nové verze ti KeyPad
+> nabídne sám (viz [Aktualizace](#aktualizace)).
 
 ## Co budeš potřebovat
 
-- Windows 10 nebo 11, 64bitové
+- Windows 10 (verze 1709 a novější, včetně LTSC) nebo Windows 11, 64bitové
+  — doporučeno Windows 10 22H2 nebo 11. Starší Windows 10 KeyPad spustí
+  taky, jen je Microsoft už nepodporuje pro WebView2 (viz níž).
 - **Microsoft Edge WebView2 Runtime** — skoro jistě už ho máš (viz níž)
-- **ViGEmBus** — ovladač, který vytváří virtuální gamepad (viz níž)
+- **ViGEmBus** — ovladač, který vytváří virtuální gamepad; když chybí,
+  **nainstaluje ho KeyPadSetup sám** (viz níž)
 
 ## Instalace
 
@@ -31,9 +35,13 @@ dál normálně — Alt+Tab, Win, Alt+F4.
    <https://github.com/iva-exe/KeyPad/raw/main/release/KeyPadSetup.exe>).
    Prohlížeč může varovat, že se soubor běžně nestahuje — zvol **Zachovat**.
 2. Spusť ho dvojklikem. Stáhne aktuální KeyPad a nainstaluje ho do tvého
-   profilu, do `%LOCALAPPDATA%\Programs\KeyPad`. **Nepotřebuje práva
-   správce** — žádné okno „Chcete povolit této aplikaci…“ nevyskočí.
-3. V nabídce Start přibude **KeyPad**. Instalátor ho na konci rovnou
+   profilu, do `%LOCALAPPDATA%\Programs\KeyPad`. KeyPad sám **práva
+   správce nepotřebuje nikdy**.
+3. Když ti chybí ovladač ViGEmBus, je v okně zaškrtnuté **„Nainstalovat
+   i ovladač ViGEmBus“**. Nech to zaškrtnuté a Windows se jednou zeptají
+   na povolení správce — to je jediné místo, kde ho kdy uvidíš (patří
+   oficiálnímu instalátoru ovladače, ne KeyPadu).
+4. V nabídce Start přibude **KeyPad**. Instalátor ho na konci rovnou
    spustí.
 
 ### „Systém Windows ochránil váš počítač“
@@ -60,15 +68,50 @@ Po jeho doinstalování spusť `KeyPadSetup.exe` znovu.
 ### ViGEmBus (nutné pro gamepad)
 
 Ovladač, díky kterému Windows (a Steam) vidí virtuální Xbox ovladač.
+Autor: Nefarius Software Solutions e.U., licence BSD-3-Clause
+(<https://github.com/nefarius/ViGEmBus>). Projekt už se dál nevyvíjí
+(je archivovaný), ale na Windows 10 i 11 funguje.
 
-1. Otevři <https://github.com/nefarius/ViGEmBus/releases>.
-2. U nejnovějšího vydání (nahoře, označené „Latest“) stáhni instalátor
-   `ViGEmBus_…_x64_x86_arm64.exe` a nainstaluj ho.
-3. Tohle je **jediné místo, kde Windows chtějí práva správce** — jde
-   o ovladač a instaluje se jen jednou.
+**Nemusíš nic stahovat sám.** Když ovladač chybí, KeyPadSetup nabídne
+jeho instalaci (zaškrtávátko v instalátoru, v aplikaci tlačítko
+**Nainstalovat ViGEmBus**). Co se přitom děje:
 
-Projekt ViGEmBus už se dál nevyvíjí (je archivovaný), ale na Windows 10
-i 11 funguje. Když ovladač chybí, instalátor KeyPadu na to upozorní.
+- stáhne se **oficiální** instalátor ViGEmBus 1.22.0 přímo z GitHubu
+  autora — vždycky přesně tentýž soubor; KeyPad ho před spuštěním
+  ověří otiskem SHA-256 a podpisem vydavatele, jinak ho nespustí;
+- Windows se zeptají na povolení správce (ukážou ověřeného vydavatele
+  „Nefarius Software Solutions e.U.“) — ovladač se bez toho nainstalovat
+  nedá;
+- po instalaci KeyPad ověří, že ovladač opravdu běží.
+
+Když je ViGEmBus nainstalovaný, ale neběží (čeká na restart, je vypnutý
+ve Správci zařízení…), KeyPad nic neinstaluje a jen poradí, co s tím.
+Odinstalace KeyPadu ViGEmBus **nechá** — může ho používat i jiný
+program; odebereš ho v Nastavení → Aplikace.
+
+Ruční cesta, kdyby cokoli selhalo: <https://github.com/nefarius/ViGEmBus/releases>
+→ nejnovější vydání → `ViGEmBus_…_x64_x86_arm64.exe`.
+
+## Okno a oznamovací oblast
+
+KeyPad sedí v oznamovací oblasti vedle hodin (jako WinSent). Zavřením
+okna se KeyPad **neukončí** — jen se schová a přestane zatěžovat
+počítač; virtuální ovladač zůstane připojený. Okno otevřeš kliknutím
+na ikonu, **ukončíš** ho pravým tlačítkem na ikoně → **Ukončit**.
+
+Při prvním spuštění na novém počítači chvíli trvá, než Windows
+virtuální ovladač nastaví („připojuji…“). Při každém startu KeyPadu
+Windows přehrají obvyklý zvuk připojení zařízení.
+
+Co ukazuje lišta okna:
+
+| Stav | Co to znamená |
+|---|---|
+| **gamepad připojen** (zelená, „hráč N“) | virtuální ovladač běží; **Vyzkoušet páčku** s ním krátce zakrouží — uvidíš to v `joy.cpl` (Win+R → `joy.cpl`) |
+| **připojuji…** | Windows ovladač nastavují (první spuštění), chvilku počkej |
+| **ViGEmBus chybí** | tlačítko **Nainstalovat ViGEmBus** (viz výš) |
+| **ovladač neběží** (jantarová) | ViGEmBus je nainstalovaný, ale nespustil se — KeyPad poradí proč (restart, vypnutý ve Správci zařízení…) |
+| **odpojeno** (kvůli spánku) | před uspáním počítače se virtuální ovladač odpojí (jinak hrozí modrá obrazovka — známá chyba ViGEmBus); po probuzení se připojí sám, jinak **Připojit znovu** |
 
 ## Aktualizace
 
@@ -97,6 +140,8 @@ udělej to předtím), data okna (WebView2, `%LOCALAPPDATA%\cz.hexel.keypad`)
 a instalátory stažené při aktualizacích (`%TEMP%\keypad-update`).
 **Tvoje nastavení (`config.toml`) nechá** — kdybys KeyPad instaloval
 znovu, mapování kláves tě počká. Když ho už nechceš, smaž ho ručně.
+**Ovladač ViGEmBus taky nechá** (může ho používat i jiný program);
+odebereš ho v Nastavení → Aplikace → „ViGEm Bus Driver“.
 
 ## Kde co leží
 
@@ -230,7 +275,14 @@ Skripty se spouštějí `powershell -ExecutionPolicy Bypass -File tools\…`.
 | `tools\check.ps1` | všechny brány: fmt, clippy, testy, svelte-check (`tools\check.ps1 clippy` = jen jedna) |
 | `tools\tauri.ps1 dev` | aplikace ve vývojovém režimu, UI se přenačítá za běhu |
 | `tools\publish.ps1` | vydání: kontrola gitu → brány → build → kontroly → `release\` → push |
-| `tools\check-imports.ps1 [-RequireDependentLoadFlag] <exe>` | nepotřebuje binárka DLL, která na čistém PC chybí? (a s přepínačem: hledá je jen v System32?) |
+| `tools\check-imports.ps1 [-RequireDependentLoadFlag] <exe>` | nepotřebuje binárka DLL, která na čistém PC chybí? Nevolá funkci novější než Windows 10 1507? (a s přepínačem: hledá DLL jen v System32?) |
+| `cargo run -p keypad --release --example pad_selftest -- vse` | virtuální pad bez okna: připojení, stav přes XInput, odpojení, pád procesu. Když je v popředí hra nebo celoobrazovková aplikace, nic nepřipojí (exit 3). |
+| `$env:KEYPAD_BEZ_VIGEM = "1"` | aplikace se chová, jako by ViGEmBus chyběl (`vypnuty` = nainstalovaný a vypnutý, `zbytek` = pozůstatek bez zařízení) — na PC, kde se pad objevit nemá |
+
+**Instalátor — režimy.** `KeyPadSetup.exe` (okno) · `/quiet`
+(z aplikace, nikdy neinstaluje ovladač) · `/headless` · `/uninstall`
+(`/uninstall /quiet` sám začne i skončí) · `/vigembus` (jen ovladač
+ViGEmBus; kód 0 = běží, 3010 = poběží po restartu, 1 = jinak).
 
 `tools\publish.ps1` vydává jen zdrojový kód, který je commitnutý
 a pushnutý na GitHub (necommitnuté změny i nepushnuté commity mimo

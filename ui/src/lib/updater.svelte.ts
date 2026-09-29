@@ -46,7 +46,7 @@ export async function checkUpdate(): Promise<void> {
 		updater.error = r.error ?? '';
 		// Nepovedená kontrola (výpadek sítě, GitHub) o verzi v repozitáři
 		// nic neříká — platí poslední známý stav. Jinak by banner při
-		// každém zakolísání Wi-Fi zajel a za minutu zase vyjel a vzal
+		// každém zakolísání Wi-Fi zajel a při další kontrole zase vyjel a vzal
 		// s sebou i chybu aktualizace, kterou uživatel zrovna čte.
 		if (!r.error) {
 			updater.latest = r.latest ?? '';
@@ -94,21 +94,39 @@ export async function runUpdate(): Promise<void> {
 }
 
 /**
- * Jak často se ptát repozitáře na novou verzi.
+ * Jak často se ptát repozitáře na novou verzi, když okno nikdo nevidí.
  *
- * Minuta stačí: `raw.githubusercontent.com` drží soubor v CDN cache
- * pět minut, takže častější dotaz by novou verzi stejně neviděl dřív.
- * A jeden malý soubor za minutu je proti tomu levný.
+ * Princip 10 (nečinná aplikace nic nedělá): KeyPad většinu času sedí
+ * v oznamovací oblasti, kde by kontrola každou minutu byla přes tisíc
+ * TLS spojení denně k ničemu. Půlhodina stačí; kdo okno otevře, dostane
+ * čerstvou kontrolu hned (viz `CERSTVOST_MS`).
  */
-const INTERVAL_MS = 60 * 1000;
+const INTERVAL_MS = 30 * 60 * 1000;
+
+/**
+ * Po návratu okna z oznamovací oblasti se kontroluje, jen když poslední
+ * kontrola je starší než tohle. `raw.githubusercontent.com` drží soubor
+ * v CDN cache pět minut — častější dotaz by novou verzi stejně neviděl.
+ */
+const CERSTVOST_MS = 5 * 60 * 1000;
 
 let timer: ReturnType<typeof setInterval> | undefined;
 
-/** Spustí kontrolu (idempotentní). Při startu hned, pak v intervalu. */
+/**
+ * Spustí kontrolu (idempotentní): hned při startu, pak každých 30 minut
+ * a navíc při každém ukázání okna, pokud je poslední kontrola starší
+ * než 5 minut. Schované okno má uspaný webview (`document.hidden`),
+ * ukázání pozná `visibilitychange`.
+ */
 export function startUpdateChecks(): void {
-	// V prohlížeči není backend — kontrola by jen každou minutu
-	// zapsala stejnou chybu.
+	// V prohlížeči není backend — kontrola by jen opakovaně zapsala
+	// stejnou chybu.
 	if (timer || !vAplikaci) return;
 	void checkUpdate();
 	timer = setInterval(() => void checkUpdate(), INTERVAL_MS);
+	document.addEventListener('visibilitychange', () => {
+		if (document.hidden) return;
+		const stari = updater.checkedAt === null ? Infinity : Date.now() - updater.checkedAt;
+		if (stari > CERSTVOST_MS) void checkUpdate();
+	});
 }

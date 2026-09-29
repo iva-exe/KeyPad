@@ -1,14 +1,41 @@
 <script lang="ts">
 	import Minus from 'lucide-svelte/icons/minus';
 	import X from 'lucide-svelte/icons/x';
+	import { pad } from './pad.svelte';
 	import { hlavniOkno } from './tauri';
 
-	// Stav padu zatím NEEXISTUJE — virtuální ovladač (ViGEm) přijde ve
-	// Fázi 2. Tečka proto svítí neutrálně a popisek říká „—", ne „OK":
-	// zelená bez skutečného ovladače by lhala (WinSent: zelená nikdy
-	// bez vynucení). Až bude pad, přijde sem stav z backendu (událost
-	// Tauri) a tečka dostane barvu podle významu.
-	const padPopis = 'Virtuální gamepad přijde v další fázi — zatím se nic nepřevádí';
+	// Tečka a popisek stavu virtuálního padu. Zelená jen tehdy, když
+	// ovladač opravdu existuje a přijal neutrál (WinSent: zelená nikdy
+	// bez skutečnosti); do té doby neutrální, u poruchy červená.
+	const popisek = $derived(
+		{
+			connecting: 'připojuji…',
+			connected: 'gamepad připojen',
+			bus_missing: 'ViGEmBus chybí',
+			bus_not_running: 'ovladač neběží',
+			error: 'chyba padu',
+			suspended: 'odpojeno'
+		}[pad.state]
+	);
+
+	const tooltip = $derived.by(() => {
+		switch (pad.state) {
+			case 'connected':
+				return pad.player
+					? `Virtuální ovladač Xbox 360 je připojený — hráč ${pad.player} (XInput)`
+					: 'Virtuální ovladač Xbox 360 je připojený';
+			case 'connecting':
+				return pad.detail || 'Připojuji virtuální ovladač Xbox 360…';
+			case 'bus_missing':
+				return 'Chybí ovladač ViGEmBus — bez něj virtuální gamepad nevznikne';
+			case 'bus_not_running':
+				return pad.detail || 'Ovladač ViGEmBus je nainstalovaný, ale neběží';
+			case 'error':
+				return pad.detail ? `Virtuální ovladač nefunguje: ${pad.detail}` : 'Virtuální ovladač nefunguje';
+			case 'suspended':
+				return 'Virtuální ovladač je odpojený kvůli spánku počítače';
+		}
+	});
 </script>
 
 <!-- „deep": táhne se za celý pruh včetně loga a stavu; tlačítka tažení
@@ -21,9 +48,9 @@
 		<span class="wordmark">KeyPad</span>
 	</div>
 
-	<div class="pad" title={padPopis}>
+	<div class="pad" data-stav={pad.state} title={tooltip}>
 		<span class="dot"></span>
-		<span class="pad-label">gamepad —</span>
+		<span class="pad-label">{popisek}</span>
 	</div>
 
 	<div class="win-controls">
@@ -35,10 +62,12 @@
 		>
 			<Minus size={17} strokeWidth={1.75} />
 		</button>
+		<!-- Zavření okno jen schová (backend, on_window_event): pad
+		     zůstává připojený. Ukončit jde z ikony v oznamovací oblasti. -->
 		<button
 			class="wc close"
-			title="Zavřít"
-			aria-label="Zavřít"
+			title="Zavřít — KeyPad poběží dál v oznamovací oblasti (ukončit jde z její nabídky)"
+			aria-label="Zavřít do oznamovací oblasti"
 			onclick={() => void hlavniOkno()?.close()}
 		>
 			<X size={18} strokeWidth={1.75} />
@@ -83,6 +112,38 @@
 		height: 7px;
 		border-radius: 50%;
 		background: var(--text-faint);
+		transition:
+			background var(--t-fast) var(--ease),
+			box-shadow var(--t-fast) var(--ease);
+	}
+	/* Připojování: jemné pulzování — je vidět, že se něco děje, ale
+	   nekřičí. „Omezit pohyb" ve Windows ho vypne (app.css). */
+	.pad[data-stav='connecting'] .dot {
+		background: var(--text-dim);
+		animation: pulz 1.6s ease-in-out infinite;
+	}
+	.pad[data-stav='connected'] .dot {
+		background: var(--ok);
+		box-shadow: var(--glow-ok);
+	}
+	.pad[data-stav='bus_missing'] .dot,
+	.pad[data-stav='error'] .dot {
+		background: var(--danger);
+		box-shadow: var(--glow-danger);
+	}
+	/* Nainstalovaný, ale neběžící ViGEmBus: úkol pro uživatele, ne porucha. */
+	.pad[data-stav='bus_not_running'] .dot {
+		background: var(--warn);
+		box-shadow: var(--glow-warn);
+	}
+	@keyframes pulz {
+		0%,
+		100% {
+			opacity: 0.35;
+		}
+		50% {
+			opacity: 1;
+		}
 	}
 	.pad-label {
 		font-family: var(--font-mono);
@@ -90,6 +151,15 @@
 		letter-spacing: 0.04em;
 		color: var(--text-dim);
 		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.pad[data-stav='bus_missing'] .pad-label,
+	.pad[data-stav='error'] .pad-label {
+		color: var(--danger);
+	}
+	.pad[data-stav='bus_not_running'] .pad-label {
+		color: var(--warn);
 	}
 	.win-controls {
 		margin-left: auto;

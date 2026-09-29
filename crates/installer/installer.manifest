@@ -2,8 +2,10 @@
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <assemblyIdentity type="win32" name="KeyPad.Setup" version="1.0.0.0" />
   <!-- KeyPad se instaluje do profilu uživatele (%LOCALAPPDATA%\Programs)
-       a zapisuje jen do HKCU, takže práva správce nepotřebuje nikdy
-       (princip: žádný admin). `asInvoker` to říká Windows výslovně.
+       a zapisuje jen do HKCU, takže instalátor sám práva správce
+       nepotřebuje nikdy. `asInvoker` to říká Windows výslovně. (Ovladač
+       ViGEmBus, když chybí, instaluje po kliknutí oficiální instalátor
+       Nefarius — s právy správce běží jen ten, výzvu ukazují Windows.)
 
        Výslovný requestedExecutionLevel má i druhý důvod: soubor se
        jmenuje „…Setup.exe" a Windows u 32bitových programů BEZ tohoto
@@ -17,13 +19,19 @@
       </requestedPrivileges>
     </security>
   </trustInfo>
-  <!-- Okno se kreslí ručně podle DPI (GetDpiForWindow), takže se
-       hlásíme jako per-monitor aware. Bez tohohle by Windows okno
-       roztáhly bitmapově a text by byl rozmazaný. -->
+  <!-- Okno se kreslí ručně podle DPI, takže se hlásíme jako
+       per-monitor aware. Bez tohohle by Windows okno roztáhly bitmapově
+       a text by byl rozmazaný.
+
+       Seznam v <dpiAwareness> je podle pořadí: PerMonitorV2 umí Windows 10
+       od 1703, 1607 ho nezná a vezme další položku (PerMonitor). 1507/1511
+       <dpiAwareness> vůbec nečtou a berou <dpiAware> true/pm (také
+       per-monitor). Bez „PerMonitor" v seznamu by 1607 skončil jako
+       DPI-unaware s rozmazaným oknem (princip 9: všechny buildy). -->
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
       <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
-      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">permonitorv2</dpiAwareness>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>
     </windowsSettings>
   </application>
   <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">

@@ -71,7 +71,22 @@ impl Drop for Handle {
 ///
 /// `progress` dostane počet dosud přenesených bajtů — instalátor podle
 /// toho kreslí ukazatel, ať uživatel nekouká na zamrzlé okno.
-pub fn get(host: &str, path: &str, mut progress: impl FnMut(usize)) -> Result<Vec<u8>, Error> {
+pub fn get(host: &str, path: &str, progress: impl FnMut(usize)) -> Result<Vec<u8>, Error> {
+    get_limited(host, path, usize::MAX, progress)
+}
+
+/// Jako [`get`], ale nejvýš `max` bajtů — víc se ani nezačne stahovat.
+///
+/// Pro soubory, jejichž přesnou velikost známe předem (instalátor
+/// ViGEmBus): cokoli většího není ten soubor a nemá smysl kvůli tomu
+/// plnit paměť. Přesměrování (github.com → CDN) WinHttp sleduje samo,
+/// jen ne z HTTPS na HTTP (výchozí politika).
+pub fn get_limited(
+    host: &str,
+    path: &str,
+    max: usize,
+    mut progress: impl FnMut(usize),
+) -> Result<Vec<u8>, Error> {
     let wagent = wide("KeyPadSetup");
     let whost = wide(host);
     let wpath = wide(path);
@@ -151,6 +166,10 @@ pub fn get(host: &str, path: &str, mut progress: impl FnMut(usize)) -> Result<Ve
             std::ptr::null_mut(),
         )
         .is_ok();
+        let too_big = |n: usize| Error::Read(format!("server posílá {n} B, čekáno nejvýš {max} B"));
+        if has_length && expected as usize > max {
+            return Err(too_big(expected as usize));
+        }
 
         let mut out = Vec::new();
         loop {
@@ -160,6 +179,9 @@ pub fn get(host: &str, path: &str, mut progress: impl FnMut(usize)) -> Result<Ve
             }
             if avail == 0 {
                 break;
+            }
+            if out.len().saturating_add(avail as usize) > max {
+                return Err(too_big(out.len().saturating_add(avail as usize)));
             }
             let start = out.len();
             out.resize(start + avail as usize, 0);

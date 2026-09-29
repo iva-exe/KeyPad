@@ -13,4 +13,11 @@ workspace = true
 features = [
     "Win32_Foundation",
     "Win32_Networking_WinHttp",
+    # SHA-256 přes CNG (bcrypt.dll) — ověření instalátoru ViGEmBus bez
+    # vlastní kryptografie a bez crate navíc (src/sha256.rs).
+    "Win32_Security_Cryptography",
+    # Stav ViGEmBus jen čtením: rozhraní a zařízení sběrnice (cfgmgr32),
+    # služba a záznam v Aplikacích (registr) — src/vigembus.rs.
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_System_Registry",
 ]

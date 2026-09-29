@@ -1,12 +1,17 @@
 ﻿# Kontrola, že binárka nepotřebuje DLL, která na čistém PC chybí,
-# a že si systémové DLL nenechá podstrčit ze své složky.
+# že si systémové DLL nenechá podstrčit ze své složky a že naběhne
+# na KAŽDÉM Windows 10 (od 1507) — žádný statický import funkce, kterou
+# starší build nemá.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\check-imports.ps1 target\release\KeyPad.exe target\release\KeyPadSetup.exe
 #   powershell -ExecutionPolicy Bypass -File tools\check-imports.ps1 -RequireDependentLoadFlag target\release\KeyPad.exe target\release\KeyPadSetup.exe
+#   powershell -ExecutionPolicy Bypass -File tools\check-imports.ps1 -ShowFunctions target\release\KeyPadSetup.exe
 #
-# Kód návratu: 0 = vše v pořádku, 1 = našla se problémová DLL (nebo
-# s -RequireDependentLoadFlag chybí příznak níž), 2 = soubor nejde
-# zkontrolovat (chybí, není to .exe, je poškozený).
+# Kód návratu: 0 = vše v pořádku, 1 = našel se problém (DLL, funkce,
+# sada API, zpožděný import, nebo s -RequireDependentLoadFlag chybí
+# příznak níž), 2 = soubor nejde zkontrolovat (chybí, není to .exe, je
+# poškozený). -ShowFunctions navíc vypíše všechny importované funkce
+# (na porovnání s `dumpbin /IMPORTS`).
 #
 # Proč to vůbec hlídat: chybějící DLL se na vývojářském PC neprojeví
 # NIKDY — Visual Studio, Windows SDK i každá druhá hra si do System32
@@ -15,30 +20,68 @@
 # VCRUNTIME140.dll" a z dálky se špatně ladí. Proto brána v publish.ps1
 # i v CI, ne jen jednorázové ruční ověření.
 #
+# Proč i jednotlivé FUNKCE (princip 9 — všechny buildy Windows 10 a 11):
+# DLL na starém buildu je, jen jí chybí novější funkce. Staticky
+# importovaná funkce, kterou build nemá, zastaví start programu hláškou
+# „Vstupní bod procedury … nebyl nalezen" dřív, než program stihne
+# cokoli říct (instalátor 0.1.0 tak neběžel na 1507/1511 kvůli
+# GetDpiForWindow z 1607). Kontroluje se:
+#  - kurátorský seznam funkcí novějších než Windows 10 1507 (DPI API
+#    z 1607+, SetThreadDescription, GetTempPath2W, VirtualAlloc2…),
+#  - sady API (api-ms-win-*): jen ty, o kterých víme, že je 10240 má.
+#    windows-rs (raw-dylib) umí funkci navázat na novou sadu potichu
+#    a tahle brána je jediné místo, kde se to ukáže,
+#  - žádné zpožděné načítání (delay-load, důvody níž).
+# Seznam funkcí není úplný (úplný by byl celý rozdíl SDK) — pokrývá, co
+# reálně hrozí z Rust std, windows-rs, Tauri a Win32 kódu KeyPadu. Nová
+# funkce se ověřuje v dokumentaci („Minimum supported client"); když je
+# novější než Windows 10 1507, patří na seznam a v kódu za GetProcAddress.
+#
 # Proč vlastní čtení PE a ne dumpbin: dumpbin je jen ve Visual Studiu,
 # jeho cesta se mění s každou verzí MSVC a jeho výstup je text určený
-# lidem. Seznam DLL je v PE na pevně daných místech a na jeho přečtení
-# stačí pár desítek řádků. Parser je ověřený proti `dumpbin /IMPORTS`
-# a `/DEPENDENTS` (binárky WinSentu, notepad.exe, mspaint.exe)
-# a `/LOADCONFIG` (x64 i x86 s příznakem 0x800, 0xA00 i bez něj,
+# lidem. Tabulky importů jsou v PE na pevně daných místech. Parser je
+# ověřený proti `dumpbin /IMPORTS` — seznamy DLL i funkcí (i zpožděných,
+# vázaných a podle ordinálu) sedí u binárek KeyPadu a WinSentu,
+# notepad.exe a mspaint.exe (x64 i x86), explorer.exe a mmc.exe —
+# a proti `/LOADCONFIG` (x64 i x86 s příznakem 0x800, 0xA00 i bez něj,
 # binárky WinSentu, System32, SysWOW64, git.exe bez load config).
 #
-# Proč i tabulka zpožděného načítání (delay-load): takovou DLL Windows
-# načte až při prvním volání funkce z ní. Program na čistém PC naběhne
-# a spadne až uprostřed práce — ještě horší než pád hned při startu.
+# Proč je zakázané zpožděné načítání (delay-load): takovou DLL Windows
+# načtou až při prvním volání funkce z ní — zavaděč ji při startu
+# nezkontroluje, takže chybějící DLL nebo funkce shodí program až
+# uprostřed práce (hůř než pád hned při startu) a tahle brána by ji
+# neviděla jako statický import. A načítá ji pomocná rutina linkeru, na
+# kterou se `/DEPENDENTLOADFLAG` spolehlivě nevztahuje. Na volitelné API
+# je správná cesta LoadLibraryExW(…, LOAD_LIBRARY_SEARCH_SYSTEM32)
+# + GetProcAddress s náhradou.
 #
 # Proč DependentLoadFlags (-RequireDependentLoadFlag, publish.ps1 i CI):
 # DLL ze statických importů hledá Windows NEJDŘÍV VE SLOŽCE S .EXE.
 # Výjimkou jsou jen KnownDLLs (kernel32, user32, shell32…), ty jdou
-# vždy ze System32 — dwmapi.dll a winhttp.dll, které importují obě
-# naše .exe, mezi nimi ale nejsou. KeyPadSetup.exe se spouští přímo ze Stažených souborů a tam umí prohlížeč uložit
-# soubor ze stránky bez ptaní (drive-by download). Podvržená dwmapi.dll
-# vedle instalátoru pak běží v našem procesu dřív než main(). Ověřeno
-# při review: podstrčená dwmapi.dll ukončila instalátor kódem 77.
-# KeyPad.exe jde stáhnout taky (release\KeyPad.exe na GitHubu).
-# Linker s /DEPENDENTLOADFLAG:0x800 (LOAD_LIBRARY_SEARCH_SYSTEM32) zapíše
-# do PE pokyn „statické importy jen ze System32" (Windows 10 1607+).
-# Za běhu volané LoadLibrary to neovlivní — ty musí cestu řešit samy.
+# vždy ze System32 — dwmapi.dll, winhttp.dll, wintrust.dll, crypt32.dll,
+# cfgmgr32.dll a bcrypt.dll, které naše .exe importují, mezi nimi ale
+# nejsou. KeyPadSetup.exe se spouští přímo ze Stažených souborů a tam
+# umí prohlížeč uložit soubor ze stránky bez ptaní (drive-by download).
+# Podvržená dwmapi.dll vedle instalátoru pak běží v našem procesu dřív
+# než main(). Ověřeno při review: podstrčená dwmapi.dll ukončila
+# instalátor kódem 77. KeyPad.exe jde stáhnout taky (release\KeyPad.exe
+# na GitHubu). Linker s /DEPENDENTLOADFLAG:0x800
+# (LOAD_LIBRARY_SEARCH_SYSTEM32) zapíše do PE pokyn „statické importy
+# jen ze System32" (Windows 10 1607+; 1507/1511 příznak neznají).
+#
+# Příznak ale chrání JEN statické importy samotného .exe. DLL načítané
+# za běhu — i ty, které si za běhu tahají samy systémové DLL — se hledají
+# postaru, nejdřív ve složce s .exe. Ověřeno při review podstrčenými
+# DLL: WinVerifyTrust načte CRYPTSP.dll a CRYPTBASE.dll,
+# SHGetKnownFolderPath profapi.dll a WinHttp přes HTTPS IPHLPAPI.DLL
+# ze Stažených, a to v instalátoru těsně před výzvou UAC pro ovladač.
+# To řeší volání SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)
+# jako úplně první příkaz main() — v KeyPadSetupu i v KeyPadu (s ním se
+# ani jedna z nich nenačetla). Volání v PE vidět není, jen import
+# funkce — skript proto u každé binárky vypíše, jestli
+# SetDefaultDllDirectories importuje. Je to jen informace, bránou to
+# není: import neříká, jestli se funkce opravdu volá a jestli hned na
+# začátku. To hlídá kód (komentář u main) a test podstrčených DLL.
 #
 # POZOR na kódování: soubor musí zůstat v UTF-8 s BOM (PowerShell 5.1).
 
@@ -48,6 +91,8 @@ param(
     # které by do hledání vrátily složku s .exe. Bez přepínače se
     # hodnota jen vypíše.
     [switch]$RequireDependentLoadFlag,
+    # Vypsat všechny importované funkce (kontrola parseru proti dumpbin).
+    [switch]$ShowFunctions,
     [Parameter(ValueFromRemainingArguments = $true)][string[]]$Path
 )
 
@@ -83,18 +128,19 @@ function Read-PeU32([byte[]]$Bytes, [long]$Offset) {
 function Read-PeU64([byte[]]$Bytes, [long]$Offset) {
     Assert-PeRange $Bytes $Offset 8
     # ImageBase 64bitových binárek se do [long] vejde (kanonické adresy
-    # uživatelského prostoru mají horní bit nulový).
+    # uživatelského prostoru mají horní bit nulový). Položky tabulek
+    # importů se tudy NEčtou — ty mají horní bit jako příznak ordinálu.
     [long][BitConverter]::ToUInt64($Bytes, [int]$Offset)
 }
 
-# Název DLL je ASCII řetězec ukončený nulou. Limit délky chrání před
-# tím, aby se poškozený soubor četl až do konce.
+# Název (DLL, funkce) je ASCII řetězec ukončený nulou. Limit délky
+# chrání před tím, aby se poškozený soubor četl až do konce.
 function Read-PeAsciiZ([byte[]]$Bytes, [long]$Offset) {
     Assert-PeRange $Bytes $Offset 1
     $end = $Offset
     $max = [Math]::Min($Bytes.Length, $Offset + 512)
     while ($end -lt $max -and $Bytes[$end] -ne 0) { $end++ }
-    if ($end -ge $max) { throw ("poškozený soubor: neukončený název DLL (offset 0x{0:X})" -f $Offset) }
+    if ($end -ge $max) { throw ("poškozený soubor: neukončený název (offset 0x{0:X})" -f $Offset) }
     [Text.Encoding]::ASCII.GetString($Bytes, [int]$Offset, [int]($end - $Offset))
 }
 
@@ -114,10 +160,35 @@ function ConvertTo-PeFileOffset([long]$Rva, $Sections, [long]$SizeOfHeaders) {
     throw ("poškozený soubor: adresa 0x{0:X} neleží v žádné sekci" -f $Rva)
 }
 
-# Vrátí DLL z importní tabulky (Static) a z tabulky zpožděného
-# načítání (Delay) v pořadí, v jakém v souboru jsou — tak, jak je
-# vypisuje dumpbin, aby se daly porovnat — a DependentLoadFlags
-# z load config.
+# Funkce z tabulky jmen importů (Import Lookup/Name Table) jedné DLL.
+# Položka má 8 bajtů (PE32+) nebo 4 (PE32); nejvyšší bit = import podle
+# ordinálu (jen číslo, bez jména), jinak je ve spodních 31 bitech RVA
+# na IMAGE_IMPORT_BY_NAME = hint (2 bajty) + jméno. Nula tabulku končí.
+# Horní DWORD 64bitové položky se čte zvlášť: s nastaveným horním bitem
+# by se hodnota do [long] nevešla.
+function Read-PeThunks([byte[]]$Bytes, [long]$TableRva, [bool]$Pe64, $Sections, [long]$SizeOfHeaders) {
+    $names = New-Object System.Collections.Generic.List[string]
+    if ($TableRva -eq 0) { return , $names }
+    $o = ConvertTo-PeFileOffset $TableRva $Sections $SizeOfHeaders
+    $step = if ($Pe64) { 8 } else { 4 }
+    for ($n = 0; $n -lt 65536; $n++) {
+        $lo = Read-PeU32 $Bytes ($o + $step * $n)
+        $hi = if ($Pe64) { Read-PeU32 $Bytes ($o + $step * $n + 4) } else { 0 }
+        if ($lo -eq 0 -and $hi -eq 0) { return , $names }
+        $ordinal = if ($Pe64) { ($hi -band 0x80000000) -ne 0 } else { ($lo -band 0x80000000) -ne 0 }
+        if ($ordinal) {
+            $names.Add(('#{0}' -f ($lo -band 0xFFFF)))
+        } else {
+            $hint = ConvertTo-PeFileOffset ($lo -band 0x7FFFFFFF) $Sections $SizeOfHeaders
+            $names.Add((Read-PeAsciiZ $Bytes ($hint + 2)))
+        }
+    }
+    throw "poškozený soubor: neukončená tabulka importů"
+}
+
+# Vrátí importy (Static) a zpožděné importy (Delay) v pořadí, v jakém
+# jsou v souboru — tak, jak je vypisuje dumpbin, aby se daly porovnat —
+# každý jako { Dll; Functions }, a DependentLoadFlags z load config.
 function Get-PeInfo([string]$File) {
     $b = [IO.File]::ReadAllBytes($File)
     if ($b.Length -lt 0x40 -or $b[0] -ne 0x4D -or $b[1] -ne 0x5A) {
@@ -141,6 +212,7 @@ function Get-PeInfo([string]$File) {
         0x10B { $imageBase = Read-PeU32 $b ($opt + 28); $countOff = 92; $dirOff = 96 }
         default { throw ("neznámý typ volitelné hlavičky 0x{0:X}" -f $magic) }
     }
+    $pe64 = $magic -eq 0x20B
     $sizeOfHeaders = Read-PeU32 $b ($opt + 60)
     $dirCount = Read-PeU32 $b ($opt + $countOff)
 
@@ -162,35 +234,53 @@ function Get-PeInfo([string]$File) {
         Read-PeU32 $b ($opt + $dirOff + 8 * $Index)
     }
 
-    # Datový adresář 1: IMAGE_IMPORT_DESCRIPTOR po 20 bajtech, pole Name
-    # na offsetu 12. Tabulku ukončuje záznam s nulovým jménem.
-    $static = New-Object System.Collections.Generic.List[string]
+    # Datový adresář 1: IMAGE_IMPORT_DESCRIPTOR po 20 bajtech —
+    # OriginalFirstThunk (tabulka jmen) na 0, Name na 12, FirstThunk
+    # (IAT) na 16. Když tabulka jmen chybí (staré linkery), jsou jména
+    # v IAT — na disku, před zavedením, obsahuje totéž. Tabulku ukončuje
+    # záznam s nulovým jménem.
+    $static = New-Object System.Collections.Generic.List[object]
     $rva = & $dirRva 1
     if ($rva -ne 0) {
         $o = ConvertTo-PeFileOffset $rva $sections $sizeOfHeaders
         # Strop počtu záznamů: poškozený soubor bez ukončovacího záznamu
         # by jinak četl nesmysly až do konce.
         for ($n = 0; $n -lt 4096; $n++) {
-            $nameRva = Read-PeU32 $b ($o + 20 * $n + 12)
+            $d = $o + 20 * $n
+            $nameRva = Read-PeU32 $b ($d + 12)
             if ($nameRva -eq 0) { break }
-            $static.Add((Read-PeAsciiZ $b (ConvertTo-PeFileOffset $nameRva $sections $sizeOfHeaders)))
+            $ilt = Read-PeU32 $b $d
+            if ($ilt -eq 0) { $ilt = Read-PeU32 $b ($d + 16) }
+            $static.Add([pscustomobject]@{
+                    Dll       = Read-PeAsciiZ $b (ConvertTo-PeFileOffset $nameRva $sections $sizeOfHeaders)
+                    Functions = [string[]](Read-PeThunks $b $ilt $pe64 $sections $sizeOfHeaders).ToArray()
+                })
         }
     }
 
     # Datový adresář 13: IMAGE_DELAYLOAD_DESCRIPTOR po 32 bajtech,
-    # Attributes na 0 a DllNameRVA na 4. Bit 0 v Attributes = adresy
-    # jsou RVA; bez něj jde o prastarý formát (Visual C++ 6), kde jsou
-    # to absolutní adresy a musí se od nich odečíst ImageBase.
-    $delay = New-Object System.Collections.Generic.List[string]
+    # Attributes na 0, DllNameRVA na 4, ImportNameTableRVA na 16. Bit 0
+    # v Attributes = adresy jsou RVA; bez něj jde o prastarý formát
+    # (Visual C++ 6), kde jsou to absolutní adresy a musí se od nich
+    # odečíst ImageBase.
+    $delay = New-Object System.Collections.Generic.List[object]
     $rva = & $dirRva 13
     if ($rva -ne 0) {
         $o = ConvertTo-PeFileOffset $rva $sections $sizeOfHeaders
         for ($n = 0; $n -lt 4096; $n++) {
-            $attrs = Read-PeU32 $b ($o + 32 * $n)
-            $nameRva = Read-PeU32 $b ($o + 32 * $n + 4)
+            $d = $o + 32 * $n
+            $attrs = Read-PeU32 $b $d
+            $nameRva = Read-PeU32 $b ($d + 4)
             if ($nameRva -eq 0) { break }
-            if (($attrs -band 1) -eq 0) { $nameRva -= $imageBase }
-            $delay.Add((Read-PeAsciiZ $b (ConvertTo-PeFileOffset $nameRva $sections $sizeOfHeaders)))
+            $int = Read-PeU32 $b ($d + 16)
+            if (($attrs -band 1) -eq 0) {
+                $nameRva -= $imageBase
+                if ($int -ne 0) { $int -= $imageBase }
+            }
+            $delay.Add([pscustomobject]@{
+                    Dll       = Read-PeAsciiZ $b (ConvertTo-PeFileOffset $nameRva $sections $sizeOfHeaders)
+                    Functions = [string[]](Read-PeThunks $b $int $pe64 $sections $sizeOfHeaders).ToArray()
+                })
         }
     }
 
@@ -211,8 +301,8 @@ function Get-PeInfo([string]$File) {
 
     [pscustomobject]@{
         Machine            = $machine
-        Static             = [string[]]$static.ToArray()
-        Delay              = [string[]]$delay.ToArray()
+        Static             = $static.ToArray()
+        Delay              = $delay.ToArray()
         DependentLoadFlags = $loadFlags
     }
 }
@@ -266,6 +356,19 @@ function Get-SystemDllDir([long]$Machine) {
     Join-Path $root 'System32'
 }
 
+# Sady API, o kterých víme, že je má už Windows 10 1507 (build 10240).
+# Sada je jen jméno, které zavaděč přesměruje na skutečnou DLL — když ji
+# build nezná, program nenaběhne stejně jako u chybějící DLL. Novou sadu
+# sem přidávej až po ověření, že ji 10240 má (dokumentace funkce: sada
+# a „Minimum supported client"), s komentářem odkud to víš.
+$ApiSetAllowList = @(
+    # WaitOnAddress/WakeByAddress* (Windows 8) — Rust std, v obou binárkách.
+    'api-ms-win-core-synch-l1-2-0.dll'
+)
+# Univerzální CRT (hybridní CRT z tauri-build): verze l1-1-0 jsou
+# součástí Windows 10 od 10240 (UCRT je komponenta systému).
+$CrtApiSet = '^api-ms-win-crt-[a-z0-9]+(-[a-z0-9]+)*-l1-1-0\.dll$'
+
 # $null = DLL je v pořádku, jinak text, proč vadí.
 #
 # Pořadí je podstatné: seznam zakázaných vyhrává nad „existuje
@@ -312,18 +415,78 @@ function Get-DllProblem([string]$Name, [string]$SystemDir) {
 
     # Sady API (api-ms-win-*, ext-ms-win-*) nejsou soubory, ale jména,
     # která zavaděč Windows přesměruje na skutečnou systémovou DLL.
-    # Univerzální CRT (api-ms-win-crt-*) je v nich od Windows 10.
-    if ($n.StartsWith('api-ms-win-') -or $n.StartsWith('ext-ms-win-')) { return $null }
+    # Projde jen sada ze seznamu výš — novější sadu starší build nezná.
+    if ($n.StartsWith('api-ms-win-') -or $n.StartsWith('ext-ms-win-')) {
+        if ($n -match $CrtApiSet -or $ApiSetAllowList -contains $n) { return $null }
+        return 'sada API, o které nevíme, že ji má Windows 10 1507 — na starším buildu by program nenaběhl. Obvykle ji potichu vybere windows-rs pro novou funkci. Ověř funkci v dokumentaci; je-li z 1507, přidej sadu do $ApiSetAllowList v tools\check-imports.ps1 (s odkazem), jinak funkci hledej za běhu přes GetProcAddress.'
+    }
 
     if ([IO.File]::Exists((Join-Path $SystemDir $Name))) { return $null }
 
     'není v System32 a není to ani sada API Windows — na čistém PC ji nikdo nedodá. Zjisti, která závislost ji přitáhla, a nalinkuj ji staticky.'
 }
 
+# ── Funkce novější než Windows 10 1507 ─────────────────────────────
+# Jméno exportu → od kdy ho Windows mají (MS Learn, „Minimum supported
+# client"). Posuzuje se jen jméno, ne DLL: tatáž funkce jde importovat
+# i přes sadu API (která by ale neprošla už výš).
+$PostRtmFunctions = @{
+    # user32 — per-monitor DPI v2 a spol.
+    'GetDpiForWindow'                     = 'Windows 10 1607'
+    'GetDpiForSystem'                     = 'Windows 10 1607'
+    'GetSystemMetricsForDpi'              = 'Windows 10 1607'
+    'SystemParametersInfoForDpi'          = 'Windows 10 1607'
+    'AdjustWindowRectExForDpi'            = 'Windows 10 1607'
+    'EnableNonClientDpiScaling'           = 'Windows 10 1607'
+    'SetThreadDpiAwarenessContext'        = 'Windows 10 1607'
+    'GetThreadDpiAwarenessContext'        = 'Windows 10 1607'
+    'GetWindowDpiAwarenessContext'        = 'Windows 10 1607'
+    'GetAwarenessFromDpiAwarenessContext' = 'Windows 10 1607'
+    'AreDpiAwarenessContextsEqual'        = 'Windows 10 1607'
+    'IsValidDpiAwarenessContext'          = 'Windows 10 1607'
+    'SetProcessDpiAwarenessContext'       = 'Windows 10 1703'
+    'SetDialogDpiChangeBehavior'          = 'Windows 10 1703'
+    'GetDialogDpiChangeBehavior'          = 'Windows 10 1703'
+    'SetDialogControlDpiChangeBehavior'   = 'Windows 10 1703'
+    'GetDialogControlDpiChangeBehavior'   = 'Windows 10 1703'
+    'GetSystemDpiForProcess'              = 'Windows 10 1803'
+    'GetDpiFromDpiAwarenessContext'       = 'Windows 10 1803'
+    'GetDpiAwarenessContextForProcess'    = 'Windows 10 1803'
+    'SetThreadDpiHostingBehavior'         = 'Windows 10 1803'
+    'GetThreadDpiHostingBehavior'         = 'Windows 10 1803'
+    'GetWindowDpiHostingBehavior'         = 'Windows 10 1803'
+    # shcore
+    'GetDpiForShellUIComponent'           = 'Windows 10 1607'
+    # kernel32 / kernelbase
+    'SetThreadDescription'                = 'Windows 10 1607'
+    'GetThreadDescription'                = 'Windows 10 1607'
+    'IsWow64Process2'                     = 'Windows 10 1709'
+    'GetUserDefaultGeoName'               = 'Windows 10 1709'
+    'SetUserGeoName'                      = 'Windows 10 1709'
+    'VirtualAlloc2'                       = 'Windows 10 1803'
+    'VirtualAlloc2FromApp'                = 'Windows 10 1803'
+    'MapViewOfFile3'                      = 'Windows 10 1803'
+    'MapViewOfFile3FromApp'               = 'Windows 10 1803'
+    'CreatePseudoConsole'                 = 'Windows 10 1809'
+    'ResizePseudoConsole'                 = 'Windows 10 1809'
+    'ClosePseudoConsole'                  = 'Windows 10 1809'
+    'GetTempPath2W'                       = 'Windows 11 (na desítkách až s pozdními aktualizacemi)'
+    'GetTempPath2A'                       = 'Windows 11 (na desítkách až s pozdními aktualizacemi)'
+    'GetMachineTypeAttributes'            = 'Windows 11'
+    'GetFileInformationByName'            = 'Windows 11 24H2'
+    'CreateFile3'                         = 'Windows 11 24H2'
+    'CreateDirectory2W'                   = 'Windows 11 24H2'
+    'CreateDirectory2A'                   = 'Windows 11 24H2'
+    'RemoveDirectory2W'                   = 'Windows 11 24H2'
+    'RemoveDirectory2A'                   = 'Windows 11 24H2'
+    'DeleteFile2W'                        = 'Windows 11 24H2'
+    'DeleteFile2A'                        = 'Windows 11 24H2'
+}
+
 # ── Hlavní část ────────────────────────────────────────────────────
 
 if (-not $Path -or $Path.Count -eq 0) {
-    Write-Host "Použití: tools\check-imports.ps1 [-RequireDependentLoadFlag] <soubor.exe> [další.exe …]" -ForegroundColor Yellow
+    Write-Host "Použití: tools\check-imports.ps1 [-RequireDependentLoadFlag] [-ShowFunctions] <soubor.exe> [další.exe …]" -ForegroundColor Yellow
     exit 2
 }
 
@@ -355,31 +518,66 @@ foreach ($p in $Path) {
 
     # Tatáž DLL bývá v tabulce víckrát, jen jinak napsaná: Rust std
     # importuje „KERNEL32.dll", crate windows (raw-dylib) „kernel32.dll".
-    # Pro Windows je to jeden soubor, takže se vypíše i posoudí jednou.
+    # Pro Windows je to jeden soubor, takže se vypíše i posoudí jednou;
+    # funkce obou záznamů se sečtou.
     $seen = @{}
-    $rows = @()
-    foreach ($d in $imp.Static) {
-        if ($seen.ContainsKey($d.ToLowerInvariant())) { continue }
-        $seen[$d.ToLowerInvariant()] = $true
-        $rows += [pscustomobject]@{ Name = $d; Delay = $false }
-    }
-    foreach ($d in $imp.Delay) {
-        if ($seen.ContainsKey($d.ToLowerInvariant())) { continue }
-        $seen[$d.ToLowerInvariant()] = $true
-        $rows += [pscustomobject]@{ Name = $d; Delay = $true }
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($kind in @(@{ List = $imp.Static; Delay = $false }, @{ List = $imp.Delay; Delay = $true })) {
+        foreach ($d in $kind.List) {
+            $key = $d.Dll.ToLowerInvariant() + $(if ($kind.Delay) { '|delay' } else { '' })
+            if ($seen.ContainsKey($key)) {
+                $seen[$key].Functions += $d.Functions
+                continue
+            }
+            $row = [pscustomobject]@{ Name = $d.Dll; Delay = $kind.Delay; Functions = @($d.Functions) }
+            $seen[$key] = $row
+            $rows.Add($row)
+        }
     }
     $delayCount = @($rows | Where-Object { $_.Delay }).Count
-    Write-Host ("{0}  ({1}, {2} DLL, z toho {3} zpožděně)" -f $leaf, $arch, $rows.Count, $delayCount) -ForegroundColor Cyan
+    $fnCount = 0
+    foreach ($r in $rows) { $fnCount += $r.Functions.Count }
+    Write-Host ("{0}  ({1}, {2} DLL, {3} funkcí, z toho {4} DLL zpožděně)" -f $leaf, $arch, $rows.Count, $fnCount, $delayCount) -ForegroundColor Cyan
 
     foreach ($r in $rows) {
         $why = Get-DllProblem $r.Name $sysDir
+        if (-not $why -and $r.Delay) {
+            $why = 'zpožděně načítaná DLL (delay-load) — zavaděč ji při startu nekontroluje, chybějící funkce shodí program až uprostřed práce a /DEPENDENTLOADFLAG ji spolehlivě nechrání. Importuj staticky, nebo volitelné API načti přes LoadLibraryExW(…, LOAD_LIBRARY_SEARCH_SYSTEM32) + GetProcAddress s náhradou.'
+        }
         $note = if ($r.Delay) { '  (zpožděně)' } else { '' }
         if ($why) {
             Write-Host ("  !!  {0}{1}" -f $r.Name, $note) -ForegroundColor Red
             $problems += [pscustomobject]@{ File = $leaf; Name = $r.Name; Why = $why }
         } else {
-            Write-Host ("  ok  {0}{1}" -f $r.Name, $note) -ForegroundColor DarkGray
+            Write-Host ("  ok  {0}{1}  ({2})" -f $r.Name, $note, $r.Functions.Count) -ForegroundColor DarkGray
         }
+        foreach ($f in $r.Functions) {
+            if ($PostRtmFunctions.ContainsKey($f)) {
+                $since = $PostRtmFunctions[$f]
+                Write-Host ("  !!    {0}!{1}  (až {2})" -f $r.Name, $f, $since) -ForegroundColor Red
+                $problems += [pscustomobject]@{
+                    File = $leaf
+                    Name = '{0}!{1}' -f $r.Name, $f
+                    # Jednoduché uvozovky: PowerShell bere „ a “ jako
+                    # uvozovky a v "…" by řetězec ukončily.
+                    Why  = 'funkce je až od {0}. Staticky importovaná zastaví start programu na starších Windows 10 hláškou „vstupní bod nenalezen“ dřív, než program cokoli řekne. Hledej ji za běhu (GetModuleHandleW/LoadLibraryExW + GetProcAddress) a měj náhradu pro starší build (princip 9).' -f $since
+                }
+            }
+        }
+        if ($ShowFunctions) {
+            foreach ($f in $r.Functions) { Write-Host ("        {0}" -f $f) -ForegroundColor DarkGray }
+        }
+    }
+
+    # DLL načítané za běhu (viz hlavička): jen informace o importu funkce.
+    $safeSearch = $false
+    foreach ($r in $rows) {
+        if (-not $r.Delay -and $r.Name -ieq 'kernel32.dll' -and $r.Functions -contains 'SetDefaultDllDirectories') { $safeSearch = $true }
+    }
+    if ($safeSearch) {
+        Write-Host '  ok  SetDefaultDllDirectories (DLL načítané za běhu může omezit na System32)' -ForegroundColor DarkGray
+    } else {
+        Write-Host '  --  bez SetDefaultDllDirectories (DLL načítané za běhu se hledají i ve složce s .exe)' -ForegroundColor Yellow
     }
 
     $flags = $imp.DependentLoadFlags
@@ -400,14 +598,14 @@ foreach ($p in $Path) {
 Write-Host ""
 if ($problems.Count -gt 0 -or $flagProblems.Count -gt 0) {
     if ($problems.Count -gt 0) {
-        Write-Host "NEPROŠLO: binárka potřebuje DLL, která na čistém PC chybí." -ForegroundColor Red
+        Write-Host "NEPROŠLO: binárka potřebuje DLL nebo funkci, která na čistém nebo starším PC chybí." -ForegroundColor Red
         foreach ($x in $problems) {
             Write-Host ""
             Write-Host ("  {0} → {1}" -f $x.File, $x.Name) -ForegroundColor Red
             Write-Host ("    {0}" -f $x.Why)
         }
         Write-Host ""
-        Write-Host "Na tomhle PC se chyba neprojeví — Windows si DLL najde. Kamarádovi se KeyPad nespustí." -ForegroundColor Yellow
+        Write-Host "Na tomhle PC se chyba neprojeví — Windows si DLL i funkci najde. Kamarádovi se KeyPad nespustí." -ForegroundColor Yellow
     }
     if ($flagProblems.Count -gt 0) {
         if ($problems.Count -gt 0) { Write-Host "" }
@@ -425,8 +623,8 @@ if ($broken.Count -gt 0) {
     exit 2
 }
 if ($RequireDependentLoadFlag) {
-    Write-Host "Importy v pořádku — jen systémové DLL, a ty jen ze System32." -ForegroundColor Green
+    Write-Host "Importy v pořádku — jen systémové DLL a funkce z Windows 10 1507, DLL jen ze System32." -ForegroundColor Green
 } else {
-    Write-Host "Importy v pořádku — jen systémové DLL." -ForegroundColor Green
+    Write-Host "Importy v pořádku — jen systémové DLL a funkce z Windows 10 1507." -ForegroundColor Green
 }
 exit 0

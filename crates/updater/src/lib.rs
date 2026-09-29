@@ -14,8 +14,14 @@
 //! ```
 //!
 //! Plní ji `tools\publish.ps1`.
+//!
+//! Vedle toho tu bydlí ovladač ViGEmBus ([`vigembus`]): napevno zapsané
+//! vydání, zjištění stavu a ověřené stažení — instalátor ho instaluje,
+//! aplikace podle téhož kódu hlásí, jestli běží.
 
 pub mod http;
+pub mod sha256;
+pub mod vigembus;
 
 use std::path::PathBuf;
 
@@ -32,6 +38,20 @@ pub const APP_EXE: &str = "KeyPad.exe";
 pub const SETUP_EXE: &str = "KeyPadSetup.exe";
 /// Soubor s verzí — v `release/` i vedle nainstalované aplikace.
 pub const VERSION_FILE: &str = "version.txt";
+
+/// Pojmenovaná událost, kterou instalátor žádá běžící KeyPad o uklizené
+/// ukončení (neutrální pad → odpojení → konec).
+///
+/// Proč ne WM_CLOSE: zavření okna KeyPad jen schová do oznamovací
+/// oblasti (jako WinSent), takže WM_CLOSE aplikaci neukončí. Událost
+/// funguje stejně u okna viditelného, minimalizovaného i schovaného.
+/// `Local\` = jen v relaci přihlášeného uživatele. Zneužít ji jde nanejvýš
+/// k tomu, že se KeyPad slušně ukončí.
+pub const QUIT_EVENT_NAME: &str = "Local\\KeyPad.Ukoncit";
+
+/// Přepínač instalátoru pro samostatnou instalaci ovladače ViGEmBus
+/// (spouští ho aplikace, když ovladač chybí).
+pub const SETUP_ARG_VIGEMBUS: &str = "/vigembus";
 
 /// Instalátor WebView2 Runtime od Microsoftu (Evergreen Bootstrapper).
 /// Odkazuje na něj instalátor, aplikace i README — jedno místo pravdy.
@@ -193,8 +213,11 @@ pub fn runs_from_install_dir(exe: &std::path::Path) -> bool {
 /// Kam se KeyPad instaluje: `%LOCALAPPDATA%\Programs\KeyPad`.
 ///
 /// Instalace je per-user (jako VS Code nebo Discord): zápis do profilu
-/// nepotřebuje práva správce, takže instalátor ani aktualizace nikdy
-/// nevyvolají výzvu UAC (princip 6 v ROADMAP.md).
+/// nepotřebuje práva správce, takže instalace ani aktualizace KeyPadu
+/// o ně nikdy nežádá (princip 6 v ROADMAP.md). Jediná výzva UAC, kterou
+/// může KeyPadSetup vyvolat, patří oficiálnímu instalátoru ViGEmBus —
+/// jen když ovladač úplně chybí a uživatel ho výslovně chce (viz
+/// [`vigembus`]).
 pub fn install_dir() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)

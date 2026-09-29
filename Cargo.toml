@@ -35,6 +35,11 @@ windows = "0.61"
 tauri = "2"
 tauri-build = "2"
 tauri-plugin-single-instance = "2"
+# Přímo jen kvůli ICoreWebView2_19 (paměť schovaného webview). Tauri
+# (`PlatformWebview::controller`) vrací typ z téhle knihovny, takže verze
+# MUSÍ být ta, kterou používá wry — přesně zamčená, aby ji `cargo update`
+# nerozvedl. S novějším Tauri zvednout spolu s ním.
+webview2-com = "=0.38.2"
 winresource = "0.1"
 proptest = "1"
 

@@ -1,23 +1,21 @@
-//! Co KeyPad potřebuje od systému, ale instalátor to sám dodat nemůže.
+//! Microsoft Edge WebView2 Runtime — co KeyPad potřebuje od systému,
+//! ale instalátor to sám dodat nemůže.
 //!
-//! Obojí se jen **čte** z registru. Instalovat to za uživatele nejde:
-//! ViGEmBus je ovladač jádra (instalace chce práva správce, a ta
-//! KeyPadSetup z principu nežádá) a WebView2 Runtime je komponenta
-//! Microsoftu s vlastním instalátorem. Úkolem instalátoru je tedy
-//! jasně říct, co chybí a kde to vzít — ne mlčky dokončit instalaci
-//! aplikace, která se pak nespustí.
+//! Jen se **čte** z registru. WebView2 Runtime je komponenta Microsoftu
+//! s vlastním instalátorem; úkolem KeyPadSetupu je jasně říct, že chybí
+//! a kde ho vzít — ne mlčky dokončit instalaci aplikace, která se pak
+//! nespustí. (Ovladač ViGEmBus instalátor umí doinstalovat sám, po
+//! kliknutí — stav i ověřené vydání má `updater::vigembus`, postup
+//! `driver.rs`.)
 
 use windows::core::HSTRING;
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
-    KEY_READ, RRF_RT_REG_SZ,
+    RegGetValueW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ,
 };
 
 /// Stránka Microsoftu s „Evergreen Bootstrapperem" WebView2 Runtime
 /// (sdílená s aplikací přes updater).
 pub use updater::WEBVIEW2_URL;
-/// Vydání ovladače ViGEmBus.
-pub const VIGEMBUS_URL: &str = "https://github.com/nefarius/ViGEmBus/releases";
 
 /// GUID klienta WebView2 Runtime v EdgeUpdate (stálý, z dokumentace
 /// Microsoftu k distribuci WebView2).
@@ -56,31 +54,6 @@ pub fn webview2_version_ok(pv: Option<&str>) -> bool {
     match pv.map(str::trim) {
         Some(v) => !v.is_empty() && v != "0.0.0.0",
         None => false,
-    }
-}
-
-/// Je nainstalovaný ovladač ViGEmBus (virtuální herní ovladače)?
-///
-/// Stačí existence klíče služby — čtení `Services` smí každý uživatel.
-/// Bez ovladače KeyPad běží, jen nevytvoří gamepad (aplikace to sama
-/// ukáže ve stavovém řádku), takže tohle není chyba instalace.
-pub fn vigembus_present() -> bool {
-    // SAFETY: jen otevření pro čtení; otevřený klíč se hned zavírá.
-    unsafe {
-        let mut key = HKEY::default();
-        let rc = RegOpenKeyExW(
-            HKEY_LOCAL_MACHINE,
-            &HSTRING::from(r"SYSTEM\CurrentControlSet\Services\ViGEmBus"),
-            None,
-            KEY_READ,
-            &mut key,
-        );
-        if rc.is_ok() {
-            let _ = RegCloseKey(key);
-            true
-        } else {
-            false
-        }
     }
 }
 
@@ -133,6 +106,5 @@ mod tests {
     #[test]
     fn cteni_registru_nepada() {
         let _ = webview2_present();
-        let _ = vigembus_present();
     }
 }

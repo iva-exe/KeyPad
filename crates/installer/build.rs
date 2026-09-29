@@ -38,7 +38,9 @@ fn main() {
     // dwmapi ani winhttp nejsou v KnownDLLs, takže je nic jiného nechrání.
     // 0x800 = LOAD_LIBRARY_SEARCH_SYSTEM32 pro statické importy (Windows 10
     // 1607+; starší systém příznak ignoruje a chová se jako dřív). Plné
-    // cesty k taskkill/cmd v proc.rs řeší totéž pro spouštěné programy.
+    // cesty k taskkill/cmd v proc.rs řeší totéž pro spouštěné programy
+    // a DLL, které si systémové knihovny načítají až za běhu (CRYPTSP,
+    // profapi, IPHLPAPI…), `SetDefaultDllDirectories` na začátku main().
     println!("cargo:rustc-link-arg-bin=KeyPadSetup=/DEPENDENTLOADFLAG:0x800");
 
     let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.1.0".into());
@@ -61,7 +63,7 @@ fn main() {
     res.set("LegalCopyright", "© KeyPad");
     res.set(
         "Comments",
-        "Nainstaluje a aktualizuje KeyPad (klávesnice jako Xbox ovladač) v profilu uživatele, bez práv správce.",
+        "Nainstaluje a aktualizuje KeyPad (klávesnice jako Xbox ovladač) v profilu uživatele, bez práv správce. Chybějící ovladač ViGEmBus doinstaluje jen po kliknutí jeho oficiálním instalátorem.",
     );
     res.set("FileVersion", &version);
     res.set("ProductVersion", &version);

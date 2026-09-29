@@ -1,14 +1,19 @@
 //! KeyPad — vybrané klávesy jako virtuální Xbox 360 ovladač (Tauri 2).
 //!
 //! Fáze 0: okno ve stylu WinSentu, logger, panic hook a aktualizace.
-//! Hook klávesnice a ViGEm přijdou ve Fázi 2+ (viz ROADMAP.md).
+//! Fáze 2: virtuální pad (vlastní klient ViGEmBus, pad vlákno), ikona
+//! v oznamovací oblasti, uspání, ukončení z instalátoru. Hook klávesnice
+//! přijde ve Fázi 3 (viz ROADMAP.md).
 
 // Release bez konzolového okna. Ve vývoji konzole zůstává — je v ní
 // vidět výchozí výpis paniky a výstup Tauri.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod gamepad;
 mod logger;
 mod okno;
+mod platform;
+mod tray;
 mod update;
 
 use std::path::PathBuf;
@@ -115,18 +120,6 @@ fn ukonci_bez_okna(app: &tauri::AppHandle) {
         });
 }
 
-/// Ukáže, obnoví z minimalizace a vyzdvihne hlavní okno. Vrací `false`,
-/// když hlavní okno není.
-fn ukaz_okno(app: &tauri::AppHandle) -> bool {
-    let Some(w) = hlavni_okno(app) else {
-        return false;
-    };
-    let _ = w.show();
-    let _ = w.unminimize();
-    let _ = w.set_focus();
-    true
-}
-
 /// Panika → řádek do logu, a to dřív, než proces skončí.
 ///
 /// Release nemá konzoli, takže výchozí výpis paniky by šel do prázdna
@@ -223,12 +216,38 @@ fn over_webview2() {
     }
 }
 
+/// DLL, které si za běhu dotahují samy systémové knihovny, jen ze
+/// System32.
+///
+/// `/DEPENDENTLOADFLAG` (build.rs) chrání jen statické importy
+/// KeyPad.exe. Systémové DLL si ale další knihovny načítají až za běhu
+/// (WinHttp → IPHLPAPI, šifrování → CRYPTSP/CRYPTBASE,
+/// SHGetKnownFolderPath → profapi) a ty by Windows hledaly NEJDŘÍV ve
+/// složce programu — přenosný KeyPad.exe ve Stažených souborech by
+/// načetl DLL, kterou tam podstrčila kdejaká stránka. Tohle platí pro
+/// celý proces, i pro LoadLibrary v cizím kódu (Tauri, WebView2).
+/// KeyPad žádné vlastní DLL nemá, složka programu se tedy nehledá vůbec.
+fn dll_jen_ze_system32() -> windows::core::Result<()> {
+    use windows::Win32::System::LibraryLoader::{
+        SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_SYSTEM32,
+    };
+    // SAFETY: jen nastaví pořadí hledání DLL pro tenhle proces.
+    unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) }
+}
+
 fn main() {
+    // ÚPLNĚ PRVNÍ, ještě před loggerem: každá DLL načtená dřív by se
+    // hledala postaru. Chyba (na Windows 10+ nenastává) se zapíše, až
+    // bude kam.
+    let dll = dll_jen_ze_system32();
     let spusteno = Instant::now();
-    // Logger a panic hook PRVNÍ, ještě před Tauri: i pád při startu
+    // Logger a panic hook hned potom, ještě před Tauri: i pád při startu
     // (chybějící WebView2, rozbitá konfigurace) musí nechat stopu v logu.
     let cesta_logu = logger::init();
     nainstaluj_panic_hook();
+    if let Err(e) = dll {
+        log::warn!("hledání DLL nejde omezit na System32: {e}");
+    }
 
     let verze = update::bezici_verze();
     let info = AppInfo {
@@ -262,7 +281,7 @@ fn main() {
         // o klávesnici a o virtuální pad.
         .plugin(tauri_plugin_single_instance::init(
             move |app, _argv, _cwd| {
-                if ukaz_okno(app) {
+                if tray::ukaz_okno(app) {
                     log::info!("druhé spuštění — ukazuji běžící okno");
                 } else if spusteno.elapsed() < LHUTA_OKNA {
                     log::info!("druhé spuštění — hlavní okno se teprve vytváří");
@@ -279,7 +298,11 @@ fn main() {
             app_info,
             open_log_dir,
             update::check_update,
-            update::run_update
+            update::run_update,
+            gamepad::pad_status,
+            gamepad::pad_test,
+            gamepad::pad_retry,
+            gamepad::install_vigembus
         ])
         .setup(|app| {
             // Okna z konfigurace Tauri vytváří těsně před tímhle voláním,
@@ -306,10 +329,40 @@ fn main() {
                 );
             };
             okno::zaobli_a_ztmav(&w);
-            // Sem přibude start hook a pad vláken (Fáze 2+). Jejich stav
-            // (režim, pad, chyby) půjde do GUI Tauri událostmi přes
-            // `app.emit(...)` — náhrada za egui `request_repaint` z ROADMAP.
+            // Ikona dřív než pad: bez ní se zavřením okna aplikace
+            // ukončí (viz `tray::schovavat`) — nikdy neviditelný proces.
+            if let Err(e) = tray::nastav(app) {
+                log::error!(
+                    "ikona v oznamovací oblasti nejde vytvořit: {e} — zavření okna KeyPad ukončí"
+                );
+            }
+            // Pad hned po startu (stabilní pořadí hráčů). Jeho stav jde
+            // do okna událostí `pad-stav` — náhrada za egui
+            // `request_repaint` z ROADMAP. Hook přibude ve Fázi 3.
+            gamepad::spust(app);
+            let handle = app.handle().clone();
+            let ukonceni = platform::windows::ukonceni::hlidej(move || {
+                // Stejná cesta jako „Ukončit" v nabídce: na hlavním vlákně.
+                let h = handle.clone();
+                let _ = handle.run_on_main_thread(move || {
+                    tray::ukonci(&h, "instalátor");
+                });
+            });
+            if let Err(e) = ukonceni {
+                log::error!("{e} — instalátor KeyPad při aktualizaci ukončí natvrdo");
+            }
             Ok(())
+        })
+        .on_window_event(|window, udalost| {
+            // Zavření okna (křížek, Alt+F4, WM_CLOSE) = schovat do
+            // oznamovací oblasti; pad a aplikace běží dál. Jen hlavní
+            // okno a jen když je kam ho schovat.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = udalost {
+                if window.label() == "main" && tray::schovavat() {
+                    api.prevent_close();
+                    tray::schovej(window);
+                }
+            }
         })
         .build(tauri::generate_context!());
 
@@ -321,10 +374,12 @@ fn main() {
         ),
     };
 
-    aplikace.run(|_app, udalost| {
+    aplikace.run(|app, udalost| {
         // `run` se nevrací — smyčka událostí končí přímo ukončením
-        // procesu. Exit je tedy poslední chvíle, kdy jde log dopsat.
+        // procesu. Exit je tedy poslední chvíle, kdy jde pad uklidit
+        // a log dopsat. Pořadí: neutrál → odpojit → zavřít, pak log.
         if let tauri::RunEvent::Exit = udalost {
+            gamepad::ukonci(app);
             log::info!("konec");
             logger::flush(Duration::from_secs(1));
         }

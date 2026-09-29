@@ -1,4 +1,42 @@
-//! Vzhled okna, který se nedá nastavit v tauri.conf.json.
+//! Vzhled a vyzdvižení okna — co se nedá nastavit v tauri.conf.json.
+
+/// Dá hlavní okno do popředí — bez syntetického vstupu.
+///
+/// Schválně NE `set_focus()` z Tauri: tao v něm, když Windows
+/// SetForegroundWindow odmítnou (hra drží popředí), pošle přes
+/// SendInput stisk a uvolnění Altu, aby zámek popředí obešel. Ten Alt
+/// by dostala hra v popředí — přesně ten zásah do cizího programu, který
+/// princip 8 vylučuje. Tady se jen slušně požádá; když Windows odmítnou,
+/// tlačítko na hlavním panelu zabliká, dokud si ho uživatel nevšimne.
+///
+/// Ukázat a obnovit okno musí volající přes Tauri (`show`, `unminimize`)
+/// — tao si viditelnost pamatuje a přímé ShowWindow by ho rozhodilo
+/// (příští `hide` by pak nic neudělal).
+pub fn do_popredi(w: &tauri::WebviewWindow) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FlashWindowEx, SetForegroundWindow, FLASHWINFO, FLASHW_TIMERNOFG, FLASHW_TRAY,
+    };
+
+    let Ok(hwnd) = w.hwnd() else {
+        return;
+    };
+    // SAFETY: platný handle okna tohoto procesu; FLASHWINFO má správnou
+    // velikost a žije po celou dobu volání.
+    unsafe {
+        if SetForegroundWindow(hwnd).as_bool() {
+            return;
+        }
+        let blikani = FLASHWINFO {
+            cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+            hwnd,
+            dwFlags: FLASHW_TRAY | FLASHW_TIMERNOFG,
+            uCount: 0,
+            dwTimeout: 0,
+        };
+        let _ = FlashWindowEx(&blikani);
+    }
+    log::debug!("Windows nepustily okno do popředí — bliká tlačítko na hlavním panelu");
+}
 
 /// Zaoblené rohy a tmavý systémový rámeček přes DWM (jako WinSent).
 ///

@@ -1,13 +1,15 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Oprávnění hlavního okna — výčtem, ne core:default (to by frontendu otevřelo ~70 příkazů: menu, tray, cesty, události…). Jen to, co vlastní titulek opravdu potřebuje: minimalizovat, zavřít a tahat za titulek. internal-toggle-maximize volá Tauri samo při dvojkliku na titulek; okno maximalizaci nemá (maximizable false), příkaz tedy nic neudělá, ale bez oprávnění by každý dvojklik skončil chybou v konzoli. Vždy navrchu je tu dopředu pro kompaktní režim (Fáze 4). Vlastní příkazy aplikace (app_info, check_update…) oprávnění nepotřebují. Až GUI začne poslouchat události z backendu (Fáze 2+), přibude core:event:allow-listen a core:event:allow-unlisten.",
+  "description": "Oprávnění hlavního okna — výčtem, ne core:default (to by frontendu otevřelo ~70 příkazů: menu, tray, cesty, události…). Jen to, co okno opravdu potřebuje: minimalizovat, zavřít (backend zavření změní na schování do oznamovací oblasti) a tahat za titulek. internal-toggle-maximize volá Tauri samo při dvojkliku na titulek; okno maximalizaci nemá (maximizable false), příkaz tedy nic neudělá, ale bez oprávnění by každý dvojklik skončil chybou v konzoli. Vždy navrchu je tu dopředu pro kompaktní režim (Fáze 4). event:allow-listen a allow-unlisten = poslech událostí z backendu (stav padu `pad-stav`, Fáze 2). Schválně CHYBÍ window:allow-set-focus: tao v set_focus obchází zámek popředí syntetickým Altem přes SendInput, který by dostala hra v popředí (princip 8) — okno vyzdvihuje backend bez něj. Vlastní příkazy aplikace (app_info, pad_status…) oprávnění nepotřebují.",
   "windows": ["main"],
   "permissions": [
     "core:window:allow-minimize",
     "core:window:allow-close",
     "core:window:allow-start-dragging",
     "core:window:allow-internal-toggle-maximize",
-    "core:window:allow-set-always-on-top"
+    "core:window:allow-set-always-on-top",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
   ]
 }

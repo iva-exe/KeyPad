@@ -6,6 +6,7 @@
 // `getCurrentWindow()` by spadlo výjimkou už při načtení. Proto jde
 // všechno přes tenhle modul, který se nejdřív zeptá, kde běží.
 import { invoke, isTauri, type InvokeArgs } from '@tauri-apps/api/core';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWindow, type Window } from '@tauri-apps/api/window';
 
 /** Běží stránka uvnitř aplikace (ne v prohlížeči)? */
@@ -21,6 +22,16 @@ export function zavolej<T>(prikaz: string, args?: InvokeArgs): Promise<T> {
 		return Promise.reject(new Error('běží v prohlížeči — backend aplikace tu není'));
 	}
 	return invoke<T>(prikaz, args);
+}
+
+/**
+ * Poslouchá událost z backendu (stav padu…). Mimo aplikaci nic —
+ * události tam nechodí. Oprávnění: core:event:allow-listen a
+ * allow-unlisten v src-tauri/capabilities/default.json.
+ */
+export async function poslouchej<T>(udalost: string, obsluha: (data: T) => void): Promise<UnlistenFn> {
+	if (!vAplikaci) return () => {};
+	return listen<T>(udalost, (e) => obsluha(e.payload));
 }
 
 let okno: Window | null = null;

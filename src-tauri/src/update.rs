@@ -31,8 +31,8 @@ pub struct UpdateInfo {
     /// je novější.
     available: bool,
     /// Proč se nepodařilo zjistit (síť, GitHub, vývojový build,
-    /// přenosná kopie). UI to v banneru nekřičí — kontrola jede každou
-    /// minutu a výpadek sítě není porucha aplikace.
+    /// přenosná kopie). UI to v banneru nekřičí — kontrola se opakuje
+    /// a výpadek sítě není porucha aplikace.
     error: Option<String>,
 }
 
@@ -76,8 +76,9 @@ fn aktualizovatelna_verze() -> Result<String, String> {
     Ok(current)
 }
 
-/// Poslední výsledek kontroly — do logu jde jen ZMĚNA. Kontrola běží
-/// každou minutu; zapisovat každou by z logu udělalo seznam kontrol.
+/// Poslední výsledek kontroly — do logu jde jen ZMĚNA. Kontrola se
+/// opakuje (start, každých 30 min, návrat okna z oznamovací oblasti);
+/// zapisovat každou by z logu udělalo seznam kontrol.
 static POSLEDNI: Mutex<Option<UpdateInfo>> = Mutex::new(None);
 
 /// Je v repozitáři NOVĚJŠÍ verze, než která běží?
@@ -116,8 +117,9 @@ fn zjisti() -> UpdateInfo {
         return nejde(e);
     }
     // Verze se čte přímo z větve přes raw (`remote_version`), ne přes
-    // commit z API: API má pro nepřihlášené 60 dotazů za hodinu a
-    // kontrola každou minutu by ho vyčerpala (WinSent na to naletěl).
+    // commit z API: API má pro nepřihlášené 60 dotazů za hodinu na
+    // veřejnou IP (sdílí je celá domácnost) a opakovaná kontrola by ho
+    // vyčerpala (WinSent na to naletěl).
     match updater::remote_version() {
         Ok(latest) => UpdateInfo {
             available: updater::is_newer(&latest, &current),

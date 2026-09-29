@@ -11,17 +11,20 @@ Jen Windows 10/11 x64; macOS/Linux se neřeší. UI i komentáře česky, v duch
 3. **Hook callback nikdy neblokuje.** Žádné I/O, žádné logování na disk, žádné volání ViGEm, žádný zámek sdílený s GUI. Windows jinak hook potichu odebere (LowLevelHooksTimeout).
 4. **Čistá logika je oddělená od Windows.** `crates/core` nesmí importovat `windows`, `vigem-client` ani `tauri`; `cargo test -p core` běží bez Windows API (hlídá CI).
 5. **Mapování podle scan kódů**, ne virtuálních kláves – jinak se rozbije české rozložení QWERTZ (Z/Y, horní řada čísel).
-6. **Žádná administrátorská práva** — aplikace ani instalátor nikdy nevyvolají UAC; aplikace nezapisuje do registru. Instalace je per-user (`%LOCALAPPDATA%\Programs\KeyPad`), jediný zápis do registru je záznam v Aplikacích (HKCU) od instalátoru.
+6. **Žádná administrátorská práva** — aplikace ani instalátor s nimi nikdy neběží; aplikace nezapisuje do registru. Instalace je per-user (`%LOCALAPPDATA%\Programs\KeyPad`), jediný zápis do registru je záznam v Aplikacích (HKCU) od instalátoru. **Jediná výjimka:** instalace ovladače ViGEmBus z KeyPadSetup — jen když úplně chybí, jen po výslovném souhlasu, nikdy při aktualizaci; s právy správce (UAC od Windows) běží výhradně oficiální podepsaný instalátor ViGEmBus ověřený napevno zapsaným SHA-256 (`updater::vigembus`). Podrobnosti ROADMAP, princip 6.
 7. **Stav gamepadu se vždy přepočítává celý** z množiny držených kláves (čistá funkce), nikdy se inkrementálně nepřičítá/neodečítá.
+8. **Stejně bezpečný jako WinSent — nic agresivního v systému.** Žádné „optimalizace“, zásahy do registru mimo vlastní záznam v HKCU, služby, naplánované úlohy, zásahy do cizích procesů, firewallu ani nastavení Windows. Každou změnu systému spouští uživatel vlastním kliknutím, aplikace ji vysvětlí předem a ověří potom (plán → provedení → ověření). Nikdy se neskrývá (vlastní procesy, soubory, log jsou vidět) a nikdy nepředstírá záruku, kterou nemá. Cizí binárky se spouštějí jen v přesně ověřené podobě (napevno zapsaný SHA-256 + podpis).
+9. **Všechny verze Windows 10 a 11 (x64).** Testuj schopnost, ne verzi (WinSent INFRA 1.1): nové API volat až po ověření, že existuje (dynamicky přes `GetProcAddress`), nikdy ho staticky neimportovat, pokud by starší build nenaběhl („entry point not found“). Funkce Windows 11 (zaoblené rohy…) musí na desítkách tiše odpadnout.
+10. **Co nejlehčí a nejrychlejší.** Nečinná aplikace nesmí brát měřitelné CPU (žádné zbytečné pollování — události a čekání), minimum paměti, rychlý start, malé binárky, žádné těžké závislosti. Výkon se měří, ne slibuje.
 
 ## Pravidla workspace
 
 | Crate | Balíček / binárka | Smí záviset na |
 |---|---|---|
 | `crates/core` | balíček `core`, knihovna **`keypad_core`** | jen `serde` (+ `proptest` v testech). **Žádné** `windows` / `vigem-client` / `tauri` |
-| `crates/updater` | `updater` | `windows` (WinHttp). Kanál vydání + cesty instalace — **jediný** zdroj pravdy pro instalátor i aplikaci |
+| `crates/updater` | `updater` | `windows` (WinHttp, CNG, cfgmgr32, registr — jen čtení). Kanál vydání, cesty instalace, `vigembus` (pinned instalátor + stav ovladače), `sha256` — **jediný** zdroj pravdy pro instalátor i aplikaci |
 | `crates/installer` | `installer` → `KeyPadSetup.exe` | `updater`, `windows` |
-| `src-tauri` | `keypad` → `KeyPad.exe` | `keypad-core`, `updater`, `tauri`, `windows`; Windows kód hooku/padu ve Fázi 2+ do `src/platform/windows/` |
+| `src-tauri` | `keypad` → `KeyPad.exe` | `keypad-core`, `updater`, `tauri`, `windows`, `webview2-com` (jen paměť schovaného WebView, verze = ta z wry); Windows kód v `src/platform/windows/` (`vigem.rs` vlastní klient ViGEmBus, `pad.rs` pad vlákno, `power.rs` spánek, `ukonceni.rs` událost pro ukončení, `shell.rs`) |
 | `ui/` | Svelte 5 + Vite + TypeScript | **Ne SvelteKit**, žádný router — jedno okno |
 
 - Balíček `core` má knihovnu pojmenovanou `keypad_core`: crate se jménem `core` by v závislých crates zastínil vestavěný `::core` a rozbil makra (serde derive, `format_args!`…). V `Cargo.toml` závislých crates: `keypad-core = { workspace = true }`.
@@ -34,9 +37,13 @@ Jen Windows 10/11 x64; macOS/Linux se neřeší. UI i komentáře česky, v duch
 - GUI → backend jen přes Tauri commands; backend → GUI přes Tauri events. Z hook callbacku nikdy přímo `emit` (princip 3) — hook zapíše stav do atomik / pošle do kanálu a event vydá jiné vlákno.
 - `src-tauri/capabilities/default.json` je **výčet** oprávnění, ne `core:default`. Každé nové JS API okna potřebuje své oprávnění (jinak „not allowed by ACL“); poslech událostí z backendu (Fáze 2+) = `core:event:allow-listen` + `core:event:allow-unlisten`. Vlastní příkazy aplikace oprávnění nepotřebují.
 - `tauri.conf.json` má CSP (`default-src 'self'` …) — externí URL a `data:` v release tiše selžou (dev na devUrl CSP nemá). Fonty a obrázky vždy lokálně.
-- Instalátor zavírá KeyPad zprávou WM_CLOSE oknu třídy **„Tauri Window“** (výchozí z tauri-runtime-wry; `taskkill` bez /F by trefil skryté okno pluginu). Kdyby se v `tauri.conf.json` nastavil `windowClassname`, upravit `crates/installer/src/proc.rs`. WM_CLOSE musí aplikaci vždy opravdu ukončit (žádné „schovat do tray“).
+- Zavření okna KeyPad jen **schová do oznamovací oblasti** a uspí WebView (jako WinSent); ukončit jde z menu v trayi. Instalátor proto ukončuje KeyPad pojmenovanou událostí `updater::QUIT_EVENT_NAME` (uklizený konec: neutrální pad → odpojení), teprve jako záloha WM_CLOSE oknu třídy **„Tauri Window“** (pro vydání 0.1.0 bez události; kdyby se v `tauri.conf.json` nastavil `windowClassname`, upravit `crates/installer/src/proc.rs`) a nakonec `taskkill /F`.
+- Okno se do popředí dostává přes `SetForegroundWindow`, **nikdy** přes `set_focus()` z tao — ten při odepřeném popředí vstříkne do systému falešný stisk Alt (SendInput), který by dopadl do běžící hry (princip 8).
 - Logování: `log::…` makra. Logger zapisuje z vlastního vlákna a na disk nikdy nečeká. **Z hook callbacku ale `log::` nevolat**: `format!` alokuje a `try_send` crossbeamu si může krátce vzít vnitřní zámek sdílený s ostatními vlákny (princip 3) — hook předá pevný záznam jinému vláknu a loguje až to. Vlákna, která nesmí čekat (hook), volají `logger::mark_realtime_thread()` — panic hook na nich pak nečeká na flush.
 - Obě binárky se linkují s `/DEPENDENTLOADFLAG:0x800` (statické importy DLL jen ze System32 — jinak by `KeyPadSetup.exe` spuštěný ze Stažených souborů načetl podvrženou `dwmapi.dll`/`winhttp.dll`, ověřeno revizí). `tools\check-imports.ps1` to v publish i CI vyžaduje. Pomocné programy (`taskkill`, `cmd`, `explorer`) spouštět plnou cestou, nikdy jménem.
+- **První příkaz `main()` obou binárek je `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)`** — DLL, které si systémové knihovny načítají za běhu (WinVerifyTrust → CRYPTSP, WinHttp → IPHLPAPI, SHGetKnownFolderPath → profapi), by jinak šly ze složky programu. Ověřeno podstrčenými DLL.
+- Systémové DLL, které si při inicializaci samy načítají další ne-KnownDLL (např. `powrprof.dll` → `UMPDC.dll` ještě **před** `main`), se **nesmí** importovat staticky — načítají se za běhu přes `LoadLibraryExW(…, LOAD_LIBRARY_SEARCH_SYSTEM32)` (viz `platform/windows/power.rs`). Nová statická DLL = ověřit podstrčenou DLL (harness ve scratchpadu revizí, `tools\check-imports.ps1`).
+- Nová API: minimum je Windows 10 **1507** — `check-imports.ps1` kontroluje i jednotlivé funkce, API sety a zpožděné importy. Novější funkce jen dynamicky (`GetProcAddress`), viz `GetDpiForWindow` v instalátoru.
 - Aktualizace se v aplikaci nabízí jen **novější** verze (`updater::is_newer`) a jen kopii běžící z instalační složky; `raw` CDN drží `version.txt` až 5 min, takže „jiná" by hned po aktualizaci nabízela tu předchozí.
 - Release profil má `panic = "unwind"` a **musí** ho mít: hook callback (Fáze 3) běží v `catch_unwind`.
 - Nové závislosti přidávej přes `[workspace.dependencies]` v kořenovém `Cargo.toml`.
@@ -77,8 +84,18 @@ powershell -ExecutionPolicy Bypass -File tools\check-imports.ps1 -RequireDepende
 powershell -ExecutionPolicy Bypass -File tools\publish.ps1
 ```
 
+```powershell
+# virtuální pad bez okna (vlastní klient ViGEmBus + kontrola přes XInput); exit 3 = v popředí
+# je celoobrazovková aplikace/hra → nic se nepřipojí. Posílá jen hodnoty pod mrtvou zónou.
+cargo run -p keypad --release --example pad_selftest -- vse     # nebo e2e | kill | popredi | xinput
+
+# aplikace bez ViGEmBus (simulace): 1 = nenainstalovaný, vypnuty = nainstalovaný a vypnutý,
+# zbytek = pozůstatek bez zařízení i záznamu v Aplikacích; bez proměnné = skutečný ovladač
+$env:KEYPAD_BEZ_VIGEM = "1"
+```
+
 CI (`.github/workflows/build.yml`) dělá kroky 1–5 publish.ps1 (app přes `tools/tauri.ps1 build --no-bundle -- --locked`) a nahraje binárky jako artefakt.
 
-Instalátor: `KeyPadSetup.exe` (okno) · `/quiet` (z aplikace; zavře se sám jen při čistém úspěchu — když se KeyPad nespustí, chybí WebView2 nebo je co hlásit, okno zůstane) · `/headless` (konzole) · `/uninstall`. Je to GUI binárka — ze skriptu `start "" /wait KeyPadSetup.exe /headless` (nebo `Start-Process -Wait -PassThru`), jinak se na ni nečeká a exit kód se ztratí. Vydání čte z `release/` v repu `iva-exe/KeyPad` (konstanty v `crates/updater/src/lib.rs`).
+Instalátor: `KeyPadSetup.exe` (okno; když ViGEmBus úplně chybí, nabídne ho předvyplněným zaškrtávátkem) · `/quiet` (z aplikace; nikdy neinstaluje ovladač; zavře se sám jen při čistém úspěchu — když se KeyPad nespustí, chybí WebView2 nebo je co hlásit, okno zůstane) · `/headless` (konzole) · `/uninstall` (`/uninstall /quiet` = sám začne i skončí; ViGEmBus nechává) · `/vigembus` (jen krok ovladače, spouští ho aplikace; `/quiet` se s ním ignoruje, `/uninstall` má přednost; exit kód podle ověřeného stavu: 0 = běží, 3010 = poběží po restartu, 1 = jinak). Ladicí přepínače jen v debug buildu: `KEYPAD_SETUP_TEST_VIGEMBUS`, `KEYPAD_SETUP_TEST_NAHLED`, `KEYPAD_SETUP_TEST_FOKUS`, `KEYPAD_SETUP_TEST_KNIHOVNY` (viz `crates/installer/src/main.rs`). **Z Git Bashe nikdy nespouštěj KeyPadSetup s lomítkovými přepínači bez `MSYS_NO_PATHCONV=1`** — MSYS z `/headless` udělá cestu a otevře se okno na ploše (stalo se); bezpečně přes PowerShell `Start-Process -ArgumentList`. Je to GUI binárka — ze skriptu `start "" /wait KeyPadSetup.exe /headless` (nebo `Start-Process -Wait -PassThru`), jinak se na ni nečeká a exit kód se ztratí. Vydání čte z `release/` v repu `iva-exe/KeyPad` (konstanty v `crates/updater/src/lib.rs`).
 
 Testování GUI: okna aplikace ani instalátoru nespouštět na ploše vlastníka a nesimulovat vstup (může mít spuštěnou hru) — na samostatné skryté ploše (`CreateDesktop` + `STARTUPINFO.lpDesktop`).

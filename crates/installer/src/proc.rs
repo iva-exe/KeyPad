@@ -1,11 +1,19 @@
 //! Zavření běžícího KeyPadu před přepsáním nebo smazáním jeho souborů.
 //!
-//! Pořadí je důležité: nejdřív SLUŠNĚ (WM_CLOSE hlavnímu oknu), teprve
-//! když do ~3 s neskončí, NATVRDO. Slušné zavření dává aplikaci šanci
-//! poslat neutrální stav padu, odhookovat klávesnici a odpojit virtuální
-//! ovladač — v tomhle pořadí. Tvrdé ukončení to přeskočí; hook i pad
-//! sice zmizí s procesem, ale hra by mohla zahlédnout poslední vychýlenou
-//! páčku.
+//! Pořadí je důležité: nejdřív SLUŠNĚ, teprve když do ~3 s neskončí,
+//! NATVRDO. Slušné zavření dává aplikaci šanci poslat neutrální stav
+//! padu, odhookovat klávesnici a odpojit virtuální ovladač — v tomhle
+//! pořadí. Tvrdé ukončení to přeskočí; hook i pad sice zmizí s procesem,
+//! ale hra by mohla zahlédnout poslední vychýlenou páčku.
+//!
+//! Slušně = dvě cesty po sobě:
+//! 1. **Pojmenovaná událost** `updater::QUIT_EVENT_NAME`. Novější KeyPad
+//!    zavřením okna jen schová do oznamovací oblasti, takže WM_CLOSE by
+//!    ho neukončil; na událost ale čeká a skončí uklizeně, ať je okno
+//!    vidět, minimalizované, nebo schované.
+//! 2. **WM_CLOSE hlavnímu oknu** — pro vydání bez události (0.1.0, ta
+//!    na zavření okna opravdu končí). Přijde na řadu, jen když proces po
+//!    události do 3 s neskončil nebo událost vůbec nemá.
 //!
 //! WM_CLOSE posíláme sami, ne přes `taskkill` bez `/F`: ten pošle jedinou
 //! zprávu prvnímu *viditelnému* oknu procesu v pořadí oken. U KeyPadu je
@@ -24,14 +32,14 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use windows::core::{BOOL, PWSTR};
+use windows::core::{BOOL, HSTRING, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, WaitForSingleObject, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    OpenEventW, OpenProcess, QueryFullProcessImageNameW, SetEvent, WaitForSingleObject,
+    EVENT_MODIFY_STATE, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetWindowLongW, GetWindowThreadProcessId, IsWindowVisible,
@@ -101,24 +109,45 @@ impl Running {
 pub enum Closed {
     /// Nic neběželo.
     NotRunning,
-    /// Aplikace se zavřela sama po WM_CLOSE.
+    /// Aplikace skončila sama — na událost, nebo po WM_CLOSE.
     Graceful,
     /// Musela se ukončit natvrdo.
     Forced,
 }
 
-/// Zavře všechny procesy spuštěné z `exe` (slušně, pak natvrdo).
+/// Zavře všechny procesy spuštěné z `exe` (událost, WM_CLOSE, natvrdo).
 ///
-/// `status` dostává průběžné hlášky, ať okno nevypadá zamrzle během
-/// tří vteřin čekání.
-pub fn close_app(exe: &Path, status: &mut dyn FnMut(&str)) -> Result<Closed, String> {
+/// `quit_event` je jméno události, na kterou aplikace čeká — v provozu
+/// `updater::QUIT_EVENT_NAME`, testy si dávají vlastní, ať se nikdy
+/// netrefí do skutečně běžícího KeyPadu. `status` dostává průběžné
+/// hlášky, ať okno nevypadá zamrzle během čekání.
+pub fn close_app(
+    exe: &Path,
+    quit_event: &str,
+    status: &mut dyn FnMut(&str),
+) -> Result<Closed, String> {
     let procs = find(exe);
     if procs.is_empty() {
         return Ok(Closed::NotRunning);
     }
 
+    status("žádám KeyPad o ukončení…");
+    // Událost se nastavuje, jen když běží proces z `exe` — jinak by
+    // mohla ukončit třeba vývojový build, který instalaci nedrží.
+    // (Dvě instance naráz single-instance nepustí, takže když běží ta
+    // naše, jinou událost nikdo nečeká.)
+    let mut alive = procs;
+    let signalled = signal_quit(quit_event);
+    if signalled {
+        alive = wait_all(alive, GRACEFUL);
+        if alive.is_empty() {
+            return Ok(Closed::Graceful);
+        }
+    }
+
     status("zavírám běžící KeyPad…");
-    let alive = close_gracefully(procs);
+    // Už nastavenou událost znovu nenastavovat — řekla by totéž.
+    let alive = close_gracefully(alive, (!signalled).then_some(quit_event));
     if alive.is_empty() {
         return Ok(Closed::Graceful);
     }
@@ -142,17 +171,48 @@ pub fn close_app(exe: &Path, status: &mut dyn FnMut(&str)) -> Result<Closed, Str
     Ok(Closed::Forced)
 }
 
+/// Nastaví pojmenovanou událost ukončení; `true` = existovala, tedy na
+/// ni běžící KeyPad čeká. Stačí právo EVENT_MODIFY_STATE — nic víc
+/// instalátor s cizí událostí dělat nepotřebuje.
+fn signal_quit(name: &str) -> bool {
+    // SAFETY: handle z OpenEventW se po SetEvent hned zavře.
+    unsafe {
+        let Ok(ev) = OpenEventW(EVENT_MODIFY_STATE, false, &HSTRING::from(name)) else {
+            return false;
+        };
+        let ok = SetEvent(ev).is_ok();
+        let _ = CloseHandle(ev);
+        ok
+    }
+}
+
+/// Počká nejvýš `timeout` na konec všech procesů; vrací ty, které
+/// pořád běží.
+fn wait_all(mut alive: Vec<Running>, timeout: Duration) -> Vec<Running> {
+    let deadline = Instant::now() + timeout;
+    for p in &alive {
+        p.wait(deadline.saturating_duration_since(Instant::now()));
+    }
+    alive.retain(|p| !p.wait(Duration::ZERO));
+    alive
+}
+
 /// Pošle WM_CLOSE hlavním oknům procesů a počká nejvýš [`GRACEFUL`].
 /// Vrací procesy, které pořád běží.
 ///
 /// Okna se hledají znovu každých [`POLL`]: KeyPad, který se právě
 /// spouští, hlavní okno ještě nemusí mít — to, které vznikne během
 /// čekání, dostane WM_CLOSE taky. Každé okno ale jen jednou; opakovaná
-/// žádost o zavření by aplikaci nic nového neřekla.
-fn close_gracefully(mut alive: Vec<Running>) -> Vec<Running> {
+/// žádost o zavření by aplikaci nic nového neřekla. Ze stejného důvodu
+/// se zkouší i událost ukončení, dokud se ji nepodaří nastavit: KeyPad,
+/// který se právě spouští, ji mohl založit až po prvním pokusu.
+fn close_gracefully(mut alive: Vec<Running>, mut quit_event: Option<&str>) -> Vec<Running> {
     let deadline = Instant::now() + GRACEFUL;
     let mut posted: Vec<isize> = Vec::new();
     loop {
+        if quit_event.is_some_and(signal_quit) {
+            quit_event = None;
+        }
         let pids: Vec<u32> = alive.iter().map(|p| p.pid).collect();
         for hwnd in pick(&top_windows(&pids)) {
             if posted.contains(&hwnd) {
@@ -350,6 +410,17 @@ pub fn same_file(a: &Path, b: &Path) -> bool {
 mod tests {
     use super::*;
 
+    /// Jméno události jen pro tenhle testovací běh. Skutečné
+    /// `updater::QUIT_EVENT_NAME` testy nikdy nenastaví — ukončily by
+    /// KeyPad, který má vlastník zrovna spuštěný.
+    fn test_event() -> String {
+        format!(
+            "Local\\KeyPad.Test.{}.{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        )
+    }
+
     #[test]
     fn stejna_cesta_bez_ohledu_na_velikost() {
         assert!(same_file(
@@ -379,7 +450,7 @@ mod tests {
             .join("KeyPad.exe");
         assert!(find(&fake).is_empty());
         let mut msgs = Vec::new();
-        let r = close_app(&fake, &mut |s| msgs.push(s.to_string()));
+        let r = close_app(&fake, &test_event(), &mut |s| msgs.push(s.to_string()));
         assert_eq!(r, Ok(Closed::NotRunning));
         assert!(msgs.is_empty());
     }
@@ -417,7 +488,7 @@ mod tests {
 
         assert_eq!(find(&exe).len(), 1);
         let mut msgs = Vec::new();
-        let r = close_app(&exe, &mut |s| msgs.push(s.to_string()));
+        let r = close_app(&exe, &test_event(), &mut |s| msgs.push(s.to_string()));
         assert_eq!(r, Ok(Closed::Forced), "{msgs:?}");
         assert!(ours.try_wait().unwrap().is_some(), "náš proces měl skončit");
         assert!(
@@ -602,7 +673,7 @@ mod tests {
         }
 
         let mut msgs = Vec::new();
-        let r = close_app(&exe, &mut |s| msgs.push(s.to_string()));
+        let r = close_app(&exe, &test_event(), &mut |s| msgs.push(s.to_string()));
         if r != Ok(Closed::Graceful) {
             let _ = child.kill();
         }
@@ -610,5 +681,107 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(r, Ok(Closed::Graceful), "{msgs:?}");
         assert!(status.success(), "proces měl skončit sám: {status:?}");
+    }
+
+    /// Proměnná prostředí se jménem události pro podřízený proces níž.
+    const EVENT_ENV: &str = "KEYPAD_TEST_UDALOST";
+
+    /// Podřízený proces pro test níž: KeyPad nové generace bez oken —
+    /// založí událost ukončení a čeká na ni. WM_CLOSE nemá komu přijít,
+    /// takže skončit slušně může JEN přes událost. Když do 30 s nepřijde,
+    /// skončí kódem 3 (test pak neprojde). Bez proměnné hned skončí.
+    #[test]
+    #[ignore = "spouští ho jako podřízený proces test udalost_ukonci_keypad_bez_oken"]
+    fn podrizeny_proces_cekajici_na_udalost() {
+        use windows::Win32::System::Threading::CreateEventW;
+
+        let Ok(name) = std::env::var(EVENT_ENV) else {
+            return;
+        };
+        // SAFETY: událost se založí, počká se na ni a zavře se.
+        unsafe {
+            let ev = CreateEventW(None, false, false, &HSTRING::from(name)).unwrap();
+            let r = WaitForSingleObject(ev, 30_000);
+            let _ = CloseHandle(ev);
+            if r != WAIT_OBJECT_0 {
+                std::process::exit(3);
+            }
+        }
+    }
+
+    /// První slušná cesta: událost. Proces bez oken skončí sám a hned —
+    /// bez tří vteřin čekání na WM_CLOSE a bez `/F`.
+    #[test]
+    fn udalost_ukonci_keypad_bez_oken() {
+        use std::process::{Command, Stdio};
+
+        let dir = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(format!("keypad-event-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("KeyPad.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        let name = test_event();
+
+        let mut child = Command::new(&exe)
+            .args([
+                "--exact",
+                "proc::tests::podrizeny_proces_cekajici_na_udalost",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env(EVENT_ENV, &name)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap();
+
+        // Počkat, až událost vznikne (proces naběhl).
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            // SAFETY: jen otevření a hned zavření handlu.
+            let exists = unsafe {
+                OpenEventW(
+                    windows::Win32::System::Threading::SYNCHRONIZATION_SYNCHRONIZE,
+                    false,
+                    &HSTRING::from(name.as_str()),
+                )
+                .map(|h| {
+                    let _ = CloseHandle(h);
+                })
+                .is_ok()
+            };
+            if exists {
+                break;
+            }
+            if Instant::now() > deadline || child.try_wait().unwrap().is_some() {
+                let _ = child.kill();
+                panic!("podřízený proces nezaložil událost");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let start = Instant::now();
+        let mut msgs = Vec::new();
+        let r = close_app(&exe, &name, &mut |s| msgs.push(s.to_string()));
+        let took = start.elapsed();
+        if r != Ok(Closed::Graceful) {
+            let _ = child.kill();
+        }
+        let status = child.wait().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(r, Ok(Closed::Graceful), "{msgs:?}");
+        assert!(
+            status.success(),
+            "proces měl skončit na událost: {status:?}"
+        );
+        assert!(
+            took < GRACEFUL,
+            "událost má zavřít hned, ne až po WM_CLOSE: {took:?}"
+        );
+        assert_eq!(msgs, ["žádám KeyPad o ukončení…"]);
     }
 }

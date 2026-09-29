@@ -20,19 +20,41 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
 crossbeam-channel = { workspace = true }
-tauri = { workspace = true }
+# tray-icon: ikona v oznamovací oblasti — zavření okna KeyPad jen
+# schová (jako WinSent), virtuální pad mezitím zůstává připojený.
+tauri = { workspace = true, features = ["tray-icon"] }
 # Druhé spuštění nevyrobí další proces — jen ukáže okno toho běžícího.
 tauri-plugin-single-instance = { workspace = true }
+# Schované okno: WebView2 dostane cíl „málo paměti" (princip 10).
+webview2-com = { workspace = true }
 
-# Win32 zatím jen pro okno a drobnosti kolem něj: zaoblené rohy a tmavý
-# rámeček (DWM), místní čas do logu (Time) a hláška, když se aplikace
-# nespustí (MessageBox — release nemá konzoli). Hook, ViGEm a zbytek
-# přibydou ve Fázi 2+ (platform/windows).
+# Win32: okno (DWM, vyzdvižení), místní čas do logu, hláška při
+# nespuštění (MessageBox) a Fáze 2 — vlastní klient ViGEmBus (CfgMgr32
+# hledá rozhraní, overlapped DeviceIoControl s časovým limitem), uspání
+# (Power), pojmenovaná událost pro ukončení z instalátoru (Threading)
+# a spuštění instalátoru ViGEmBus (Shell). XboxController jen kvůli
+# konstantám XINPUT_GAMEPAD_* v testech a XInputGetState v příkladu
+# pad_selftest — KeyPad.exe sám xinput1_4.dll neimportuje (windows-rs
+# linkuje jen funkce, které se opravdu volají).
 [dependencies.windows]
 workspace = true
 features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Graphics_Dwm",
+    # jen příklad pad_selftest (kontrola celoobrazovkového okna)
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_IO",
+    # SetDefaultDllDirectories — DLL za běhu jen ze System32
+    "Win32_System_LibraryLoader",
+    "Win32_System_Power",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
     "Win32_System_Time",
+    "Win32_UI_Input_XboxController",
+    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ]
