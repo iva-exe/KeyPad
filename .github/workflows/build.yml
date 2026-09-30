@@ -81,8 +81,25 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # Log akcí vidí jen přihlášený uživatel GitHubu — selhané testy
+      # proto jdou i do souhrnu běhu, který je u veřejného repa vidět
+      # bez přihlášení. Runner je Windows Server na jádře Windows 11
+      # (jiná písma než desítky), takže tu umí spadnout test, který
+      # lokálně na Windows 10 projde.
       - name: cargo test
-        run: cargo test --workspace --locked
+        shell: pwsh
+        run: |
+          [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+          $log = Join-Path $env:RUNNER_TEMP 'cargo-test.log'
+          cargo test --workspace --locked 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $log
+          $kod = $LASTEXITCODE
+          if ($kod -ne 0) {
+            $vypis = Select-String -Path $log -Encoding utf8 -Pattern 'panicked at|^---- |FAILED|^failures:|error(\[|:)' -Context 0,8 |
+              ForEach-Object { $_.Line; $_.Context.PostContext } | Select-Object -First 200
+            @('## cargo test selhal', '', '```text') + $vypis + @('```') |
+              Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          }
+          exit $kod
 
       # Princip 4 (ROADMAP.md): crates/core je čistá logika bez Windows
       # API — jen tak jde engine testovat bez hooku a bez ViGEmu.
