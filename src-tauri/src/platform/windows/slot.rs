@@ -70,6 +70,9 @@ pub struct StavSlot {
     /// číslo zápisu (16) | LY (16) | RX (16) | RY (16)
     b: AtomicU64,
     zapisu: AtomicU32,
+    /// Tep pad vlákna (`GetTickCount64`, ms): kdy naposledy mluvilo
+    /// s ovladačem. Čte ho hook (watchdog, Fáze 5) — bez zámku.
+    tep: AtomicU64,
     budik: Budik,
 }
 
@@ -88,6 +91,7 @@ impl StavSlot {
             a: AtomicU64::new(0),
             b: AtomicU64::new(0),
             zapisu: AtomicU32::new(0),
+            tep: AtomicU64::new(0),
             budik: Budik::new()?,
         })
     }
@@ -135,6 +139,16 @@ impl StavSlot {
             }
         }
         None
+    }
+
+    /// Tep pad vlákna (zapisuje jen ono).
+    pub fn zapis_tep(&self, ms: u64) {
+        self.tep.store(ms, Ordering::Release);
+    }
+
+    /// Kdy pad vlákno naposledy mluvilo s ovladačem (0 = nikdy).
+    pub fn tep(&self) -> u64 {
+        self.tep.load(Ordering::Acquire)
     }
 
     /// Nastaví událost (nový příkaz ve frontě pad vlákna).

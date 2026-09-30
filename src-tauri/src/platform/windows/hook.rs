@@ -25,18 +25,20 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, Sender};
 use keypad_core::{
     Decision, DisabledReason, Engine, ForceReason, KeyId, Mapping, Mode, PadId, PadState,
-    PadUpdates,
+    PadUpdates, MAX_PADS,
 };
-use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, KillTimer, PeekMessageW, PostThreadMessageW,
-    SetTimer, SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT,
-    LLKHF_EXTENDED, LLKHF_INJECTED, MSG, PM_NOREMOVE, WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_KEYUP,
-    WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
+    SetTimer, SetWindowsHookExW, UnhookWindowsHookEx, EVENT_SYSTEM_DESKTOPSWITCH, HC_ACTION, HHOOK,
+    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, MSG, PM_NOREMOVE, WH_KEYBOARD_LL,
+    WINEVENT_OUTOFCONTEXT, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_TIMER,
 };
 
 /// Ve frontě kanálu čekají příkazy (probuzení smyčky).
@@ -48,6 +50,11 @@ const WM_PANIKA: u32 = WM_APP + 2;
 /// o čtvrt vteřiny později je pořád „po deseti vteřinách". Časovač běží
 /// jen během přiřazování — nečinný hook nikdy netiká (princip 10).
 const TIK_MS: u32 = 250;
+
+/// Watchdog (Fáze 5): ovladač, jehož pad vlákno déle nemluvilo s ViGEm,
+/// je zaseknutý. Keep-alive chodí každých 200 ms — 1 s je pět
+/// vynechaných a pořád dost pod tím, co by hráč považoval za „visí".
+pub const WATCHDOG_MS: u64 = 1_000;
 
 /// Jak dlouho se čeká na nainstalování a na konec vlákna. Obojí trvá
 /// milisekundy; limit jen hlídá, aby okno nikdy nečekalo navždy.
@@ -110,15 +117,19 @@ pub trait Vystup: Send + Sync {
     /// Volá jen smyčka, nikdy callback. Okno pak nesmí tvrdit, že
     /// klávesy ovládají ovladač (princip 8).
     fn hook_chyba(&self, _chyba: bool) {}
+
+    /// Tep pad vlákna ovladače (`GetTickCount64`, ms) pro watchdog;
+    /// `None` = výstup ovladače nezná (testy, příklad). Volá se
+    /// z callbacku — jen čtení atomiku.
+    fn tep_ms(&self, _pad: PadId) -> Option<u64> {
+        None
+    }
 }
 
 /// Příkazy hook vláknu. Každý vede na volání enginu a jeho rozhodnutí
 /// jde do [`Vystup`]u stejně jako rozhodnutí o klávese.
 #[derive(Debug, Clone)]
-#[allow(
-    dead_code,
-    reason = "Vynut použije Fáze 5 (hlídání), Mapovani Fáze 6–7 (editor, konfigurace)"
-)]
+#[allow(dead_code, reason = "Mapovani použije Fáze 6–7 (editor, konfigurace)")]
 pub enum HookPrikaz {
     /// Nové mapování (v režimu Gamepad nejdřív vynutí Klávesnici).
     Mapovani(Box<Mapping>),
@@ -136,6 +147,9 @@ pub enum HookPrikaz {
     Zachytavej,
     /// Vynutit Klávesnici (fail-safe).
     Vynut(ForceReason),
+    /// Vynutit Klávesnici a zapomenout držené klávesy — key-upy se
+    /// ztratily (zamčení relace, odpojení relace).
+    Zapomen(ForceReason),
     /// Odhooknout a nainstalovat znovu (Windows mohli hook potichu
     /// odebrat). Držené klávesy se zapomenou.
     Preinstaluj,
@@ -346,6 +360,10 @@ struct Stav {
     /// Drží OS klávesu s daným VK? Skutečně [`os_drzi`], v testech
     /// podvrh (skutečný stav klávesnice testy měnit nesmí).
     os_drzi: fn(u32) -> bool,
+    /// Kdy engine ovladač povolil. Pad vlákno ohlásí „zapnuto" dřív,
+    /// než zkopíruje tep do slotu — watchdog tedy bere novější z obou,
+    /// jinak by čerstvě zapnutý ovladač mohl hned vypadat zaseknutý.
+    povoleno_ms: [u64; MAX_PADS],
 }
 
 /// Drží OS klávesu? Asynchronní stav klávesnice: v LL hooku je to stav
@@ -396,10 +414,12 @@ fn vlakno(
             vystup,
             rozbity: false,
             os_drzi,
+            povoleno_ms: [0; MAX_PADS],
         })
     });
     // Hook zatím ne: bez zapnutého ovladače ho engine nepotřebuje.
     let mut hook = HHOOK::default();
+    let plocha = hlidej_plochu();
     let _ = hotovo.send(Ok(tid));
 
     let mut casovac = 0usize;
@@ -429,6 +449,14 @@ fn vlakno(
                             if !hook.is_invalid() {
                                 s_enginem(|e| e.capture(ted_ms()));
                             }
+                        }
+                        HookPrikaz::Povol(pad) => {
+                            STAV.with(|s| {
+                                if let Some(s) = s.borrow_mut().as_mut() {
+                                    s.povoleno_ms[pad.index()] = ted_ms();
+                                }
+                            });
+                            s_enginem(|e| e.enable(pad));
                         }
                         p => s_enginem(|e| prikaz(e, p, ted_ms())),
                     }
@@ -475,7 +503,65 @@ fn vlakno(
         // SAFETY: časovač vlákna vytvořený v `hlidej_casovac`.
         let _ = unsafe { KillTimer(None, casovac) };
     }
+    if let Some(h) = plocha {
+        // SAFETY: handle z SetWinEventHook, odebírá se právě jednou.
+        let _ = unsafe { UnhookWinEvent(h) };
+    }
     STAV.with(|s| s.borrow_mut().take());
+}
+
+/// Přepnutí plochy (Fáze 5): výzva UAC, Ctrl+Alt+Del, zamčení (Win+L)
+/// přepnou na zabezpečenou plochu, kde LL hook key-upy nevidí. Klávesa
+/// držená přes přepnutí by po návratu zůstala „dole" — ovladač by měl
+/// vychýlenou páčku, dokud ji uživatel znovu nestiskne a nepustí.
+///
+/// Událost `EVENT_SYSTEM_DESKTOPSWITCH` chodí do smyčky tohohle vlákna
+/// (mimo kontext, bez DLL v cizích procesech). `None` = hlídání nejde —
+/// zůstává ztracený key-up (1,5 s) a zkratka.
+fn hlidej_plochu() -> Option<HWINEVENTHOOK> {
+    // SAFETY: callback je funkce tohoto modulu a žije po celý běh;
+    // WINEVENT_OUTOFCONTEXT = volá se ze smyčky zpráv tohoto vlákna.
+    let h = unsafe {
+        SetWinEventHook(
+            EVENT_SYSTEM_DESKTOPSWITCH,
+            EVENT_SYSTEM_DESKTOPSWITCH,
+            None,
+            Some(plocha_se_prepnula),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        )
+    };
+    if h.is_invalid() {
+        log::warn!("přepnutí plochy nejde hlídat — po výzvě UAC pomůže zkratka");
+        None
+    } else {
+        Some(h)
+    }
+}
+
+/// Callback přepnutí plochy. Běží ve smyčce hook vlákna (ne v LL hooku),
+/// smí tedy logovat; panika nesmí přes hranici FFI.
+unsafe extern "system" fn plocha_se_prepnula(
+    _hook: HWINEVENTHOOK,
+    _udalost: u32,
+    _okno: HWND,
+    _objekt: i32,
+    _potomek: i32,
+    _vlakno: u32,
+    _cas: u32,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(prepnuti_plochy));
+}
+
+/// Co udělat při přepnutí plochy (mimo FFI, ať to jde otestovat).
+fn prepnuti_plochy() {
+    if rezim().is_some_and(|m| !matches!(m, Mode::Disabled { .. })) {
+        log::info!(
+            "přepnutí plochy (UAC, Ctrl+Alt+Del, zamčení) — Klávesnice, držené klávesy zapomenuty"
+        );
+    }
+    s_enginem(|e| e.reset_held(ForceReason::DesktopSwitch));
 }
 
 /// Režim enginu (`None` = stav je pryč nebo rozbitý).
@@ -611,6 +697,7 @@ fn prikaz(e: &mut Engine, p: HookPrikaz, ted: u64) -> Decision {
         HookPrikaz::Prepni => e.toggle(ted),
         HookPrikaz::Zachytavej => e.capture(ted),
         HookPrikaz::Vynut(duvod) => e.force_keyboard(duvod),
+        HookPrikaz::Zapomen(duvod) => e.reset_held(duvod),
         // Přeinstalaci dělá smyčka; bez hooku v systému není co dělat.
         HookPrikaz::Preinstaluj => Decision::NONE,
     }
@@ -677,6 +764,13 @@ fn zpracuj(wparam: WPARAM, kb: &KBDLLHOOKSTRUCT) -> bool {
             return false;
         }
         let ted = ted_ms();
+        // Watchdog: klávesy do zaseknutého ovladače by jen mizely
+        // (princip 1) — hra dál vidí jeho poslední stav a uživatel nemůže
+        // ani psát. Proto Klávesnice; zachytávání vrátí zkratka.
+        if s.engine.mode() == Mode::Gamepad && zaseknuty(s, ted) {
+            let d = s.engine.force_keyboard(ForceReason::Watchdog);
+            s.vystup.rozhodnuti(None, &d, s.engine.mode());
+        }
         // Key-down klávesy, o které engine neví, ale OS ji drží: hook ji
         // neviděl stisknout (nainstaloval se později, nebo se držené
         // klávesy zapomněly). Je to autorepeat klávesy OS — ne nový
@@ -687,6 +781,18 @@ fn zpracuj(wparam: WPARAM, kb: &KBDLLHOOKSTRUCT) -> bool {
         let d = s.engine.on_key(u.klavesa, dolu, ted);
         s.vystup.rozhodnuti(Some(&u), &d, s.engine.mode());
         d.suppress
+    })
+}
+
+/// Je některý připravený ovladač zaseknutý (pad vlákno dlouho nemluvilo
+/// s ViGEm)? Jen čtení atomiků — volá se z callbacku.
+fn zaseknuty(s: &Stav, ted: u64) -> bool {
+    PadId::ALL.iter().any(|&p| {
+        s.engine.is_ready(p)
+            && s.vystup.tep_ms(p).is_some_and(|t| {
+                let zivy = t.max(s.povoleno_ms[p.index()]);
+                ted.saturating_sub(zivy) > WATCHDOG_MS
+            })
     })
 }
 
@@ -748,6 +854,8 @@ mod tests {
         /// Kolikátým voláním zpanikařit (0 = nikdy).
         panikar: AtomicU32,
         volani: AtomicU32,
+        /// Tep ovladačů pro watchdog (0 = výstup ho nezná).
+        tep: std::sync::atomic::AtomicU64,
     }
 
     impl Vystup for Zaznam {
@@ -761,6 +869,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((u.copied(), *d, rezim));
+        }
+
+        fn tep_ms(&self, _pad: PadId) -> Option<u64> {
+            Some(self.tep.load(Ordering::Acquire)).filter(|&t| t != 0)
         }
     }
 
@@ -784,6 +896,7 @@ mod tests {
                 vystup,
                 rozbity: false,
                 os_drzi: nic_nedrzi,
+                povoleno_ms: [0; MAX_PADS],
             })
         });
     }
@@ -993,6 +1106,7 @@ mod tests {
                 rozbity: false,
                 // Skutečný dotaz na stav klávesy — i ten musí být bez alokace.
                 os_drzi,
+                povoleno_ms: [0; MAX_PADS],
             })
         });
         // Scroll Lock (přepnutí), W, šipka, AltGr, média, vstříknutá.
@@ -1203,6 +1317,69 @@ mod tests {
             assert_eq!(d.pads.get(p), Some(PadState::NEUTRAL), "{p:?}");
         }
         assert!(!hook.posli(HookPrikaz::Prepni), "mrtvé vlákno nic nepřijme");
+    }
+
+    /// Watchdog (Fáze 5): ovladač, jehož pad vlákno přes 1 s nemluvilo
+    /// s ViGEm, dostane při nejbližší klávese Klávesnici — klávesa jde
+    /// do OS, ne do zaseknutého ovladače. Živý ovladač nic nezmění.
+    #[test]
+    fn watchdog_zaseknuteho_ovladace() {
+        let z = Arc::new(Zaznam::default());
+        priprav(&z);
+        z.tep.store(ted_ms(), Ordering::Release);
+        assert!(zavolej(0, WM_KEYDOWN, &kb(0x76, 0)), "živý ovladač hraje");
+        assert!(zavolej(0, WM_KEYUP, &kb(0x76, LLKHF_UP.0)));
+        z.tep.store(1, Ordering::Release);
+        assert!(!zavolej(0, WM_KEYDOWN, &kb(0x76, 0)), "zaseknutý: do OS");
+        assert_eq!(rezim(), Mode::Keyboard);
+        let vynuceni = z.rozhodnuti.lock().unwrap().iter().any(|r| {
+            r.1.ui
+                == Some(UiEvent::ModeChanged {
+                    mode: Mode::Keyboard,
+                    cause: ModeCause::Forced(ForceReason::Watchdog),
+                })
+        });
+        assert!(vynuceni);
+        assert!(!zavolej(0, WM_KEYUP, &kb(0x76, LLKHF_UP.0)));
+        // Čerstvé povolení se počítá jako tep (ohlášení „zapnuto" předbíhá
+        // kopii tepu do slotu).
+        STAV.with(|s| {
+            let mut g = s.borrow_mut();
+            let s = g.as_mut().unwrap();
+            s.povoleno_ms[0] = ted_ms();
+            let _ = s.engine.toggle(ted_ms());
+        });
+        assert!(
+            zavolej(0, WM_KEYDOWN, &kb(0x76, 0)),
+            "čerstvě povolený hraje"
+        );
+    }
+
+    /// Přepnutí plochy (UAC, Ctrl+Alt+Del, zamčení): Klávesnice a držené
+    /// klávesy zapomenuté — key-up po návratu jde do OS, ovladač neutrální.
+    #[test]
+    fn prepnuti_plochy_zapomene_klavesy() {
+        let z = Arc::new(Zaznam::default());
+        priprav(&z);
+        assert!(zavolej(0, WM_KEYDOWN, &kb(0x76, 0)));
+        prepnuti_plochy();
+        assert_eq!(rezim(), Mode::Keyboard);
+        assert!(!drzeno(F24));
+        let (_, d, _) = z.posledni();
+        assert_eq!(d.pads.get(PadId::FIRST), Some(PadState::NEUTRAL));
+        assert!(!zavolej(0, WM_KEYUP, &kb(0x76, LLKHF_UP.0)));
+        // Zamčení relace přes příkaz dělá totéž.
+        assert!(!zavolej(0, WM_KEYDOWN, &kb(0x76, 0)));
+        let d = STAV.with(|s| {
+            let mut g = s.borrow_mut();
+            prikaz(
+                &mut g.as_mut().unwrap().engine,
+                HookPrikaz::Zapomen(ForceReason::SessionLock),
+                ted_ms(),
+            )
+        });
+        assert_eq!(d.pads.get(PadId::FIRST), Some(PadState::NEUTRAL));
+        assert!(!drzeno(F24));
     }
 
     /// Časovač přiřazování běží jen při přiřazování.

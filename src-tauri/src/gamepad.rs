@@ -17,18 +17,23 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use keypad_core::{DisabledReason, Mapping, PadId, MAX_PADS};
+use keypad_core::{DisabledReason, ForceReason, Mapping, PadId, MAX_PADS};
 use serde::Deserialize;
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::platform::windows::hook::{Hook, HookOdesilatel, HookPrikaz, Vystup};
+use crate::platform::windows::hook::{Hook, HookOdesilatel, HookPrikaz, Vystup, WATCHDOG_MS};
 use crate::platform::windows::pad::{Oznam, PadInfo, PadPrikaz, PadStav, Pady, UDALOST};
 use crate::platform::windows::slot::Budik;
-use crate::platform::windows::vystup::{HookVystup, RezimInfo};
+use crate::platform::windows::vystup::{HookVystup, Rezim, RezimInfo};
 use crate::platform::windows::{power, shell};
 
 /// Tauri událost se změnou režimu (payload [`RezimInfo`]).
 pub const UDALOST_REZIM: &str = "rezim";
+
+/// Jak často vlákno okna během hraní kontroluje tep ovladačů (Fáze 5).
+/// Callback hooku to kontroluje u každé klávesy; tohle pokryje chvíli,
+/// kdy hráč nic nemačká. Mimo hraní se netiká (princip 10).
+const PULS_MS: u64 = 500;
 
 /// Jak dlouho při konci aplikace čekat na neutrál + odpojení padů.
 /// Normálně milisekundy; když ovladač visí, proces skončí i tak a pady
@@ -91,20 +96,43 @@ pub fn spust(app: &tauri::App) -> Result<(), String> {
     let _ = hook_tx.set(hook.odesilatel());
 
     // Změna režimu → okno. Vlastní vlákno, protože hook callback smí jen
-    // nastavit událost (princip 3); tohle vlákno spí, dokud nepřijde.
+    // nastavit událost (princip 3); tohle vlákno spí, dokud nepřijde —
+    // jen během hraní se budí i samo a hlídá tep ovladačů (watchdog).
     let handle = app.handle().clone();
     let v = Arc::clone(&vystup);
+    let pady_rezimu = Arc::clone(&pady);
+    let tx = hook.odesilatel();
+
+    // Zamčení relace (Fáze 5): key-upy kláves držených přes zámek hook
+    // neuvidí — zapomenout je a vynutit Klávesnici. Po odemčení
+    // zachytávání vrátí zkratka.
+    let tx_relace = hook.odesilatel();
+    crate::platform::windows::relace::pri_zamceni(move |duvod| {
+        log::info!("relace: {duvod} — Klávesnice, držené klávesy zapomenuty");
+        tx_relace.posli(HookPrikaz::Zapomen(ForceReason::SessionLock));
+    });
     std::thread::Builder::new()
         .name("keypad-rezim".into())
         .spawn(move || {
             let mut posledni = v.info().seq;
             loop {
-                budik.cekej(None);
+                let hraje = v.info().rezim == Rezim::Capturing;
+                budik.cekej(hraje.then_some(PULS_MS));
                 let r = v.info();
                 if r.seq != posledni {
                     log::info!("režim: {:?}", r.rezim);
                     posledni = r.seq;
                     let _ = handle.emit(UDALOST_REZIM, r);
+                }
+                if r.rezim == Rezim::Capturing {
+                    let zaseknuty = zaseknuty_pad(|i| pady_rezimu.stav_a_tep(i), ted_ms());
+                    if let Some(i) = zaseknuty {
+                        log::warn!(
+                            "ovladač {} přes {WATCHDOG_MS} ms nemluví s ViGEmBus — Klávesnice",
+                            i + 1
+                        );
+                        tx.posli(HookPrikaz::Vynut(ForceReason::Watchdog));
+                    }
                 }
             }
         })
@@ -117,6 +145,20 @@ pub fn spust(app: &tauri::App) -> Result<(), String> {
         konec: Mutex::new(()),
     });
     Ok(())
+}
+
+/// Zapnutý ovladač, jehož pad vlákno přes [`WATCHDOG_MS`] nemluvilo
+/// s ViGEmBus (první takový). Čistá funkce kvůli testu.
+fn zaseknuty_pad(stav_a_tep: impl Fn(usize) -> Option<(PadStav, u64)>, ted: u64) -> Option<usize> {
+    (0..MAX_PADS).find(|&i| {
+        stav_a_tep(i)
+            .is_some_and(|(s, tep)| s == PadStav::On && ted.saturating_sub(tep) > WATCHDOG_MS)
+    })
+}
+
+fn ted_ms() -> u64 {
+    // SAFETY: bez parametrů, jen čte čítač.
+    unsafe { windows::Win32::System::SystemInformation::GetTickCount64() }
 }
 
 /// Co má hook udělat, když se stav ovladače změnil.
@@ -453,6 +495,24 @@ mod tests {
             assert_eq!(stav_z_kodu(kod_stavu(s)), Some(s));
         }
         assert_eq!(stav_z_kodu(0), None);
+    }
+
+    /// Watchdog okna: jen zapnutý ovladač se starým tepem; vypnutý ani
+    /// čerstvý ne.
+    #[test]
+    fn watchdog_okna() {
+        let stavy = [
+            Some(PadStav::Off),
+            Some(PadStav::On),
+            Some(PadStav::On),
+            None,
+        ];
+        let tepy = [0, 9_000, 10_000, 0];
+        let st = |i: usize| stavy[i].map(|s| (s, tepy[i]));
+        assert_eq!(zaseknuty_pad(st, 10_000), None);
+        assert_eq!(zaseknuty_pad(st, 10_000 + WATCHDOG_MS), Some(1));
+        assert_eq!(zaseknuty_pad(st, 12_000), Some(1));
+        assert_eq!(zaseknuty_pad(|_| Some((PadStav::Off, 0)), u64::MAX), None);
     }
 
     #[test]

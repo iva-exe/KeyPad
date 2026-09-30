@@ -115,7 +115,6 @@ pub enum PadStav {
 }
 
 impl PadStav {
-    #[cfg_attr(not(test), allow(dead_code, reason = "watchdog padu ve Fázi 5"))]
     fn z_u8(v: u8) -> PadStav {
         match v {
             1 => PadStav::Connecting,
@@ -208,15 +207,13 @@ impl PadStatus {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code, reason = "watchdog padu ve Fázi 5"))]
     pub fn stav(&self) -> PadStav {
         PadStav::z_u8(self.stav.load(Ordering::Acquire))
     }
 
     /// Kdy pad vlákno naposledy úspěšně mluvilo s ovladačem
-    /// (`GetTickCount64`, ms). Watchdog Fáze 5: v režimu Gamepad starší
-    /// než 1 s → vynutit Klávesnici.
-    #[cfg_attr(not(test), expect(dead_code, reason = "watchdog padu ve Fázi 5"))]
+    /// (`GetTickCount64`, ms). Pad vlákno ho kopíruje do slotu, kde ho
+    /// čte watchdog hooku (Fáze 5).
     pub fn heartbeat_ms(&self) -> u64 {
         self.heartbeat_ms.load(Ordering::Acquire)
     }
@@ -401,6 +398,11 @@ impl<B: Backend> Smycka<B> {
     /// přímo do BSOD ViGEmBus #160.
     pub fn uspava_se(&mut self, od_ms: u64) {
         self.uspava_se_od = Some(od_ms);
+    }
+
+    /// Tep pad vlákna (viz [`PadStatus::heartbeat_ms`]).
+    pub fn tep_ms(&self) -> u64 {
+        self.status.heartbeat_ms()
     }
 
     pub fn skoncila(&self) -> bool {
@@ -1236,6 +1238,15 @@ impl Pady {
         })
     }
 
+    /// Stav a tep ovladače `i` z atomik (watchdog okna, Fáze 5). Tep se
+    /// zapisuje DŘÍV, než pad vlákno ohlásí „zapnuto", takže čerstvě
+    /// zapnutý ovladač nikdy nevypadá zaseknutý. `None` = vlákno neběží.
+    pub fn stav_a_tep(&self, i: usize) -> Option<(PadStav, u64)> {
+        let g = self.zamek();
+        let st = g.pady.get(i)?.as_ref()?.status();
+        Some((st.stav(), st.heartbeat_ms()))
+    }
+
     /// Stav všech ovladačů, jejichž vlákno běží.
     #[cfg_attr(
         not(test),
@@ -1398,6 +1409,9 @@ fn vlakno<B: Backend>(mut s: Smycka<B>, rx: Receiver<PadPrikaz>, slot: &StavSlot
             }
         }
         s.krok();
+        // Tep pro watchdog hooku: jen kopie — nový je, jen když ovladač
+        // opravdu přijal stav (keep-alive každých 200 ms).
+        slot.zapis_tep(s.tep_ms());
     }
     // Kdo ještě čeká na potvrzení (uspání, druhý konec), ať nečeká do
     // limitu — pad je odpojený.

@@ -278,17 +278,17 @@ Zpětná vazba po vyzkoušení Fáze 2. Jde první, dřív než hook — mění 
 
 ### Fáze 5 – Pojistky proti softlocku
 
-- [ ] **Watchdog padu:** hook vlákno při každé události v režimu Gamepad kontroluje heartbeat; starší než 1 s → vynutit Klávesnici. Totéž kontroluje GUI strana každých 500 ms.
-- [ ] **Uzamčení / spánek:** message-only okno v hook vlákně, `WTSRegisterSessionNotification` a `WM_POWERBROADCAST`; při `WTS_SESSION_LOCK` / `PBT_APMSUSPEND` → `Engine::reset_held` (vynutí Klávesnici a vyprázdní `held`; key-up během zámku nepřijdou).
-- [ ] **Zabezpečená plocha** (výzva UAC, Ctrl+Alt+Del) neposílá `WTS_SESSION_LOCK`, ale LL hook tam taky nevidí key-upy: `SetWinEventHook(EVENT_SYSTEM_DESKTOPSWITCH)` v hook vlákně → `reset_held(DesktopSwitch)`. Bez toho by po návratu zůstala páčka vychýlená, dokud se klávesa znovu nestiskne a nepustí.
-- [ ] Zvážit totéž při přepnutí popředí na okno s vyššími právy (UIPI — hook mu klávesy nevidí).
-- [ ] Nenamapované klávesy **se v režimu Gamepad vždy propouštějí** (Alt+Tab, Win, Alt+F4 zůstávají funkční).
-- [ ] Mapování nesmí obsahovat zkratku přepnutí (validace v GUI i při načtení konfigurace).
-- [ ] Pokud se hook vlákno zasekne, Windows hook po timeoutu přeskočí → klávesy jdou do OS. Zdokumentovat jako přijatelné selhání (není softlock).
-- [ ] Poslední záchrana (do README): Ctrl+Alt+Del nelze hookem zachytit → Správce úloh → ukončit aplikaci; hook i virtuální pad zmizí s procesem.
-- [ ] **Ukončení** (menu v oznamovací oblasti nebo událost `QUIT_EVENT_NAME` od instalátoru) = neutrální pad, odhook, odpojení targetu, v tomto pořadí. Zavření okna jen schovává do trayе. Otevřená otázka 21: má schování okna v režimu Gamepad vynutit Klávesnici?
+- [x] **Watchdog padu:** hook vlákno při každé události v režimu Gamepad kontroluje heartbeat; starší než 1 s → vynutit Klávesnici. Totéž kontroluje GUI strana každých 500 ms. _(Pad vlákno kopíruje tep do slotu; callback ho kontroluje u každé klávesy v Gamepadu — čerstvé povolení ovladače se počítá jako tep, ohlášení „zapnuto“ totiž předbíhá kopii. Okno kontroluje `PadStatus` každých 500 ms, jen během hraní.)_
+- [x] **Uzamčení / spánek:** message-only okno v hook vlákně, `WTSRegisterSessionNotification` a `WM_POWERBROADCAST`; při `WTS_SESSION_LOCK` / `PBT_APMSUSPEND` → `Engine::reset_held` (vynutí Klávesnici a vyprázdní `held`; key-up během zámku nepřijdou). _(Zamčení, přepnutí uživatele a odpojení vzdálené plochy: `WTSRegisterSessionNotification` ve skrytém okně relace (`relace.rs`, wtsapi32 za běhu ze System32) → `Zapomen(SessionLock)`. Spánek: pady se vypnou (Fáze 2b) → poslední vypnutý ovladač → `Disabled` → hook odebrán a držené klávesy zapomenuty.)_
+- [x] **Zabezpečená plocha** (výzva UAC, Ctrl+Alt+Del) neposílá `WTS_SESSION_LOCK`, ale LL hook tam taky nevidí key-upy: `SetWinEventHook(EVENT_SYSTEM_DESKTOPSWITCH)` v hook vlákně → `reset_held(DesktopSwitch)`. Bez toho by po návratu zůstala páčka vychýlená, dokud se klávesa znovu nestiskne a nepustí. _(`SetWinEventHook(EVENT_SYSTEM_DESKTOPSWITCH)` mimo kontext v hook vlákně → `reset_held(DesktopSwitch)`; klávesy držené přes přepnutí pak převezme `adopt_os_key`.)_
+- [ ] Zvážit totéž při přepnutí popředí na okno s vyššími právy (UIPI — hook mu klávesy nevidí). _(Zatím ne — otevřená otázka 39.)_
+- [x] Nenamapované klávesy **se v režimu Gamepad vždy propouštějí** (Alt+Tab, Win, Alt+F4 zůstávají funkční). _(Fáze 1.)_
+- [x] Mapování nesmí obsahovat zkratku přepnutí (validace v GUI i při načtení konfigurace). _(Jádro: `Mapping` to nedovolí vyrobit. GUI a konfigurace ve Fázi 6–7.)_
+- [x] Pokud se hook vlákno zasekne, Windows hook po timeoutu přeskočí → klávesy jdou do OS. Zdokumentovat jako přijatelné selhání (není softlock). _(README, „Bezpečnost“.)_
+- [x] Poslední záchrana (do README): Ctrl+Alt+Del nelze hookem zachytit → Správce úloh → ukončit aplikaci; hook i virtuální pad zmizí s procesem. _(README.)_
+- [x] **Ukončení** (menu v oznamovací oblasti nebo událost `QUIT_EVENT_NAME` od instalátoru) = neutrální pad, odhook, odpojení targetu, v tomto pořadí. Zavření okna jen schovává do trayе. Otevřená otázka 21: má schování okna v režimu Gamepad vynutit Klávesnici? _(Fáze 4: neutrál → odhooknout → odpojit, celý konec pod jedním zámkem.)_
 
-**Hotovo, když:** projdou všechny scénáře v tabulce edge cases níže.
+**Hotovo, když:** projdou všechny scénáře v tabulce edge cases níže. _Stav: pojistky ověřené testy (watchdog, přepnutí plochy, zapomenutí, panika mimo callback, klávesa držená OS). Skutečné Win+L, UAC a Ctrl+Alt+Del s drženou klávesou ověří vlastník — testy nesmí přepínat plochy ani simulovat vstup._
 
 ### Fáze 6 – GUI
 
@@ -423,6 +423,7 @@ Nejasnosti ve specifikaci, na které se narazilo. U každé je, jak to **teď** 
 36. **Stav padů při změně režimu jde všem 4 ovladačům** (i nepřipojeným — vždy neutrál). Aplikace ho zapíše do jejich slotů; vlákno nepřipojeného ovladače neběží nebo stav nepošle. Engine při každé klávese přepočítá všechny 4 ovladače (4× tabulka 256 položek, bez alokace) — princip 7 má přednost před mikrooptimalizací.
 37. **Hook se instaluje jen se zapnutým ovladačem** (nebo při přiřazování); po vypnutí posledního ovladače zmizí a držené klávesy se zapomenou. Zapnutí z pozastavení hook vždy přeinstaluje (ochrana proti tichému odebrání), zapnutí druhého ovladače během hry ne (zapomněly by se klávesy, které hráč 1 drží).
 38. **Převzetí klávesy OS podle virtuální klávesy.** `GetAsyncKeyState` se ptá na VK z události. Dvě fyzické klávesy se stejnou VK (šipka nahoru a 8 na numerické klávesnici při vypnutém NumLocku) se tak pletou: drží-li uživatel jednu v OS a stiskne druhou (namapovanou), převezme se jako klávesa OS a ovladač ji do uvolnění nedostane. Velmi vzácné, bezpečná strana (klávesa jde do Windows, nic nevisí). Alternativa: ptát se přes scan kód (`MapVirtualKey`) — dražší a na rozloženích nejednoznačné.
+39. **Okno s právy správce v popředí (UIPI).** Hook z neprivilegovaného KeyPadu nevidí klávesy mířící do okna spuštěného jako správce — key-up klávesy držené při přepnutí do takového okna se ztratí. Teď to řeší jen obecné pojistky: ztracený key-up (1,5 s) a převzetí klávesy OS. Zjišťovat práva popředí (`EVENT_SYSTEM_FOREGROUND` + token cizího procesu) by znamenalo sahat na cizí procesy (princip 8) — proto zatím ne. README radí nespouštět Steam jako správce.
 
 ---
 

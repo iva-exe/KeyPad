@@ -60,6 +60,8 @@ features = [
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_System_Time",
+    # SetWinEventHook — přepnutí plochy (UAC, Ctrl+Alt+Del) v hook vlákně
+    "Win32_UI_Accessibility",
     # GetKeyNameTextW — názvy kláves podle rozložení
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Input_XboxController",

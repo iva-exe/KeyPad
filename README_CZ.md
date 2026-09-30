@@ -185,6 +185,11 @@ je nová verze. Zdrojový kód je veřejný:
   **Klávesnice** (klávesy jdou do Windows). Nikdy naopak.
 - Sledovat klávesnici KeyPad začne, až když zapneš ovladač, a s vypnutím
   posledního ovladače přestane. Stisky kláves nikam neukládá — ani do logu.
+- Po zamčení počítače (Win+L), výzvě UAC nebo Ctrl+Alt+Del se převádění
+  **pozastaví** a držené klávesy se pustí — zpátky ho zapneš Scroll Lockem.
+  Totéž, když virtuální ovladač přestane odpovídat (déle než 1 s).
+- Kdyby se KeyPad zasekl, Windows ho po chvíli přestanou čekat a klávesy
+  jdou normálně do Windows.
 - V režimu Gamepad fungují všechny klávesy, které nejsou namapované —
   Alt+Tab, Win, Alt+F4.
 - **Poslední záchrana:** **Ctrl+Alt+Del** → **Správce úloh** → KeyPad →

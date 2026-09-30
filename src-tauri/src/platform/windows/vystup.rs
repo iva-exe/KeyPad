@@ -9,7 +9,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use keypad_core::{Decision, Mode, MAX_PADS};
+use keypad_core::{Decision, Mode, PadId, MAX_PADS};
 use serde::Serialize;
 
 use super::hook::{Udalost, Vystup};
@@ -139,12 +139,16 @@ impl Vystup for HookVystup {
     fn hook_chyba(&self, chyba: bool) {
         self.zmen(|s| if chyba { s | CHYBA } else { s & !CHYBA });
     }
+
+    fn tep_ms(&self, pad: PadId) -> Option<u64> {
+        self.sloty.get(pad.index()).map(|s| s.tep())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use keypad_core::{DisabledReason, PadId, PadState, PadUpdates, AXIS_MAX};
+    use keypad_core::{DisabledReason, PadState, PadUpdates, AXIS_MAX};
 
     fn vystup() -> (HookVystup, [Arc<StavSlot>; MAX_PADS], Arc<Budik>) {
         let sloty: [Arc<StavSlot>; MAX_PADS] =
