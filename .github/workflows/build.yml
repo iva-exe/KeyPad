@@ -81,23 +81,26 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      # Log akcí vidí jen přihlášený uživatel GitHubu — selhané testy
-      # proto jdou i do souhrnu běhu, který je u veřejného repa vidět
-      # bez přihlášení. Runner je Windows Server na jádře Windows 11
-      # (jiná písma než desítky), takže tu umí spadnout test, který
-      # lokálně na Windows 10 projde.
+      # Log akcí i souhrn běhu vidí jen přihlášený uživatel GitHubu —
+      # anotace jsou u veřejného repa vidět i bez přihlášení, takže
+      # každé selhání testu jde i do anotace. Runner je Windows Server
+      # na jádře Windows 11 (jiná písma než desítky), takže tu umí
+      # spadnout test, který lokálně na Windows 10 projde.
       - name: cargo test
         shell: pwsh
         run: |
           [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+          $env:CARGO_TERM_COLOR = 'never'
           $log = Join-Path $env:RUNNER_TEMP 'cargo-test.log'
           cargo test --workspace --locked 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $log
           $kod = $LASTEXITCODE
           if ($kod -ne 0) {
-            $vypis = Select-String -Path $log -Encoding utf8 -Pattern 'panicked at|^---- |FAILED|^failures:|error(\[|:)' -Context 0,8 |
-              ForEach-Object { $_.Line; $_.Context.PostContext } | Select-Object -First 200
-            @('## cargo test selhal', '', '```text') + $vypis + @('```') |
-              Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            Select-String -Path $log -Encoding utf8 -Pattern 'panicked at|^error(\[|:)' -Context 1,8 |
+              Select-Object -First 10 | ForEach-Object {
+                $text = (@($_.Context.PreContext) + $_.Line + @($_.Context.PostContext)) -join "`n"
+                $text = $text.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+                "::error title=cargo test::$text"
+              }
           }
           exit $kod
 
