@@ -94,7 +94,7 @@ crates/
   installer/                  // KeyPadSetup.exe (per-user instalace, aktualizace, odinstalace)
 src-tauri/                    // aplikace KeyPad.exe (Tauri 2)
   src/main.rs, logger.rs, …
-  src/platform/windows/       // (Fáze 2+) hook.rs, pad.rs, keyname.rs
+  src/platform/windows/       // hook.rs (Fáze 3), klavesy.rs (názvy kláves), pad.rs, vigem.rs, power.rs, relace.rs…
   src/config.rs               // (Fáze 7) načtení, validace, atomický zápis
 ui/                           // Svelte 5 + Vite + TypeScript
 tools/                        // check.ps1, tauri.ps1, publish.ps1, check-imports.ps1
@@ -235,7 +235,7 @@ Zpětná vazba po vyzkoušení Fáze 2. Jde první, dřív než hook — mění 
 - [x] **Ovladač jen na povel.** Virtuální ovladač se připojí **výhradně** po interakci uživatele (přepínač „ovladač zapnutý / vypnutý“) — nikdy sám po startu aplikace, po probuzení ani po aktualizaci. Nahrazuje původní „připojit hned po startu“. Vypnutí = neutrál → odpojit.
 - [x] **Žádný autostart.** KeyPad se nikdy nespouští s Windows, jen když ho uživatel zapne (otevřená otázka 16 uzavřena).
 - [x] **Vypnutí / restart / odhlášení PC:** vždy před tím aktivní ovladač deaktivovat (neutrál → odpojit) a celou aplikaci ukončit (skryté okno nejvyšší úrovně s `WM_QUERYENDSESSION` / `WM_ENDSESSION`). **Uspání / hibernace:** ovladač vypnout a po probuzení nechat vypnutý (bod 1).
-- [ ] **Tahání okna bez zadrhávání jako ve WinSentu** _(Windows 11: Mica hotová. Windows 10: nastavení je už totožné s WinSentem, žádná příčina specifická pro KeyPad se nenašla — čeká na potvrzení vlastníka, viz otevřená otázka 29.)_ (ten přešel z acrylic na blur). Windows 10: blur jako WinSent; Windows 11 22H2+ (kde blur podle autorů knihovny zadrhává): systémový Mica. Rozhoduje číslo buildu, ne předpoklad.
+- [ ] **Tahání okna bez zadrhávání jako ve WinSentu** (ten přešel z acrylic na blur). Windows 10: blur jako WinSent; Windows 11 22H2+ (kde blur podle autorů knihovny zadrhává): systémový Mica. Rozhoduje číslo buildu, ne předpoklad. _(Windows 11: Mica hotová. Windows 10: nastavení je už totožné s WinSentem, žádná příčina specifická pro KeyPad se nenašla — čeká na potvrzení vlastníka, viz otevřená otázka 29.)_
 - [x] **Zrcadlo ViGEmBus** v `iva-exe/KeyPad` (`mirror/ViGEmBus_1.22.0_x64_x86_arm64.exe`, schváleno) — záložní adresa, když repo autora zmizí; ověřuje se stejným napevno zapsaným SHA-256.
 - [x] **Credit ViGEmBus** (Nefarius Software Solutions e.U., odkaz na github.com/nefarius/ViGEmBus) v instalátoru i v detailech aplikace.
 - [x] **ViGEmBus automaticky — instalace i aktualizace.** KeyPadSetup ho nainstaluje bez zaškrtávátka, když chybí, a aktualizuje, když je starší než poslední vydání (ovladač < 1.21.442). Platí i pro aktualizaci z aplikace. Výzva UAC od Windows zůstává (ovladač jinak nejde). Nainstalovaný a běžící ViGEmBus v aktuální verzi se nikdy nepřeinstalovává.
@@ -246,17 +246,17 @@ Zpětná vazba po vyzkoušení Fáze 2. Jde první, dřív než hook — mění 
 
 ### Fáze 3 – Keyboard hook
 
-- [ ] Jednoinstanční zámek: řeší `tauri-plugin-single-instance` (registruje se jako první plugin, tedy **před** instalací hooku); druhé spuštění ukáže okno běžící instance a skončí.
-- [ ] Hook vlákno: instalace `WH_KEYBOARD_LL` (`hMod` z `GetModuleHandleW(None)`), smyčka `GetMessageW`, `logger::mark_realtime_thread()`. Z callbacku **nevolat `log::`** (alokace + krátký zámek uvnitř crossbeamu) — pevný záznam do fronty bez zámků, logovat z jiného vlákna.
-- [ ] Callback: `nCode < 0` → rovnou `CallNextHookEx`. Ignorovat (propustit) události s `LLKHF_INJECTED`.
-- [ ] `KeyId` ze `scanCode` + `LLKHF_EXTENDED`. Klávesy se `scanCode == 0` (mediální apod.) nelze mapovat → propustit (`KeyId::is_mappable`).
-- [ ] **AltGr na českém rozložení** generuje falešný LCtrl (typicky `scanCode 0x21D`) → nikdy nemapovat, propustit. Ověřit v logu.
-- [ ] Celé tělo callbacku v `catch_unwind`; při panice nastavit atomický příznak „fail-safe“, propustit klávesu a zavolat **`reset_held(HookPanic)`**, ne `force_keyboard`: engine mohl klávesu už zaznamenat jako `Pad`, `force_keyboard` by z ní udělal `Swallow` a key-up propuštěné klávesy by se spolkl → v OS by visela (s levým Shiftem = vše velkými). Nalezeno revizí.
-- [ ] Po každé (pře)instalaci hooku `reset_held(HookReinstalled)` — během tichého odebrání se události ztrácely.
-- [ ] Engine je vlastněn hook vláknem (přístup přes `thread_local!`/`static` jen z tohoto vlákna – callback nemá kontext).
-- [ ] Zobrazované názvy kláves přes `GetKeyNameTextW`.
+- [x] Jednoinstanční zámek: řeší `tauri-plugin-single-instance` (registruje se jako první plugin, tedy **před** instalací hooku); druhé spuštění ukáže okno běžící instance a skončí.
+- [x] Hook vlákno (`platform/windows/hook.rs`): instalace `WH_KEYBOARD_LL` (`hMod` z `GetModuleHandleW(None)`), smyčka `GetMessageW`, `logger::mark_realtime_thread()`. Z callbacku **nevolat `log::`** (alokace + krátký zámek uvnitř crossbeamu) — pevný záznam do fronty bez zámků, logovat z jiného vlákna. _(Callback předává rozhodnutí přes `trait Vystup` — jen atomiky; panika se loguje ze smyčky přes `WM_APP`. Testem ověřeno, že callback **nic nealokuje** — počítadlo alokací v testech.)_
+- [x] Callback: `nCode < 0` → rovnou `CallNextHookEx`. Ignorovat (propustit) události s `LLKHF_INJECTED`.
+- [x] `KeyId` ze `scanCode` + `LLKHF_EXTENDED`. Scan kód nad `u16` se neusekává (0x1_0011 by jinak byl W), ale bere jako nemapovatelný. Klávesy se `scanCode == 0` (mediální apod.) nelze mapovat → propustit (`KeyId::is_mappable`).
+- [x] **AltGr na českém rozložení** generuje falešný LCtrl (typicky `scanCode 0x21D`) → nikdy nemapovat, propustit. _(Test s 0x21D; naostro ověří vlastník v `hook_selftest` — AltGr vypíše „(nemapovatelná) scan 0x21D“.)_
+- [x] Celé tělo callbacku v `catch_unwind`; při panice nastavit atomický příznak „fail-safe“, propustit klávesu a zavolat **`reset_held(HookPanic)`**, ne `force_keyboard`: engine mohl klávesu už zaznamenat jako `Pad`, `force_keyboard` by z ní udělal `Swallow` a key-up propuštěné klávesy by se spolkl → v OS by visela (s levým Shiftem = vše velkými). Nalezeno revizí. _(Když selže i úklid, engine se už nevolá a smyčka hook odebere — klávesy jdou do OS.)_
+- [x] Po každé (pře)instalaci hooku `reset_held(HookReinstalled)` — během tichého odebrání se události ztrácely.
+- [x] Engine je vlastněn hook vláknem (přístup přes `thread_local!`/`static` jen z tohoto vlákna – callback nemá kontext).
+- [x] Zobrazované názvy kláves přes `GetKeyNameTextW` (`platform/windows/klavesy.rs`; podle rozložení, česky).
 
-**Hotovo, když:** log ukazuje scan kódy, Notepad funguje normálně a v testovacím režimu lze potlačit vybranou klávesu.
+**Hotovo, když:** log ukazuje scan kódy, Notepad funguje normálně a v testovacím režimu lze potlačit vybranou klávesu. _Stav: automaticky ověřeno (13 testů callbacku a vlákna, skutečná instalace/přeinstalace/odebrání na skryté ploše i `hook_selftest -- instalace`). Scan kódy vypisuje `hook_selftest` **jen do konzole** — aplikace stisky nikdy neloguje (otevřená otázka 33). Ruční zkoušku (Poznámkový blok, Scroll Lock potlačí WASD) udělá vlastník: `cargo run -p keypad --release --example hook_selftest`. Aplikace hook zatím neinstaluje — zapne ho přepínač ve Fázi 4._
 
 ### Fáze 4 – Propojení a přepínání
 
@@ -392,7 +392,7 @@ Nejasnosti ve specifikaci, na které se narazilo. U každé je, jak to **teď** 
 12. **Interval kontroly aktualizací** — teď při startu, pak každých 30 min a při zobrazení okna, pokud je poslední kontrola starší než 5 min (princip 10; WinSent 30 s). `raw` drží cache 5 minut, častěji to nemá smysl.
 13. **Tlačítko Guide (Xbox logo)** není mezi akcemi — výchozí mapování ho nemá a Steam ho zachytává pro svůj overlay. Přidat?
 14. **Pravidlo ztraceného key-upu (1,5 s)** — přidáno po revizi, ve specifikaci nebylo; mění doslovné „klávesa v `held` = autorepeat“ pro klávesy `Pad`/`Swallow`. Opírá se o to, že Windows opakují jen naposledy stisknutou klávesu a starší se po jejím uvolnění znovu nerozjede. Kdyby nějaká klávesnice/ovladač opakování starší klávesy obnovil, stane se nanejvýš: klávesa padu dostane nové pořadí pro SOCD, nebo spolknutá klávesa pošle do OS jeden úhoz navíc. OK?
-15. **Čím se v hooku měří čas** — čas události (`KBDLLHOOKSTRUCT::time`, 32 bitů, rozšířit na 64) je přesnější pro pravidlo z bodu 14 (nezávisí na zdržení hook vlákna); `GetTickCount64()` je jednodušší. Rozhodne se ve Fázi 3.
+15. ✅ _Rozhodnuto ve Fázi 3: `GetTickCount64()`._ **Čím se v hooku měří čas** — čas události (`KBDLLHOOKSTRUCT::time`) je jen 32bitový (po 49 dnech přeteče) a u vstříknutých událostí si ho volající vymýšlí; engine potřebuje čas, který necouvne. Zdržení hook vlákna jsou milisekundy, pravidla mají vteřinové limity (1,5 s, 10 s).
 16. ✅ _Rozhodnuto vlastníkem 29. 9.: žádný autostart, KeyPad spouští jen uživatel._ **Spouštění po přihlášení** (WinSent ho má) — teď NENÍ. Zápis do `HKCU\…\Run` by porušil princip 6 (aplikace nezapisuje do registru; šla by zkratka ve složce Po spuštění) a hlavně: běžící KeyPad drží připojený virtuální Xbox ovladač, takže by ho hry a Steam viděly pořád, i když KeyPad nepoužíváš. _Návrh:_ nechat bez, případně volitelně přes zástupce ve složce Po spuštění.
 17. ✅ _Rozhodnuto 29. 9.: ovladač jen po interakci uživatele (Fáze 2b)._ **Připojení padu hned po startu** (roadmapa kvůli stabilnímu pořadí hráčů) znamená zvuk „zařízení připojeno“ při každém startu KeyPadu a ovladač viditelný pro hry po celou dobu běhu (i schovaného v trayi). Alternativa: připojit až při prvním přepnutí na Gamepad.
 18. **Oficiálně podporované minimum Windows.** Naše binárky mají běžet na každém Windows 10 od 1507 (po opravě instalátoru žádný novější statický import). Microsoft ale oficiálně podporuje WebView2 až od Windows 10 **1709** (+ LTSC 2015/2016). _Návrh do README:_ „Windows 10 1709 a novější (vč. LTSC) a Windows 11, 64bit; doporučeno 22H2 / 11“. Na 1507/1511 navíc chybí ochrana `/DEPENDENTLOADFLAG` (Windows ji ignorují) — přijatelné u nepodporovaných buildů?
@@ -410,6 +410,7 @@ Nejasnosti ve specifikaci, na které se narazilo. U každé je, jak to **teď** 
 30. **Číslo hráče u víc ovladačů** — ViGEmBus vrací při dvou virtuálních ovladačích stejný index pro oba (naměřeno), okno proto „hráč N“ neukazuje. Pro Fázi 4 (víc ovladačů) najít jiný spolehlivý zdroj.
 31. **Aktualizace ViGEmBus, která starý ovladač odebere a nový nepřidá** (známá chyba dodavatele „spusť instalaci dvakrát“): co udělá instalátor MSI nad už zaregistrovaným produktem, se dá ověřit jen ve virtuálu. Do té doby KeyPad v tomhle stavu nic neopakuje (druhé automatické spuštění instalátoru bylo odebráno — nikdy víc než jedno spuštění) a poradí odebrat „ViGEm Bus Driver“ v Aplikacích a spustit KeyPadSetup znovu.
 32. **Aktualizace ovladače zavře KeyPad** (nesmí držet sběrnici) a pak ho znovu spustí — ve všech režimech, i z tlačítka v aplikaci. Tlačítko „Aktualizovat ovladač“ se ukazuje i při zapnutém ovladači; kliknutí ovladač nejdřív vypne.
+33. **Logování stisků.** Fáze 3 chtěla „log ukazuje scan kódy“. Aplikace ale stisky do `keypad.log` **nikdy** nezapisuje — log by jinak obsahoval i hesla a kamarád by ho posílal při hlášení chyby. Scan kódy vypisuje jen příklad `hook_selftest`, a to jen do konzole. Kdyby byla potřeba diagnostika u kamaráda, návrh: jen nemapovatelné klávesy (AltGr, média) a jen scan kód, zapnuté proměnnou prostředí.
 
 ---
 

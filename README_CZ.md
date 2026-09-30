@@ -287,6 +287,7 @@ Skripty se spouštějí `powershell -ExecutionPolicy Bypass -File tools\…`.
 | `tools\publish.ps1` | vydání: kontrola gitu → brány → build → kontroly → `release\` → push |
 | `tools\check-imports.ps1 [-RequireDependentLoadFlag] <exe>` | nepotřebuje binárka DLL, která na čistém PC chybí? Nevolá funkci novější než Windows 10 1507? (a s přepínačem: hledá DLL jen v System32?) |
 | `cargo run -p keypad --release --example pad_selftest -- vse` | virtuální pad bez okna: připojení, stav přes XInput, odpojení, pád procesu. Když je v popředí hra nebo celoobrazovková aplikace, nic nepřipojí (exit 3). |
+| `cargo run -p keypad --release --example hook_selftest` | hook klávesnice bez okna na 60 s: vypisuje stisknuté klávesy se scan kódy **jen do konzole** (nic neukládá); Scroll Lock přepne na Gamepad a WASD, šipky… se potlačí. Virtuální ovladač nepřipojuje. `-- instalace` jen ověří instalaci a odebrání hooku. |
 | `$env:KEYPAD_BEZ_VIGEM = "1"` | aplikace se chová, jako by ViGEmBus chyběl (`vypnuty` = nainstalovaný a vypnutý, `zbytek` = pozůstatek bez zařízení) — na PC, kde se pad objevit nemá |
 
 **Instalátor — režimy.** `KeyPadSetup.exe` (okno) · `/quiet`

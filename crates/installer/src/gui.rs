@@ -1835,27 +1835,42 @@ mod tests {
 
     /// Čím delší zpráva, tím úspornější kreslení — a nikdy potichu
     /// useknutá, dokud se vejde aspoň menším písmem až k tlačítkům.
-    /// Měří se GDI jako v okně (paměťové DC, žádné okno).
+    /// Měří se GDI jako v okně (paměťové DC, žádné okno), zpráva roste
+    /// po slovech.
+    ///
+    /// Stupeň „menší písmo mezi kroky a pruhem" se na Segoe UI (Windows
+    /// 10) použije vždy. Na Segoe UI Variable (Windows 11 a CI) ho umí
+    /// zalomení přeskočit: zpráva o slovo delší, než se vejde běžným
+    /// písmem, se nevejde ani menším — pak rovnou menším písmem až
+    /// k tlačítkům, což je v pořádku. Useknout se nesmí ani tam.
     #[test]
     fn dlouha_zprava_prejde_na_mensi_pismo() {
         let line = "Pozor: zástupce v nabídce Start se nepodařilo vytvořit — přístup odepřen.";
-        let text = |n: usize| vec![line; n].join("\n");
-        let fits: Vec<Fit> = (1..=16).map(|n| measure_96(&text(n), 6, true).1).collect();
-        assert_eq!(fits[0], Fit::Body);
-        assert_eq!(*fits.last().unwrap(), Fit::Clipped);
-        // Pořadí se nikdy nevrací (Body → Small → SmallOverBar → Clipped)
-        // a každý stupeň se opravdu použije.
-        let rank = |f: &Fit| *f as u8;
+        let joined = vec![line; 16].join(" ");
+        let words: Vec<&str> = joined.split(' ').collect();
+        let text = |n: usize| words[..n].join(" ");
+        let fits: Vec<(usize, Fit)> = (1..=words.len())
+            .map(|n| (n, measure_96(&text(n), 6, true).1))
+            .collect();
+        assert_eq!(fits[0].1, Fit::Body);
+        assert_eq!(fits.last().unwrap().1, Fit::Clipped);
+        // Pořadí se nikdy nevrací (Body → Small → SmallOverBar → Clipped).
+        let rank = |f: Fit| f as u8;
         assert!(
-            fits.windows(2).all(|w| rank(&w[0]) <= rank(&w[1])),
+            fits.windows(2).all(|w| rank(w[0].1) <= rank(w[1].1)),
             "{fits:?}"
         );
-        for f in [Fit::Body, Fit::Small, Fit::SmallOverBar, Fit::Clipped] {
-            assert!(fits.contains(&f), "{f:?} v {fits:?}");
+        let used = |f: Fit| fits.iter().any(|x| x.1 == f);
+        for f in [Fit::Body, Fit::SmallOverBar, Fit::Clipped] {
+            assert!(used(f), "{f:?} v {fits:?}");
+        }
+        let face = pick_face(UI_FACES);
+        if face == "Segoe UI" {
+            assert!(used(Fit::Small), "{fits:?}");
         }
         // Během práce pruh neustoupí: co by se vešlo jen místo pruhu, je
         // tam rovnou Clipped (neurčitý pruh je důkaz, že se pracuje).
-        let n = fits.iter().position(|f| *f == Fit::SmallOverBar).unwrap() + 1;
+        let n = fits.iter().find(|x| x.1 == Fit::SmallOverBar).unwrap().0;
         assert_eq!(measure_96_with(&text(n), 6, true, false).1, Fit::Clipped);
     }
 

@@ -55,9 +55,13 @@ features = [
     # SetDefaultDllDirectories — DLL za běhu jen ze System32
     "Win32_System_LibraryLoader",
     "Win32_System_Power",
+    # jen testy: hook a okna testů na skryté ploše, ne na ploše vlastníka
+    "Win32_System_StationsAndDesktops",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_System_Time",
+    # GetKeyNameTextW — názvy kláves podle rozložení
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Input_XboxController",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",

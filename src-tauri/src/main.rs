@@ -460,6 +460,59 @@ fn main() {
     });
 }
 
+/// Počítadlo alokací pro testy: callback hooku nesmí alokovat
+/// (princip 3) a test to musí umět dokázat, ne jen tvrdit.
+///
+/// Počítá se po vláknech — testy běží souběžně a cizí alokace by se
+/// jinak započítaly. `thread_local!` s `const` a bez destruktoru sám
+/// nealokuje, takže ho alokátor smí použít.
+#[cfg(test)]
+mod testy_alokace {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static POCET: Cell<u64> = const { Cell::new(0) };
+    }
+
+    struct Pocitadlo;
+
+    // SAFETY: jen předává systémovému alokátoru a počítá.
+    unsafe impl GlobalAlloc for Pocitadlo {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            let _ = POCET.try_with(|p| p.set(p.get() + 1));
+            unsafe { System.alloc(l) }
+        }
+        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+            let _ = POCET.try_with(|p| p.set(p.get() + 1));
+            unsafe { System.alloc_zeroed(l) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, l: Layout, n: usize) -> *mut u8 {
+            let _ = POCET.try_with(|p| p.set(p.get() + 1));
+            unsafe { System.realloc(ptr, l, n) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, l: Layout) {
+            unsafe { System.dealloc(ptr, l) }
+        }
+    }
+
+    #[global_allocator]
+    static ALOKATOR: Pocitadlo = Pocitadlo;
+
+    /// Alokace na tomhle vlákně od jeho startu.
+    pub fn pocet() -> u64 {
+        POCET.with(Cell::get)
+    }
+
+    #[test]
+    fn pocitadlo_pocita() {
+        let pred = pocet();
+        let v = std::hint::black_box(vec![1u8; 16]);
+        assert_eq!(pocet(), pred + 1);
+        drop(v);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

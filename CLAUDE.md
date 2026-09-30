@@ -92,6 +92,10 @@ powershell -ExecutionPolicy Bypass -File tools\publish.ps1
 # je celoobrazovková aplikace/hra → nic se nepřipojí. Posílá jen hodnoty pod mrtvou zónou.
 cargo run -p keypad --release --example pad_selftest -- vse     # nebo e2e | kill | popredi | xinput
 
+# hook klávesnice bez okna (spouští VLASTNÍK: vypisuje stisky do konzole, Scroll Lock potlačí WASD…);
+# `instalace` = jen nainstalovat, přeinstalovat, odebrat — nic o klávesách nevypisuje
+cargo run -p keypad --release --example hook_selftest -- 60      # nebo instalace
+
 # aplikace bez ViGEmBus (simulace): 1 = nenainstalovaný, vypnuty = nainstalovaný a vypnutý,
 # zbytek = pozůstatek bez zařízení i záznamu v Aplikacích; bez proměnné = skutečný ovladač
 $env:KEYPAD_BEZ_VIGEM = "1"

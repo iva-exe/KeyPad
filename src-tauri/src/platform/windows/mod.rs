@@ -1,7 +1,9 @@
-//! Win32 kód aplikace: virtuální pad (ViGEmBus), uspání, konec relace
-//! Windows, ukončení z instalátoru, spuštění instalátoru ViGEmBus
-//! a odkazů. Hook klávesnice přibude ve Fázi 3 (`hook.rs`).
+//! Win32 kód aplikace: hook klávesnice, virtuální pad (ViGEmBus),
+//! uspání, konec relace Windows, ukončení z instalátoru, spuštění
+//! instalátoru ViGEmBus a odkazů.
 
+pub mod hook;
+pub mod klavesy;
 pub mod pad;
 pub mod power;
 pub mod relace;

@@ -78,7 +78,10 @@ thread_local! {
 /// bezpečné nezačne — callback hooku `log::…` nevolá vůbec (viz
 /// dokumentace modulu); řádek z panic hooku je výjimka, panika už
 /// alokuje sama.
-#[expect(dead_code, reason = "použije hook vlákno ve Fázi 3")]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "hook zapne až přepínač ve Fázi 4")
+)]
 pub fn mark_realtime_thread() {
     REALTIME.with(|r| r.set(true));
 }
