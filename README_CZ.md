@@ -119,6 +119,7 @@ vypne a KeyPad skončí.
 | **Zapínám…** | Windows ovladač nastavují (napoprvé na novém PC chvíli trvá) |
 | **Zapnutý** | ovladač běží a klávesy ho ovládají — **Vyzkoušet** s ním krátce zakrouží (Win+R → `joy.cpl`) |
 | **Pozastaveno** | ovladač běží, ale klávesy jdou do Windows (Scroll Lock) — tečka jen obrysem |
+| **Klávesy nejdou** | ovladač běží, ale Windows nedovolily sledovat klávesnici — klávesy jdou do Windows; vypni a zapni ovladač |
 | **Chybí ViGEmBus** | tlačítko **Nainstalovat ovladač** |
 | **ViGEmBus neběží** | nainstalovaný, ale nespustil se — rada v bublině (restart, Správce zařízení…) |
 

@@ -298,6 +298,24 @@ impl Model {
         }
     }
 
+    /// Klávesa, kterou drží OS a model o ní neví, se zapíše jako OS
+    /// (co dělá hook podle asynchronního stavu klávesnice).
+    fn adopt_os(&mut self, key: KeyId, now: u64) -> bool {
+        if !mappable(key) || self.held.contains_key(&key) {
+            return false;
+        }
+        self.seq += 1;
+        self.held.insert(
+            key,
+            MHeld {
+                owner: Owner::Os,
+                seq: self.seq,
+                last: now,
+            },
+        );
+        true
+    }
+
     /// Vrací očekávané potlačení a oznámení.
     fn key_down(&mut self, key: KeyId, now: u64) -> (bool, Option<UiEvent>) {
         let expired = self.expire(now);
@@ -541,9 +559,11 @@ impl Model {
 struct Press {
     /// Rozhodnutí o potlačení při key-down.
     suppressed: bool,
-    /// Engine záznam o stisku zapomněl (reset_held) — key-up pak jde do
-    /// OS, i když key-down nešel. Takový stisk se na principu 2
-    /// nekontroluje (viz ROADMAP, Otevřené otázky).
+    /// Engine záznam o stisku zapomněl (reset_held). Stisk, který OS
+    /// viděl, hook při dalším autorepeatu ohlásí jako klávesu OS (dál se
+    /// kontroluje). Spolknutý stisk je pro engine nový — jeho key-up jde
+    /// do OS, i když key-down nešel; ten se na principu 2 nekontroluje
+    /// (neškodný key-up navíc).
     forgotten: bool,
     /// Čas poslední události (kvůli pravidlu ztraceného key-upu).
     last: u64,
@@ -649,10 +669,25 @@ impl World {
 
     fn press(&mut self, key: KeyId) -> Result<(Decision, Option<UiEvent>), TestCaseError> {
         let now = self.now;
-        // Klávesa, o které engine zapomněl (reset_held), je pro něj po
-        // návratu nový stisk — LL hook autorepeat nerozliší.
-        if self.physical.get(&key).is_some_and(|p| p.forgotten) {
-            self.physical.remove(&key);
+        // Klávesa, o které engine zapomněl (reset_held): hook se podívá
+        // do asynchronního stavu klávesnice. Drží-li ji OS (viděl její
+        // key-down), ohlásí ji enginu jako klávesu OS — autorepeat
+        // i key-up jdou pak dál do OS a nic nevisí (princip 2 platí
+        // i přes zapomenutí). Stisk, který OS neviděl (spolknutý), je
+        // pro engine nový stisk — LL hook autorepeat nerozliší.
+        match self.physical.get(&key).map(|p| (p.forgotten, p.suppressed)) {
+            Some((true, false)) => {
+                let a = self.e.adopt_os_key(key, now);
+                let b = self.m.adopt_os(key, now);
+                prop_assert_eq!(a, b, "převzetí klávesy OS {}", key);
+                if let Some(p) = self.physical.get_mut(&key) {
+                    p.forgotten = false;
+                }
+            }
+            Some((true, true)) => {
+                self.physical.remove(&key);
+            }
+            _ => {}
         }
         let (expected, want_ui) = self.m.key_down(key, now);
         let d = self.e.on_key(key, true, now);

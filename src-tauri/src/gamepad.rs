@@ -24,10 +24,10 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::platform::windows::hook::{Hook, HookOdesilatel, HookPrikaz, Vystup};
 use crate::platform::windows::pad::{Oznam, PadInfo, PadPrikaz, PadStav, Pady, UDALOST};
 use crate::platform::windows::slot::Budik;
-use crate::platform::windows::vystup::{HookVystup, Rezim};
+use crate::platform::windows::vystup::{HookVystup, RezimInfo};
 use crate::platform::windows::{power, shell};
 
-/// Tauri událost se změnou režimu (payload [`Rezim`]).
+/// Tauri událost se změnou režimu (payload [`RezimInfo`]).
 pub const UDALOST_REZIM: &str = "rezim";
 
 /// Jak dlouho při konci aplikace čekat na neutrál + odpojení padů.
@@ -46,6 +46,10 @@ pub struct Ovladani {
     /// Hook vlákno; `None` po konci aplikace.
     hook: Mutex<Option<Hook>>,
     vystup: Arc<HookVystup>,
+    /// Konec běží celý najednou: konec relace Windows a `RunEvent::Exit`
+    /// ho můžou spustit souběžně a druhý by jinak odpojil pady dřív,
+    /// než první odebere hook (pořadí neutrál → odhooknout → odpojit).
+    konec: Mutex<()>,
 }
 
 /// Spustí pad vlákno prvního ovladače (jen ověří sběrnici — nic
@@ -93,13 +97,13 @@ pub fn spust(app: &tauri::App) -> Result<(), String> {
     std::thread::Builder::new()
         .name("keypad-rezim".into())
         .spawn(move || {
-            let mut posledni = Rezim::Disabled;
+            let mut posledni = v.info().seq;
             loop {
                 budik.cekej(None);
-                let r = v.rezim();
-                if r != posledni {
-                    log::info!("režim: {r:?}");
-                    posledni = r;
+                let r = v.info();
+                if r.seq != posledni {
+                    log::info!("režim: {:?}", r.rezim);
+                    posledni = r.seq;
                     let _ = handle.emit(UDALOST_REZIM, r);
                 }
             }
@@ -110,6 +114,7 @@ pub fn spust(app: &tauri::App) -> Result<(), String> {
         pady,
         hook: Mutex::new(Some(hook)),
         vystup,
+        konec: Mutex::new(()),
     });
     Ok(())
 }
@@ -167,6 +172,7 @@ pub fn ukonci(app: &AppHandle) {
     let Some(o) = app.try_state::<Ovladani>() else {
         return;
     };
+    let _konec = o.konec.lock().unwrap_or_else(|e| e.into_inner());
     let hook = o.hook.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(mut h) = hook {
         if !h.zastav() {
@@ -222,10 +228,11 @@ pub fn pad_status(o: tauri::State<'_, Ovladani>, pad: Option<u8>) -> Result<PadI
         .ok_or_else(|| "Takový ovladač není.".into())
 }
 
-/// Režim zachytávání pro okno (změny chodí událostí `rezim`).
+/// Režim zachytávání pro okno (změny chodí událostí `rezim`; starší
+/// z obojího okno pozná podle `seq`).
 #[tauri::command]
-pub fn rezim(o: tauri::State<'_, Ovladani>) -> Rezim {
-    o.vystup.rezim()
+pub fn rezim(o: tauri::State<'_, Ovladani>) -> RezimInfo {
+    o.vystup.info()
 }
 
 /// Přepínač „zapnout" — jediná cesta, kudy se virtuální ovladač

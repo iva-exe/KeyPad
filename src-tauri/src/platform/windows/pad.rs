@@ -395,6 +395,14 @@ impl<B: Backend> Smycka<B> {
         self.instalace = true;
     }
 
+    /// Vlákno vzniká mezi oznámením o uspání a probuzením (další
+    /// ovladač zapnutý těsně před spánkem): převzít pojistku, jako by
+    /// přišlo [`PadPrikaz::Uspat`] — jinak by se nový ovladač připojil
+    /// přímo do BSOD ViGEmBus #160.
+    pub fn uspava_se(&mut self, od_ms: u64) {
+        self.uspava_se_od = Some(od_ms);
+    }
+
     pub fn skoncila(&self) -> bool {
         self.konec
     }
@@ -996,7 +1004,7 @@ pub struct Pad {
 impl Pad {
     /// Spustí pad vlákno se skutečným ovladačem. Nikdy neselže: když
     /// vlákno nejde vytvořit, stav padu je chyba a aplikace běží dál.
-    fn spust(cislo: u8, slot: Arc<StavSlot>, oznam: Oznam, instalace: bool) -> Pad {
+    fn spust(cislo: u8, slot: Arc<StavSlot>, oznam: Oznam, dedictvi: Dedictvi) -> Pad {
         let status = Arc::new(PadStatus::new(cislo));
         let backend = VigemBackend {
             pad: None,
@@ -1004,9 +1012,7 @@ impl Pad {
             simulace_stary: std::env::var_os("KEYPAD_VIGEM_STARY").is_some(),
         };
         let mut smycka = Smycka::new(backend, Arc::clone(&status), Arc::clone(&oznam));
-        if instalace {
-            smycka.behem_instalace();
-        }
+        dedictvi.predej(&mut smycka);
         Pad::spust_se_smyckou(cislo, smycka, status, slot, oznam)
     }
 
@@ -1057,6 +1063,9 @@ impl Pad {
                 seq: 1,
             };
             status.zapis(&info);
+            // Vlákno nevzniklo, nic nepřipojilo — pro spánek, instalátor
+            // i konec je „uklizené".
+            status.ukonceno.store(true, Ordering::Release);
         }
         Pad {
             tx: PadOdesilatel { tx, slot },
@@ -1082,7 +1091,34 @@ impl Pad {
 }
 
 /// Jak se spouští pad vlákno — skutečné, nebo v testu s falešným ovladačem.
-type Spoustec = Box<dyn Fn(u8, Arc<StavSlot>, Oznam, bool) -> Pad + Send + Sync>;
+type Spoustec = Box<dyn Fn(u8, Arc<StavSlot>, Oznam, Dedictvi) -> Pad + Send + Sync>;
+
+/// Co nové pad vlákno přebírá od běžících: stavy, které by jinak znal
+/// jen z příkazů poslaných dřív, než vzniklo.
+#[derive(Clone, Copy, Debug, Default)]
+struct Dedictvi {
+    /// Běží instalátor ViGEmBus.
+    instalace: bool,
+    /// Počítač se uspává (od kdy, `GetTickCount64`).
+    uspava_se_od: Option<u64>,
+}
+
+impl Dedictvi {
+    fn predej<B: Backend>(self, s: &mut Smycka<B>) {
+        if self.instalace {
+            s.behem_instalace();
+        }
+        if let Some(od) = self.uspava_se_od {
+            s.uspava_se(od);
+        }
+    }
+}
+
+/// Stejné hodiny jako `VigemBackend::ted_ms` (pojistka spánku).
+fn ted_ms() -> u64 {
+    // SAFETY: bez parametrů, jen čte čítač.
+    unsafe { windows::Win32::System::SystemInformation::GetTickCount64() }
+}
 
 /// Všechny virtuální ovladače (až [`MAX_PADS`]) pro zbytek aplikace.
 ///
@@ -1103,6 +1139,11 @@ struct StavPadu {
     pady: [Option<Pad>; MAX_PADS],
     /// Běží instalátor ViGEmBus: nové vlákno nesmí otevřít sběrnici.
     instalace: bool,
+    /// Počítač se uspává (od kdy) — do probuzení.
+    uspava_se_od: Option<u64>,
+    /// Aplikace končí: žádné nové vlákno (nový ovladač by se připojil
+    /// uprostřed konce).
+    konci: bool,
 }
 
 impl Pady {
@@ -1138,6 +1179,8 @@ impl Pady {
             stav: Mutex::new(StavPadu {
                 pady: [None, None, None, None],
                 instalace: false,
+                uspava_se_od: None,
+                konci: false,
             }),
             simulace: false,
         };
@@ -1155,14 +1198,18 @@ impl Pady {
     fn zajisti(&self, i: usize) -> Option<Arc<PadStatus>> {
         let slot = self.sloty.get(i)?;
         let mut g = self.zamek();
-        let instalace = g.instalace;
+        let dedictvi = Dedictvi {
+            instalace: g.instalace,
+            uspava_se_od: g.uspava_se_od,
+        };
+        let konci = g.konci;
         let misto = g.pady.get_mut(i)?;
-        if misto.is_none() {
+        if misto.is_none() && !konci {
             *misto = Some((self.spoustec)(
                 i as u8,
                 Arc::clone(slot),
                 Arc::clone(&self.oznam),
-                instalace,
+                dedictvi,
             ));
         }
         misto.as_ref().map(|p| Arc::clone(p.status()))
@@ -1232,21 +1279,23 @@ impl Pady {
         pred: impl FnOnce(&mut StavPadu),
         p: impl Fn(Sender<()>) -> PadPrikaz,
     ) -> bool {
-        let potvrzeni: Vec<Option<Receiver<()>>> = {
+        let potvrzeni: Vec<(Arc<PadStatus>, Option<Receiver<()>>)> = {
             let mut g = self.zamek();
             pred(&mut g);
             g.pady
                 .iter()
                 .flatten()
-                .map(|pad| pad.posli_s_potvrzenim(&p))
+                .map(|pad| (Arc::clone(pad.status()), pad.posli_s_potvrzenim(&p)))
                 .collect()
         };
         let konec = Instant::now() + limit;
-        potvrzeni.into_iter().all(|rx| {
+        potvrzeni.into_iter().all(|(st, rx)| {
+            // Vlákno, které skončilo (panika, konec), ovladač uklidilo
+            // (target zmizel se spojením) — potvrzovat nemá kdo a není co.
             rx.is_some_and(|rx| {
                 rx.recv_timeout(konec.saturating_duration_since(Instant::now()))
                     .is_ok()
-            })
+            }) || st.ukonceno.load(Ordering::Acquire)
         })
     }
 
@@ -1271,7 +1320,17 @@ impl Pady {
     /// Počítač se uspává: všechny ovladače neutrál → odpojit. `true`,
     /// když všechna vlákna potvrdila do `limit`.
     pub fn uspat(&self, limit: Duration) -> bool {
-        self.vsem_s_potvrzenim(limit, |_| {}, PadPrikaz::Uspat)
+        self.vsem_s_potvrzenim(limit, |g| g.uspava_se_od = Some(ted_ms()), PadPrikaz::Uspat)
+    }
+
+    /// Počítač se probudil: nic se nezapíná, jen končí pojistka proti
+    /// zapnutí těsně před spánkem — ve všech vláknech i pro nová.
+    pub fn probuzeni(&self) {
+        let mut g = self.zamek();
+        g.uspava_se_od = None;
+        for pad in g.pady.iter().flatten() {
+            pad.posli(PadPrikaz::Probuzeni);
+        }
     }
 
     /// Uklizené ukončení všech ovladačů: neutrál → odpojit → zavřít.
@@ -1279,7 +1338,8 @@ impl Pady {
     /// — vlákno, které už skončilo, se hlásí jako uklizené.
     pub fn ukonci(&self, limit: Duration) -> bool {
         let potvrzeni: Vec<(Arc<PadStatus>, Option<Receiver<()>>)> = {
-            let g = self.zamek();
+            let mut g = self.zamek();
+            g.konci = true;
             g.pady
                 .iter()
                 .flatten()
@@ -2500,13 +2560,11 @@ mod tests {
         let logy: Logy = std::array::from_fn(|_| Arc::new(Mutex::new(Vec::new())));
         let pro_vlakna = logy.clone();
         let oznam: Oznam = Arc::new(|_: &PadInfo| {});
-        let spoustec: Spoustec = Box::new(move |cislo, slot, oznam, instalace| {
+        let spoustec: Spoustec = Box::new(move |cislo, slot, oznam, dedictvi: Dedictvi| {
             let status = Arc::new(PadStatus::new(cislo));
             let log = Arc::clone(&pro_vlakna[usize::from(cislo)]);
             let mut s = Smycka::new(Sdileny(log), Arc::clone(&status), Arc::clone(&oznam));
-            if instalace {
-                s.behem_instalace();
-            }
+            dedictvi.predej(&mut s);
             Pad::spust_se_smyckou(cislo, s, status, slot, oznam)
         });
         (
@@ -2733,5 +2791,54 @@ mod tests {
             );
         }
         assert!(pady.ukonci(Duration::from_secs(5)));
+    }
+
+    /// Revize Fáze 4: ovladač zapnutý mezi oznámením o uspání
+    /// a probuzením (jeho vlákno teprve vzniká) se nepřipojí — jinak by
+    /// šel přímo do BSOD ViGEmBus #160. Po probuzení už ano.
+    #[test]
+    fn novy_ovladac_pred_spankem_se_nepripoji() {
+        let (pady, logy) = pady();
+        assert!(pady.uspat(Duration::from_secs(5)));
+        assert!(pady.posli(2, PadPrikaz::Zapnout));
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(pocet(&logy[2], &Volani::Pripoj), 0);
+        assert_eq!(pady.stav(2).unwrap().detail, USPAVA_SE);
+        pady.probuzeni();
+        assert!(pady.posli(2, PadPrikaz::Zapnout));
+        assert_eq!(cekej_na(&pady, 2, PadStav::On), PadStav::On);
+        assert!(pady.ukonci(Duration::from_secs(5)));
+    }
+
+    /// Po začátku konce aplikace žádné nové vlákno: příkaz dalšímu
+    /// ovladači nesmí nic spustit ani připojit.
+    #[test]
+    fn po_konci_zadne_nove_vlakno() {
+        let (pady, logy) = pady();
+        assert!(pady.ukonci(Duration::from_secs(5)));
+        assert!(!pady.posli(1, PadPrikaz::Zapnout));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(logy[1].lock().unwrap().is_empty());
+        assert_eq!(pady.stavy().len(), 1);
+    }
+
+    /// Mrtvé pad vlákno (tady skončilo po konci) neblokuje spánek ani
+    /// instalátor: vlákno, které skončilo, ovladač uklidilo.
+    #[test]
+    fn mrtve_vlakno_neblokuje_spanek_ani_instalator() {
+        let (pady, _logy) = pady();
+        let g = pady.zamek();
+        let pad = g.pady[0].as_ref().unwrap();
+        assert!(pad.posli_s_potvrzenim(PadPrikaz::Konec).is_some());
+        let st = Arc::clone(pad.status());
+        drop(g);
+        let start = std::time::Instant::now();
+        while !st.ukonceno.load(Ordering::Acquire) && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let start = std::time::Instant::now();
+        assert!(pady.uspat(Duration::from_secs(5)));
+        assert!(pady.pred_instalaci(Duration::from_secs(5)));
+        assert!(start.elapsed() < Duration::from_secs(1), "nečeká do limitu");
     }
 }

@@ -373,6 +373,37 @@ impl Engine {
 
     // ── Klávesnice ───────────────────────────────────────────────────
 
+    /// Klávesa, kterou drží OS, ale engine o ní neví: hook neviděl její
+    /// stisk (nainstaloval se, až když už byla dole, nebo `reset_held`
+    /// zapomněl držené klávesy). Hook to pozná z asynchronního stavu
+    /// klávesnice u key-downu bez záznamu a zavolá tohle PŘED
+    /// [`Engine::on_key`].
+    ///
+    /// Klávesa dostane vlastníka `Os`, takže její autorepeat i key-up jdou
+    /// dál do OS (princip 2). Bez toho by autorepeat vypadal jako nový
+    /// stisk: v Gamepadu by se spolkl i s key-upem a v OS by klávesa
+    /// visela (s levým Shiftem = všechno velkými). Nic nespouští, stav
+    /// ovladačů nemění. `true` = zapsáno; už sledovaná nebo nemapovatelná
+    /// klávesa se nemění.
+    pub fn adopt_os_key(&mut self, key: KeyId, now_ms: u64) -> bool {
+        let Some(i) = key.index() else {
+            return false;
+        };
+        if self.held.get(i).is_some_and(Option::is_some) {
+            return false;
+        }
+        self.seq += 1;
+        self.remember(
+            i,
+            HeldKey {
+                owner: Owner::Os,
+                seq: self.seq,
+                last_ms: now_ms,
+            },
+        );
+        true
+    }
+
     /// Zpracuje událost klávesnice z hooku.
     pub fn on_key(&mut self, key: KeyId, down: bool, now_ms: u64) -> Decision {
         // Timeout přiřazování se kontroluje i tady, nejen v `tick`:
@@ -1484,6 +1515,36 @@ mod tests {
         // Key-upy po odemčení nemají záznam → jdou do OS.
         assert!(!up(&mut e, KeyId::W).suppress);
         assert!(!up(&mut e, KeyId::X).suppress);
+    }
+
+    /// Revize Fáze 4: uživatel drží W (OS jeho stisk viděl), mezitím se
+    /// hook nainstaluje / přeinstaluje (engine o W neví) a zapne se
+    /// zachytávání. Autorepeat W by byl „nový stisk" ovladače — spolkl
+    /// by se i key-up a W by v OS viselo. Hook proto W předem ohlásí
+    /// jako klávesu OS (`adopt_os_key`).
+    #[test]
+    fn klavesa_drzena_os_pred_zachytavanim_nevisi() {
+        let mut e = engine();
+        let _ = e.reset_held(ForceReason::HookReinstalled);
+        let _ = e.capture(T0);
+        assert_eq!(e.mode(), Mode::Gamepad);
+        assert!(e.adopt_os_key(KeyId::LEFT_SHIFT, T0));
+        assert!(!e.adopt_os_key(KeyId::LEFT_SHIFT, T0), "podruhé nic");
+        let r = down(&mut e, KeyId::LEFT_SHIFT);
+        assert!(!r.suppress, "autorepeat dál do OS");
+        assert!(r.pads.is_empty() && r.ui.is_none());
+        assert!(!up(&mut e, KeyId::LEFT_SHIFT).suppress, "key-up do OS");
+        // Další stisk už patří ovladači (L3).
+        assert!(down(&mut e, KeyId::LEFT_SHIFT).suppress);
+        // Sledovaná ani nemapovatelná klávesa se nepřebírá.
+        assert!(!e.adopt_os_key(KeyId::LEFT_SHIFT, T0));
+        assert!(!e.adopt_os_key(KeyId::ALTGR_FAKE_CTRL, T0));
+        assert!(!e.adopt_os_key(KeyId::new(0), T0));
+        // Zkratka držená OS se přebere taky — její autorepeat nepřepíná.
+        assert!(e.adopt_os_key(TOGGLE, T0));
+        let r = down(&mut e, TOGGLE);
+        assert!(!r.suppress && r.ui.is_none());
+        assert_eq!(e.mode(), Mode::Gamepad);
     }
 
     #[test]

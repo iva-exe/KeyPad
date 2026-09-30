@@ -33,7 +33,16 @@ export type Rezim =
 	| 'paused'
 	/** Klávesy ovládají zapnuté ovladače. */
 	| 'capturing'
-	| 'binding';
+	| 'binding'
+	/** Ovladač je zapnutý, ale Windows nedovolily sledovat klávesnici. */
+	| 'no_hook';
+
+/** Odpověď `rezim` i obsah události `rezim`. */
+interface RezimInfo {
+	rezim: Rezim;
+	/** Pořadí změny — starší (odpověď po novější události) se zahodí. */
+	seq: number;
+}
 
 /** Odpověď `pad_status` i obsah události `pad-stav`. */
 interface PadInfo {
@@ -74,8 +83,16 @@ export const pad = $state({
 	/** Chyba posledního kliknutí — krátká věta u tlačítek. */
 	chybaAkce: '',
 	/** Režim zachytávání (zdroj pravdy je engine v backendu). */
-	rezim: 'disabled' as Rezim
+	rezim: 'disabled' as Rezim,
+	/** Pořadí poslední převzaté změny režimu; −1 = zatím nic. */
+	rezimSeq: -1
 });
+
+function prevezmiRezim(r: RezimInfo): void {
+	if (r.seq < pad.rezimSeq) return;
+	pad.rezim = r.rezim;
+	pad.rezimSeq = r.seq;
+}
 
 /** Ovladač, který okno zatím ukazuje. */
 const PRVNI = 0;
@@ -114,7 +131,7 @@ function prevezmi(i: PadInfo): void {
 async function nacti(): Promise<void> {
 	try {
 		prevezmi(await zavolej<PadInfo>('pad_status', { pad: PRVNI }));
-		pad.rezim = await zavolej<Rezim>('rezim');
+		prevezmiRezim(await zavolej<RezimInfo>('rezim'));
 	} catch {
 		// Mimo aplikaci backend není — zůstane „vypnuto".
 	}
@@ -130,7 +147,7 @@ export function startPad(): void {
 	// k události by se jinak ztratila. Starší odpověď zahodí `seq`.
 	void Promise.all([
 		poslouchej<PadInfo>('pad-stav', prevezmi),
-		poslouchej<Rezim>('rezim', (r) => (pad.rezim = r))
+		poslouchej<RezimInfo>('rezim', prevezmiRezim)
 	]).then(nacti);
 	// Schované okno má uspaný webview; po návratu stav pro jistotu znovu.
 	document.addEventListener('visibilitychange', () => {

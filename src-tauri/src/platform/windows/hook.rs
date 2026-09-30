@@ -23,11 +23,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
-use keypad_core::{Decision, DisabledReason, Engine, ForceReason, KeyId, Mapping, Mode, PadId};
+use keypad_core::{
+    Decision, DisabledReason, Engine, ForceReason, KeyId, Mapping, Mode, PadId, PadState,
+    PadUpdates,
+};
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, KillTimer, PeekMessageW, PostThreadMessageW,
     SetTimer, SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT,
@@ -101,6 +105,11 @@ pub trait Vystup: Send + Sync {
     /// Vstříknuté klávesy přicházejí s `Decision::NONE` — engine je
     /// nevidí.
     fn rozhodnuti(&self, udalost: Option<&Udalost>, d: &Decision, rezim: Mode);
+
+    /// Hook nejde dostat do systému (`true`), nebo zase jde (`false`).
+    /// Volá jen smyčka, nikdy callback. Okno pak nesmí tvrdit, že
+    /// klávesy ovládají ovladač (princip 8).
+    fn hook_chyba(&self, _chyba: bool) {}
 }
 
 /// Příkazy hook vláknu. Každý vede na volání enginu a jeho rozhodnutí
@@ -266,7 +275,16 @@ fn spust_s(
             // Panic hook na tomhle vlákně nesmí čekat na zápis logu.
             crate::logger::mark_realtime_thread();
             match pred() {
-                Ok(()) => vlakno(Engine::new(mapovani), vystup, st, rx, &hotovo_tx),
+                Ok(()) => {
+                    let nouze = Arc::clone(&vystup);
+                    let stav = Arc::clone(&st);
+                    let vysledek = catch_unwind(AssertUnwindSafe(|| {
+                        vlakno(Engine::new(mapovani), vystup, stav, rx, &hotovo_tx)
+                    }));
+                    if vysledek.is_err() {
+                        po_panice_vlakna(&*nouze, &st);
+                    }
+                }
                 Err(e) => {
                     let _ = hotovo_tx.send(Err(e));
                 }
@@ -289,6 +307,35 @@ fn spust_s(
     }
 }
 
+/// Hook vlákno spadlo mimo callback (engine, výstup). Hook zmizí se
+/// skončením vlákna (Windows ho odeberou samy), klávesy jdou do OS —
+/// ale ovladače by si nechaly poslední stav a pad vlákna by ho dál
+/// posílala. Proto všem neutrál a okno se dozví, že nic nezachytává.
+fn po_panice_vlakna(vystup: &dyn Vystup, status: &HookStatus) {
+    status.nainstalovan.store(false, Ordering::Release);
+    status.rozbity.store(true, Ordering::Release);
+    status.paniky.fetch_add(1, Ordering::AcqRel);
+    let mut pads = PadUpdates::NONE;
+    for p in PadId::ALL {
+        pads.set(p, PadState::NEUTRAL);
+    }
+    let d = Decision {
+        pads,
+        ..Decision::NONE
+    };
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        vystup.rozhodnuti(
+            None,
+            &d,
+            Mode::Disabled {
+                reason: DisabledReason::PadError,
+            },
+        );
+        vystup.hook_chyba(true);
+    }));
+    log::error!("hook vlákno spadlo — ovladače dostaly neutrál, klávesy jdou do Windows");
+}
+
 /// Stav, který potřebuje callback. Žije v `thread_local!` hook vlákna:
 /// callback nemá kontext a jiné vlákno k enginu nesmí.
 struct Stav {
@@ -296,6 +343,20 @@ struct Stav {
     vystup: Arc<dyn Vystup>,
     /// Po panice selhal i úklid — engine se už nevolá.
     rozbity: bool,
+    /// Drží OS klávesu s daným VK? Skutečně [`os_drzi`], v testech
+    /// podvrh (skutečný stav klávesnice testy měnit nesmí).
+    os_drzi: fn(u32) -> bool,
+}
+
+/// Drží OS klávesu? Asynchronní stav klávesnice: v LL hooku je to stav
+/// PŘED touhle událostí a spolknuté události ho nemění — „dole" tedy
+/// znamená, že OS viděl key-down a key-up ještě ne. Nečeká, nezamyká.
+fn os_drzi(vk: u32) -> bool {
+    let Ok(vk) = i32::try_from(vk) else {
+        return false;
+    };
+    // SAFETY: jen čte asynchronní stav klávesy.
+    (unsafe { GetAsyncKeyState(vk) } as u16) & 0x8000 != 0
 }
 
 thread_local! {
@@ -334,6 +395,7 @@ fn vlakno(
             engine,
             vystup,
             rozbity: false,
+            os_drzi,
         })
     });
     // Hook zatím ne: bez zapnutého ovladače ho engine nepotřebuje.
@@ -362,7 +424,11 @@ fn vlakno(
                             if rezim() == Some(Mode::Keyboard) {
                                 hook = preinstaluj(hook, &status);
                             }
-                            s_enginem(|e| e.capture(ted_ms()));
+                            // Bez hooku v systému by zachytávání jen
+                            // předstíralo, že běží (princip 8).
+                            if !hook.is_invalid() {
+                                s_enginem(|e| e.capture(ted_ms()));
+                            }
                         }
                         p => s_enginem(|e| prikaz(e, p, ted_ms())),
                     }
@@ -433,15 +499,26 @@ fn hlidej_hook(hook: HHOOK, status: &HookStatus) -> HHOOK {
             Ok(h) => {
                 status.nainstalovan.store(true, Ordering::Release);
                 status.instalaci.fetch_add(1, Ordering::AcqRel);
+                nahlas_chybu(false);
                 log::info!("hook klávesnice nainstalován (zapnutý ovladač)");
                 h
             }
             Err(e) => {
-                // Klávesy pak jdou do Windows — bezpečná strana (princip 1).
+                // Klávesy jdou do Windows — bezpečná strana (princip 1).
+                // Zachytávání bez hooku by jen předstíralo, že běží.
+                if rezim() == Some(Mode::Gamepad) {
+                    s_enginem(|e| e.force_keyboard(ForceReason::HookReinstalled));
+                }
+                nahlas_chybu(true);
                 log::error!("hook klávesnice nejde nainstalovat: {e}");
                 hook
             }
         },
+        (false, true) => {
+            // Hook už není potřeba — ani jeho chyba.
+            nahlas_chybu(false);
+            hook
+        }
         (false, false) => {
             odhookni(hook);
             status.nainstalovan.store(false, Ordering::Release);
@@ -484,15 +561,26 @@ fn preinstaluj(stary: HHOOK, status: &HookStatus) -> HHOOK {
         Ok(h) => {
             status.nainstalovan.store(true, Ordering::Release);
             status.instalaci.fetch_add(1, Ordering::AcqRel);
+            nahlas_chybu(false);
             log::info!("hook klávesnice přeinstalován");
             h
         }
         Err(e) => {
             status.nainstalovan.store(false, Ordering::Release);
+            nahlas_chybu(true);
             log::error!("hook klávesnice nejde znovu nainstalovat: {e}");
             HHOOK::default()
         }
     }
+}
+
+/// Ohlásí výstupu, že hook (ne)jde nainstalovat.
+fn nahlas_chybu(chyba: bool) {
+    STAV.with(|s| {
+        if let Some(s) = s.borrow().as_ref() {
+            s.vystup.hook_chyba(chyba);
+        }
+    });
 }
 
 /// Časovač běží jen během přiřazování klávesy.
@@ -588,7 +676,15 @@ fn zpracuj(wparam: WPARAM, kb: &KBDLLHOOKSTRUCT) -> bool {
                 .rozhodnuti(Some(&u), &Decision::NONE, s.engine.mode());
             return false;
         }
-        let d = s.engine.on_key(u.klavesa, dolu, ted_ms());
+        let ted = ted_ms();
+        // Key-down klávesy, o které engine neví, ale OS ji drží: hook ji
+        // neviděl stisknout (nainstaloval se později, nebo se držené
+        // klávesy zapomněly). Je to autorepeat klávesy OS — ne nový
+        // stisk, který by se spolkl i s key-upem (klávesa by v OS visela).
+        if dolu && s.engine.held(u.klavesa).is_none() && (s.os_drzi)(u.vk) {
+            let _ = s.engine.adopt_os_key(u.klavesa, ted);
+        }
+        let d = s.engine.on_key(u.klavesa, dolu, ted);
         s.vystup.rozhodnuti(Some(&u), &d, s.engine.mode());
         d.suppress
     })
@@ -687,8 +783,21 @@ mod tests {
                 engine,
                 vystup,
                 rozbity: false,
+                os_drzi: nic_nedrzi,
             })
         });
+    }
+
+    fn nic_nedrzi(_vk: u32) -> bool {
+        false
+    }
+
+    fn vse_drzi(_vk: u32) -> bool {
+        true
+    }
+
+    fn podvrhni_os(f: fn(u32) -> bool) {
+        STAV.with(|s| s.borrow_mut().as_mut().unwrap().os_drzi = f);
     }
 
     fn kb(scan: u32, flags: u32) -> KBDLLHOOKSTRUCT {
@@ -882,6 +991,8 @@ mod tests {
                 engine,
                 vystup,
                 rozbity: false,
+                // Skutečný dotaz na stav klávesy — i ten musí být bez alokace.
+                os_drzi,
             })
         });
         // Scroll Lock (přepnutí), W, šipka, AltGr, média, vstříknutá.
@@ -1015,6 +1126,83 @@ mod tests {
                 cause: ModeCause::Forced(ForceReason::Shutdown),
             })
         );
+    }
+
+    /// Revize Fáze 4: klávesu, kterou OS drží (hook neviděl její stisk,
+    /// protože se nainstaloval později), callback převezme jako klávesu
+    /// OS — její autorepeat ani key-up se nespolknou, nic nevisí.
+    #[test]
+    fn klavesa_drzena_os_pri_instalaci_hooku_nevisi() {
+        let z = Arc::new(Zaznam::default());
+        priprav(&z);
+        podvrhni_os(vse_drzi);
+        // Autorepeat F24 (namapované) — OS ji drží, engine o ní neví.
+        assert!(!zavolej(0, WM_KEYDOWN, &kb(0x76, 0)), "autorepeat do OS");
+        assert!(!zavolej(0, WM_KEYDOWN, &kb(0x76, 0)));
+        assert!(!zavolej(0, WM_KEYUP, &kb(0x76, LLKHF_UP.0)), "key-up do OS");
+        assert_eq!(
+            z.posledni().1.pads.get(PadId::FIRST),
+            None,
+            "ovladač se nehnul"
+        );
+        // Nový stisk (OS ho ještě neviděl) už patří ovladači.
+        podvrhni_os(nic_nedrzi);
+        assert!(zavolej(0, WM_KEYDOWN, &kb(0x76, 0)));
+        // Klávesa, kterou engine sleduje, se podle OS nepřebírá.
+        podvrhni_os(vse_drzi);
+        assert!(zavolej(0, WM_KEYDOWN, &kb(0x76, 0)), "autorepeat ovladače");
+        assert!(zavolej(0, WM_KEYUP, &kb(0x76, LLKHF_UP.0)));
+    }
+
+    /// Hook vlákno spadne mimo callback (tady výstup při příkazu): hook
+    /// zmizí se skončením vlákna a ovladače dostanou neutrál — jinak by
+    /// jim zůstal poslední stav a pad vlákna by ho dál posílala.
+    #[test]
+    fn panika_vlakna_mimo_callback_posle_neutral() {
+        #[derive(Default)]
+        struct Padajici(Mutex<Vec<Radek>>, AtomicBool);
+        impl Vystup for Padajici {
+            fn rozhodnuti(&self, u: Option<&Udalost>, d: &Decision, rezim: Mode) {
+                let prepnuti_z_okna = d.ui
+                    == Some(UiEvent::ModeChanged {
+                        mode: Mode::Keyboard,
+                        cause: ModeCause::Gui,
+                    });
+                if prepnuti_z_okna {
+                    panic!("zkušební panika mimo callback");
+                }
+                self.0.lock().unwrap().push((u.copied(), *d, rezim));
+            }
+            fn hook_chyba(&self, chyba: bool) {
+                self.1.store(chyba, Ordering::Release);
+            }
+        }
+        let v = Arc::new(Padajici::default());
+        let vystup: Arc<dyn Vystup> = v.clone();
+        let mut hook = spust_s(mapovani(), vystup, testy_plocha::na_skryte_plose).unwrap();
+        let st = Arc::clone(hook.status());
+        assert!(hook.posli(HookPrikaz::Povol(PadId::FIRST)));
+        assert!(hook.posli(HookPrikaz::Zachytavej));
+        let konec = std::time::Instant::now() + LIMIT;
+        while v.0.lock().unwrap().last().map(|r| r.2) != Some(Mode::Gamepad) {
+            assert!(std::time::Instant::now() < konec);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(hook.posli(HookPrikaz::Prepni));
+        let konec = std::time::Instant::now() + LIMIT;
+        while !st.rozbity() {
+            assert!(std::time::Instant::now() < konec, "panika se neprojevila");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(hook.zastav(), "vlákno skončilo (ne visí)");
+        assert!(!st.nainstalovan());
+        assert!(v.1.load(Ordering::Acquire), "okno se dozví, že hook není");
+        let (u, d, m) = *v.0.lock().unwrap().last().unwrap();
+        assert!(u.is_none() && matches!(m, Mode::Disabled { .. }));
+        for p in PadId::ALL {
+            assert_eq!(d.pads.get(p), Some(PadState::NEUTRAL), "{p:?}");
+        }
+        assert!(!hook.posli(HookPrikaz::Prepni), "mrtvé vlákno nic nepřijme");
     }
 
     /// Časovač přiřazování běží jen při přiřazování.

@@ -36,7 +36,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DEVICE_NOTIFY_CALLBACK, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND,
 };
 
-use super::pad::{PadPrikaz, Pady};
+use super::pad::Pady;
 
 /// Co potřebuje spánek od virtuálních ovladačů. Rozhraní kvůli testu
 /// obsluhy bez skutečných pad vláken.
@@ -54,7 +54,7 @@ impl Napajeni for Pady {
     }
 
     fn probuzeni(&self) {
-        self.vsem(|| PadPrikaz::Probuzeni);
+        Pady::probuzeni(self);
     }
 }
 

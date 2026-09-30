@@ -38,6 +38,7 @@
 				return 'Zapínám…';
 			case 'on':
 				// Bez čísla hráče: ViGEmBus ho s víc pady hlásí špatně.
+				if (pad.rezim === 'no_hook') return 'Klávesy nejdou';
 				return pad.rezim === 'paused' ? 'Pozastaveno' : 'Zapnutý';
 			case 'bus_missing':
 				return 'Chybí ViGEmBus';
@@ -60,6 +61,8 @@
 			case 'connecting':
 				return pad.detail || 'Zapínám virtuální ovladač Xbox 360';
 			case 'on':
+				if (pad.rezim === 'no_hook')
+					return 'Windows nedovolily sledovat klávesnici — klávesy jdou do Windows. Zkus ovladač vypnout a zapnout; podrobnosti jsou v logu.';
 				return pad.rezim === 'paused'
 					? 'Klávesy jdou do Windows — Scroll Lock ovladač zase pustí'
 					: 'Klávesy ovládají virtuální ovladač — Scroll Lock je vrátí Windows';
@@ -277,6 +280,15 @@
 	/* Pozastaveno zkratkou: ovladač existuje (zelená zůstává pravdivá),
 	   ale klávesy teď jdou do Windows — tečka zhasne na obrys, ať je
 	   rozdíl vidět na první pohled bez čtení. */
+	/* Hook nejde: ovladač existuje, ale klávesy ho neovládají — úkol pro
+	   uživatele, jantarová jako u neběžícího ViGEmBus. */
+	.card[data-stav='on'][data-rezim='no_hook'] .dot {
+		background: var(--warn);
+		box-shadow: var(--glow-warn);
+	}
+	.card[data-stav='on'][data-rezim='no_hook'] .veta {
+		color: var(--warn);
+	}
 	.card[data-stav='on'][data-rezim='paused'] .dot {
 		background: transparent;
 		box-shadow: inset 0 0 0 1.5px var(--ok);
