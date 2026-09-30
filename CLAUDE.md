@@ -55,6 +55,8 @@ Jen Windows 10/11 x64; macOS/Linux se neřeší. UI i komentáře česky, v duch
 - Nové závislosti přidávej přes `[workspace.dependencies]` v kořenovém `Cargo.toml`.
 - Release build aplikace **jen přes Tauri CLI** (`tools\tauri.ps1 build --no-bundle`). Holý `cargo build` vestaví jen adresu vývojového serveru — nainstalovaná aplikace by ukázala „localhost se odmítl připojit“.
 - PowerShell skripty v `tools\` musí zůstat v **UTF-8 s BOM** (PowerShell 5.1), jinak se rozsype diakritika.
+- **Zkratky KeyPadu nikdy s klávesou Win** (vlastník 30. 9.: Win+L zamyká počítač); potřebuje-li zkratka modifikátor, je to Alt. Win nejde přiřadit ani akci ovladače.
+- **Žádné okno přes hru v popředí** (překryv, toast, vyskakovací okno) — znamení stavu jen ikonou v oznamovací oblasti a zvukem.
 - Nejasnost ve specifikaci se nerozhoduje potichu — zapiš ji do „Otevřených otázek“ v `ROADMAP.md` (i s tím, jak to kód dělá teď).
 
 ## Příkazy

@@ -239,7 +239,7 @@ Zpětná vazba po vyzkoušení Fáze 2. Jde první, dřív než hook — mění 
 - [x] **Ovladač jen na povel.** Virtuální ovladač se připojí **výhradně** po interakci uživatele (přepínač „ovladač zapnutý / vypnutý“) — nikdy sám po startu aplikace, po probuzení ani po aktualizaci. Nahrazuje původní „připojit hned po startu“. Vypnutí = neutrál → odpojit.
 - [x] **Žádný autostart.** KeyPad se nikdy nespouští s Windows, jen když ho uživatel zapne (otevřená otázka 16 uzavřena).
 - [x] **Vypnutí / restart / odhlášení PC:** vždy před tím aktivní ovladač deaktivovat (neutrál → odpojit) a celou aplikaci ukončit (skryté okno nejvyšší úrovně s `WM_QUERYENDSESSION` / `WM_ENDSESSION`). **Uspání / hibernace:** ovladač vypnout a po probuzení nechat vypnutý (bod 1).
-- [ ] **Tahání okna bez zadrhávání jako ve WinSentu** (ten přešel z acrylic na blur). Windows 10: blur jako WinSent; Windows 11 22H2+ (kde blur podle autorů knihovny zadrhává): systémový Mica. Rozhoduje číslo buildu, ne předpoklad. _(Windows 11: Mica hotová. Windows 10: nastavení je už totožné s WinSentem, žádná příčina specifická pro KeyPad se nenašla — čeká na potvrzení vlastníka, viz otevřená otázka 29.)_
+- [x] **Tahání okna bez zadrhávání jako ve WinSentu** (ten přešel z acrylic na blur). Windows 10: blur jako WinSent; Windows 11 22H2+ (kde blur podle autorů knihovny zadrhává): systémový Mica. Rozhoduje číslo buildu, ne předpoklad. _(Windows 11: Mica hotová. Windows 10: nastavení je už totožné s WinSentem, žádná příčina specifická pro KeyPad se nenašla — potvrzeno vlastníkem 30. 9.: na jeho Windows 10 v pořádku.)_
 - [x] **Zrcadlo ViGEmBus** v `iva-exe/KeyPad` (`mirror/ViGEmBus_1.22.0_x64_x86_arm64.exe`, schváleno) — záložní adresa, když repo autora zmizí; ověřuje se stejným napevno zapsaným SHA-256.
 - [x] **Credit ViGEmBus** (Nefarius Software Solutions e.U., odkaz na github.com/nefarius/ViGEmBus) v instalátoru i v detailech aplikace.
 - [x] **ViGEmBus automaticky — instalace i aktualizace.** KeyPadSetup ho nainstaluje bez zaškrtávátka, když chybí, a aktualizuje, když je starší než poslední vydání (ovladač < 1.21.442). Platí i pro aktualizaci z aplikace. Výzva UAC od Windows zůstává (ovladač jinak nejde). Nainstalovaný a běžící ViGEmBus v aktuální verzi se nikdy nepřeinstalovává.
@@ -275,6 +275,13 @@ Zpětná vazba po vyzkoušení Fáze 2. Jde první, dřív než hook — mění 
 - [ ] Volba „vždy navrchu“ (v nastavení, Fáze 7).
 
 **Hotovo, když:** v gamepad režimu WASD hýbe páčkou v `joy.cpl`, Notepad písmena WASD nedostává, ostatní klávesy fungují. _Stav: automaticky ověřeno po kouscích (callback bez alokací, slot, výstup do slotů, instalace hooku jen se zapnutým ovladačem na skryté ploše, pad vlákna se stavem ze slotu až do ovladače, víc ovladačů, spánek, instalátor, konec). Skutečné klávesy → páčka v `joy.cpl` ověří vlastník — testy nesmí simulovat vstup a vstříknuté klávesy hook stejně propouští._
+
+### Fáze 4b – Zpětná vazba vlastníka (30. 9. 2026)
+
+Ověřeno vlastníkem na vydání `0.1.0+20260930.2241`: `joy.cpl` měří vstup z kláves, Scroll Lock převádění pozastaví a vrátí (funguje jen se zapnutým ovladačem — hook je v systému jen tehdy, viz Fáze 4).
+
+- [ ] **Znamení pozastavení mimo okno** — během hry je okno schované, a pozastavení (Scroll Lock) teď nejde poznat. Ikona v oznamovací oblasti podle režimu (zachytává / pozastaveno / vypnuto) a krátký zvuk při pozastavení a obnovení (vypnout půjde v nastavení, Fáze 7). Žádné okno přes hru v popředí (princip 8).
+- [ ] **Zkratky KeyPadu nikdy s klávesou Win** (vlastník: Win+L zamyká počítač). Když zkratka potřebuje modifikátor, je to **Alt**. Platí pro nastavení zkratky (Fáze 7) i výchozí hodnoty; Win nejde ani přiřadit akci ovladače (Win musí zůstat funkční, Fáze 5).
 
 ### Fáze 5 – Pojistky proti softlocku
 
@@ -413,7 +420,7 @@ Nejasnosti ve specifikaci, na které se narazilo. U každé je, jak to **teď** 
 26. **Instalace ViGEmBus není ověřená naostro** — na tomhle PC je ViGEmBus nainstalovaný (nesmí se měnit), cesta s UAC se dá otestovat jen ve virtuálu (čistý Windows 10/11). Do té doby ověřeno po kouscích: stažení + hash, zámek souboru, podpis, stav ovladače, obrazovky.
 27. ✅ _Zastaralé: „Připojit znovu“ zmizelo (Fáze 2b) — po probuzení zůstává ovladač vypnutý; kliknutí těsně před spánkem hlídá 5s pojistka._ **„Připojit znovu“ ve spánku** — když po probuzení nepřijde oznámení (Modern Standby…), tlačítko pad připojí ručně. Teoreticky kdyby ho někdo zmáčkl v mezičase mezi oznámením o uspání a skutečným spánkem, pad by se připojil těsně před spánkem (oblast BSOD #160). Přijatelné?
 28. **Nesouhlasná verze ovladače** (odpověď 1/50/87 na kontrolu verze) → chyba padu s radou odebrat „ViGEm Bus Driver“ v Aplikacích a zkusit znovu; potom aplikace nabídne instalaci.
-29. **Tahání okna na Windows 10** — KeyPad má na Windows 10 přesně stejné nastavení pozadí jako WinSent (blur, bez vlastních rohů a rámečku). Pokud tahání zadrhává i tak, je potřeba vědět na jakém PC/buildu — ověřit se to dá jen skutečným tažením myší (zakázané v testech). Na Windows 11 je Mica.
+29. ✅ _Vlastník 30. 9.: průhlednost i tahání na Windows 10 v pořádku._ **Tahání okna na Windows 10** — KeyPad má na Windows 10 přesně stejné nastavení pozadí jako WinSent (blur, bez vlastních rohů a rámečku). Pokud tahání zadrhává i tak, je potřeba vědět na jakém PC/buildu — ověřit se to dá jen skutečným tažením myší (zakázané v testech). Na Windows 11 je Mica.
 30. **Číslo hráče u víc ovladačů** — ViGEmBus vrací při dvou virtuálních ovladačích stejný index pro oba (naměřeno), okno proto „hráč N“ neukazuje. Pro Fázi 4 (víc ovladačů) najít jiný spolehlivý zdroj.
 31. **Aktualizace ViGEmBus, která starý ovladač odebere a nový nepřidá** (známá chyba dodavatele „spusť instalaci dvakrát“): co udělá instalátor MSI nad už zaregistrovaným produktem, se dá ověřit jen ve virtuálu. Do té doby KeyPad v tomhle stavu nic neopakuje (druhé automatické spuštění instalátoru bylo odebráno — nikdy víc než jedno spuštění) a poradí odebrat „ViGEm Bus Driver“ v Aplikacích a spustit KeyPadSetup znovu.
 32. **Aktualizace ovladače zavře KeyPad** (nesmí držet sběrnici) a pak ho znovu spustí — ve všech režimech, i z tlačítka v aplikaci. Tlačítko „Aktualizovat ovladač“ se ukazuje i při zapnutém ovladači; kliknutí ovladač nejdřív vypne.
