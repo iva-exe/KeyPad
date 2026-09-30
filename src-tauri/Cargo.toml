@@ -31,14 +31,18 @@ webview2-com = { workspace = true }
 # Win32: okno (DWM, vyzdvižení), místní čas do logu, hláška při
 # nespuštění (MessageBox) a Fáze 2 — vlastní klient ViGEmBus (CfgMgr32
 # hledá rozhraní, overlapped DeviceIoControl s časovým limitem), uspání
-# (Power), pojmenovaná událost pro ukončení z instalátoru (Threading)
-# a spuštění instalátoru ViGEmBus (Shell). XboxController jen kvůli
-# konstantám XINPUT_GAMEPAD_* v testech a XInputGetState v příkladu
-# pad_selftest — KeyPad.exe sám xinput1_4.dll neimportuje (windows-rs
-# linkuje jen funkce, které se opravdu volají).
+# (Power), pojmenovaná událost pro ukončení z instalátoru (Threading),
+# spuštění instalátoru ViGEmBus a odkazů (Shell), skryté okno pro konec
+# relace Windows (WindowsAndMessaging) a build Windows pro pozadí okna
+# (Wdk: RtlGetVersion z ntdll — tentýž import, který už má Tauri).
+# XboxController jen kvůli konstantám XINPUT_GAMEPAD_* v testech
+# a XInputGetState v příkladu pad_selftest — KeyPad.exe sám
+# xinput1_4.dll neimportuje (windows-rs linkuje jen funkce, které se
+# opravdu volají).
 [dependencies.windows]
 workspace = true
 features = [
+    "Wdk_System_SystemServices",
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Devices_DeviceAndDriverInstallation",

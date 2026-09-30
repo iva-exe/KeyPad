@@ -15,8 +15,13 @@ on:
     # dřív. Stavět ho znovu by jen pálilo minuty. Když se v jednom
     # pushi sejde kód i vydání, CI poběží normálně (rozhoduje součet
     # změn celého pushe).
+    # mirror/ = záložní kopie instalátoru ViGEmBus (ověřuje se napevno
+    # zapsaným otiskem v kódu, do žádné binárky se nestaví) — commit,
+    # který mění jen ji, nemá co stavět. Test, že sedí s otiskem
+    # (updater: soubor_zrcadla_sedi_s_pinem), poběží s dalším kódem.
     paths-ignore:
       - 'release/**'
+      - 'mirror/**'
   workflow_dispatch:
 
 # Nový push do stejné větve zruší rozběhnutý build — výsledek starého

@@ -26,7 +26,7 @@ Jen Windows 10/11 x64. macOS ani Linux se neřeší.
 5. **Mapování podle scan kódů**, ne virtuálních kláves – jinak se rozbije české rozložení QWERTZ (Z/Y, horní řada čísel).
 6. **Žádná administrátorská práva** — aplikace ani instalátor nikdy nevyvolají UAC. Aplikace nezapisuje do registru. Instalaci a aktualizace dělá `KeyPadSetup.exe` **per-user** (`%LOCALAPPDATA%\Programs\KeyPad`); jediný zápis do registru je záznam v Aplikacích (`HKCU\…\Uninstall\KeyPad`), a ten dělá instalátor, ne aplikace.
    _(Změna oproti původní verzi, kde stálo „žádný instalátor“: vlastník chce stejný instalátor a updater jako u WinSentu. Per-user instalace drží zbytek principu — žádná admin práva.)_
-   **Jediná výjimka (29. 9. 2026, na přání vlastníka): instalace ovladače ViGEmBus z KeyPadSetup.** Ovladač jádra bez práv správce nainstalovat nejde. Proto: jen když ViGEmBus v systému úplně chybí, jen po výslovném souhlasu (zaškrtnutí / tlačítko), nikdy při aktualizaci. S právy správce běží **výhradně** oficiální podepsaný instalátor ViGEmBus 1.22.0 z repa nefarius/ViGEmBus, ověřený napevno zapsaným SHA-256 a podpisem; výzvu UAC ukazuje Windows. KeyPad ani KeyPadSetup samy s právy správce nikdy neběží. Proč to není „stahování ovladačů z webu“, které WinSent zakazuje: jde o jediný přesně známý soubor (hash v naší binárce, finální vydání archivovaného projektu — nikdy se nezmění), totéž, co dělá winget.
+   **Jediná výjimka (29. 9. 2026, na přání vlastníka): ovladač ViGEmBus z KeyPadSetup.** Ovladač jádra bez práv správce nainstalovat nejde. KeyPadSetup ho **automaticky nainstaluje, když chybí, a aktualizuje, když je prokazatelně starší** než ovladač 1.21.442 (i při aktualizaci z aplikace); aktuální, neznámý nebo na restart čekající ovladač nikdy nepřeinstalovává a před aktualizací ovladače KeyPad slušně ukončí (nesmí držet sběrnici). Souhlas = výzva UAC od Windows. S právy správce běží **výhradně** oficiální podepsaný instalátor ViGEmBus 1.22.0 z repa nefarius/ViGEmBus, ověřený napevno zapsaným SHA-256 a podpisem; výzvu UAC ukazuje Windows. KeyPad ani KeyPadSetup samy s právy správce nikdy neběží. Proč to není „stahování ovladačů z webu“, které WinSent zakazuje: jde o jediný přesně známý soubor (hash v naší binárce, finální vydání archivovaného projektu — nikdy se nezmění), totéž, co dělá winget.
 7. **Stav gamepadu se vždy přepočítává celý** z množiny držených kláves (čistá funkce), nikdy se inkrementálně nepřičítá/neodečítá.
 8. **Stejně bezpečný jako WinSent — nic agresivního v systému.** Žádné tweaky, zásahy do registru mimo vlastní záznam v HKCU, služby, naplánované úlohy, zásahy do cizích procesů ani nastavení Windows. Každou změnu systému spouští uživatel kliknutím, aplikace ji předem vysvětlí a potom ověří. Nic se neskrývá, nepředstírají se záruky, které nemáme. Cizí binárky jen v přesně ověřené podobě (pinned SHA-256 + podpis). _(Přidáno 29. 9. 2026 na přání vlastníka.)_
 9. **Všechny verze Windows 10 a 11 (x64).** Testuj schopnost, ne verzi; žádné statické importy API novějších, než je podporovaný minimální build; funkce Windows 11 na desítkách tiše odpadnou. _(29. 9. 2026)_
@@ -216,17 +216,33 @@ Rozhodnutí z výzkumu (29. 9. 2026): **vlastní malý klient ViGEmBus** (~250 �
 
 - [x] Vlastní klient (`platform/windows/vigem.rs`): časové limity na všech voláních, chyby rozlišené (chybí ovladač / 170 = poslat znovu / 55 = pad zmizel / 483 = ještě se připravuje / 650 = bez XInput slotu).
 - [x] Pravidla pad vlákna: `wait_ready` právě jednou a nikdy odpojit dřív, než se vrátí (chyba v ovladači); 483 při prvním připojení na novém PC není chyba („připojuji…“, až 10 s); 170 → opakovat až 250 ms, pak chyba.
-- [x] **Před uspáním pad odpojit, po probuzení připojit** (otevřený BSOD ViGEmBus #160 při probuzení s připojeným padem) — `PowerRegisterSuspendResumeNotification`, bez okna a bez pollování.
+- [x] **Před uspáním pad odpojit** (po probuzení zůstane vypnutý — Fáze 2b) (otevřený BSOD ViGEmBus #160 při probuzení s připojeným padem) — `PowerRegisterSuspendResumeNotification`, bez okna a bez pollování.
 - [x] Oznamovací oblast jako WinSent: ikona, menu Otevřít/Ukončit, zavření okna = schovat + uspat WebView. Instalátor ukončuje KeyPad pojmenovanou událostí (`updater::QUIT_EVENT_NAME`), ne WM_CLOSE.
 - [x] Instalace ViGEmBus z KeyPadSetup (viz výjimka v principu 6) + režim `/vigembus`, který spouští aplikace, když ovladač chybí.
 - [x] Pad vlákno: připojení ke sběrnici; při neúspěchu stav „ViGEmBus chybí“ (resp. „nainstalovaný, ale neběží“ s radou), aplikace **běží dál**.
 - [ ] Engine startuje v `Disabled { PadNotConnected }`, dokud se target nepřipojí (toggle je do té doby zakázaný) — napojení engine na stav padu je Fáze 4 (engine žije v hook vlákně); místa v kódu jsou označená.
-- [x] Xbox 360 target připojit **hned po startu** (stabilní pořadí hráčů), v režimu Klávesnice posílat neutrál.
+- [x] ~~Xbox 360 target připojit **hned po startu**~~ — nahrazeno Fází 2b: připojit jen na povel uživatele.
 - [x] Smyčka `recv_timeout(200 ms)`: vyprázdnit frontu na poslední `PadState`, `update()`, zapsat heartbeat.
 - [x] Chyba `update()` → nahlásit do stavu padu, nabídnout „Zkusit znovu“ (`Engine::disable(PadError)` přibude s napojením engine ve Fázi 4).
 - [x] Při ukončení target odpojit. **Ověřeno:** i při pádu procesu ho ovladač odebere sám (~6 ms).
 
 **Hotovo, když:** v `joy.cpl` se objeví Xbox 360 ovladač a testovací tlačítko v GUI pohne páčkou. _Stav: automaticky ověřeno bez okna (pad_selftest přes XInput: připojení, stav, odpojení, pád procesu); kontrola v `joy.cpl` s tlačítkem „Vyzkoušet páčku“ čeká na vlastníka. Neověřeno naostro: spánek/probuzení, instalace ViGEmBus (potřebuje čistý virtuál)._
+
+### Fáze 2b – Doladění podle vlastníka (29. 9. 2026)
+
+Zpětná vazba po vyzkoušení Fáze 2. Jde první, dřív než hook — mění chování toho, co už je hotové.
+
+- [x] **Ovladač jen na povel.** Virtuální ovladač se připojí **výhradně** po interakci uživatele (přepínač „ovladač zapnutý / vypnutý“) — nikdy sám po startu aplikace, po probuzení ani po aktualizaci. Nahrazuje původní „připojit hned po startu“. Vypnutí = neutrál → odpojit.
+- [x] **Žádný autostart.** KeyPad se nikdy nespouští s Windows, jen když ho uživatel zapne (otevřená otázka 16 uzavřena).
+- [x] **Vypnutí / restart / odhlášení PC:** vždy před tím aktivní ovladač deaktivovat (neutrál → odpojit) a celou aplikaci ukončit (skryté okno nejvyšší úrovně s `WM_QUERYENDSESSION` / `WM_ENDSESSION`). **Uspání / hibernace:** ovladač vypnout a po probuzení nechat vypnutý (bod 1).
+- [ ] **Tahání okna bez zadrhávání jako ve WinSentu** _(Windows 11: Mica hotová. Windows 10: nastavení je už totožné s WinSentem, žádná příčina specifická pro KeyPad se nenašla — čeká na potvrzení vlastníka, viz otevřená otázka 29.)_ (ten přešel z acrylic na blur). Windows 10: blur jako WinSent; Windows 11 22H2+ (kde blur podle autorů knihovny zadrhává): systémový Mica. Rozhoduje číslo buildu, ne předpoklad.
+- [x] **Zrcadlo ViGEmBus** v `iva-exe/KeyPad` (`mirror/ViGEmBus_1.22.0_x64_x86_arm64.exe`, schváleno) — záložní adresa, když repo autora zmizí; ověřuje se stejným napevno zapsaným SHA-256.
+- [x] **Credit ViGEmBus** (Nefarius Software Solutions e.U., odkaz na github.com/nefarius/ViGEmBus) v instalátoru i v detailech aplikace.
+- [x] **ViGEmBus automaticky — instalace i aktualizace.** KeyPadSetup ho nainstaluje bez zaškrtávátka, když chybí, a aktualizuje, když je starší než poslední vydání (ovladač < 1.21.442). Platí i pro aktualizaci z aplikace. Výzva UAC od Windows zůstává (ovladač jinak nejde). Nainstalovaný a běžící ViGEmBus v aktuální verzi se nikdy nepřeinstalovává.
+- [x] **Méně textu:** v okně aplikace i instalátoru co nejméně vysvětlivek, žádné chybové kódy (ty patří do logu).
+- [x] Vyzkoušet, co jde bez zásahu do systému, a opravit známé chyby. _(Naostro neověřeno: skutečné vypnutí/uspání PC, instalace a aktualizace ViGEmBus s UAC — potřebuje virtuál.)_
+
+**Hotovo, když:** po startu KeyPadu není v `joy.cpl` žádný ovladač; objeví se až po zapnutí přepínače; vypnutí PC s aktivním ovladačem aplikaci ukončí.
 
 ### Fáze 3 – Keyboard hook
 
@@ -246,11 +262,13 @@ Rozhodnutí z výzkumu (29. 9. 2026): **vlastní malý klient ViGEmBus** (~250 �
 
 - [ ] **Hook → Pad bez zámku:** hook NESMÍ posílat stav přes dnešní crossbeam kanál pad vlákna (bere std Mutex sdílený s odesílateli z GUI a alokuje — princip 3). Rozhodnuto: atomický slot „poslední stav“ + auto-reset událost, na kterou pad vlákno čeká spolu s kanálem příkazů; GUI a uspání zůstávají na kanálu.
 - [ ] Hook → Pad kanál, GUI → Hook příkazy (`Toggle`, `SetMapping`, `StartBinding`, `CancelBinding`, `ForceKeyboard`) přes Tauri commands; stav do GUI přes Tauri events.
-- [ ] Velké tlačítko v GUI: „Klávesnice“ / „Gamepad“ se zřetelnou barvou stavu.
+- [ ] **Přepínač „ovladač zapnutý / vypnutý“** (z Fáze 2b) napojený na engine: zapnutí = připojit ovladač a začít zachytávat jeho klávesy; vypnutí = neutrál, odpojit. **Zkratka (Scroll Lock) jen pozastaví** zachytávání (ovladače zůstanou připojené a neutrální), aby šlo psát do chatu, aniž by hra ztratila hráče.
+- [ ] **Víc ovladačů z jedné klávesnice** (až 4 — strop XInputu): každý vlastní klávesy, každý **barevně odlišený** (barva v okně i u kláves). Jádro: `Binding { pad, action }`, vlastník `Pad(pad, akce)`, `PadState` a stav „připraven“ pro každý ovladač zvlášť; klávesa smí patřit jen jednomu ovladači. Nový ovladač začíná bez kláves. Property test rozšířit na víc ovladačů.
+- [ ] Hook se instaluje jen tehdy, když je potřeba: zapnutý ovladač nebo otevřené okno (živá detekce stisků). Jinak KeyPad na klávesnici vůbec nesahá (princip 10).
 - [ ] Zkratka přepnutí (výchozí **Scroll Lock**, nastavitelná), reaguje jen na první key-down, nikdy na autorepeat.
-- [ ] Toggle je zakázaný, dokud není pad ve stavu „připojeno“.
-- [ ] Pokyn v GUI: po kliknutí na tlačítko se vraťte do okna streamu (nebo používejte zkratku, která fokus nemění).
-- [ ] Volba „vždy navrchu“ a kompaktní režim okna.
+- [ ] Zachytávání jde zapnout jen pro připojené ovladače.
+- [ ] (Bez dlouhých pokynů v GUI — minimum textu; zkratka je vidět v nastavení.)
+- [ ] Volba „vždy navrchu“ (v nastavení, Fáze 7).
 
 **Hotovo, když:** v gamepad režimu WASD hýbe páčkou v `joy.cpl`, Notepad písmena WASD nedostává, ostatní klávesy fungují.
 
@@ -271,14 +289,16 @@ Rozhodnutí z výzkumu (29. 9. 2026): **vlastní malý klient ViGEmBus** (~250 �
 ### Fáze 6 – GUI
 
 - [ ] Stavový řádek: ViGEmBus (OK / chybí + „Nainstalovat ViGEmBus“ / neběží + rada + „Zkusit znovu“), režim, poslední chyba. _(Stav padu a instalace ovladače hotové ve Fázi 2.)_
-- [ ] Živý náhled gamepadu (páčky, tlačítka, triggery) – slouží i jako ladicí nástroj.
-- [ ] Editor mapování: seznam akcí → „Přiřadit“ → stiskněte klávesu (Esc ruší, 10 s timeout) → odebrat vazbu → „Obnovit výchozí“.
+- [ ] **Nastavení kláves jako keybinds ve hře:** seznam vstupů ovladače (páčky, D-pad, A/B/X/Y, LB/RB, LT/RT, L3/R3, Start/Back) s přiřazenými klávesami (názvy přes `GetKeyNameTextW`); klik na vstup → „stiskni klávesu“ (Esc ruší, 10 s timeout) → uloženo; odebrání klávesy; „Obnovit výchozí“. Barva ovladače u kláves.
+- [ ] **Živá vizuální detekce stisků:** stisknutá klávesa hned rozsvítí svůj vstup (i když ovladač neběží) — jako v menu kláves ve hře. Zároveň živý náhled ovladače (páčky, tlačítka, triggery).
+- [ ] **Jednoduché a minimalistické:** co nejméně textu, vysvětlivek a kódů; stav poznat z barvy a ikon, podrobnosti v tooltipu nebo logu.
 - [ ] Upozornění na konflikty přímo u řádku (`MappingError` nese klávesu i akci).
-- [ ] Při změně mapování v režimu Gamepad nejdříve přepnout na Klávesnici (engine to dělá sám v `set_mapping`; GUI editaci v režimu Gamepad radši zakáže).
+- [ ] Úpravy kláves i za běhu ovladače: přiřazování dočasně pozastaví zachytávání a pak ho vrátí; držené klávesy si drží vlastníka (princip 2).
 
 ### Fáze 7 – Konfigurace a balení
 
-- [ ] `config.toml` — umístění viz Otevřené otázky (vedle `.exe` v per-user instalaci je zapisovatelné; fallback `%APPDATA%\KeyPad\config.toml`).
+- [ ] **Nastavení v aplikaci** (ozubené kolo): zkratka pozastavení, vždy navrchu, obnovit výchozí klávesy, aktualizace, **O aplikaci** (verze, credit ViGEmBus s odkazem, log).
+- [ ] `config.toml` — klávesy všech ovladačů, zkratka, volby; návrh (otevřená otázka 11): vždy `%APPDATA%\KeyPad\`. Dřív: vedle `.exe` v per-user instalaci je zapisovatelné; fallback `%APPDATA%\KeyPad\config.toml`).
 - [ ] Chybějící soubor → vytvořit výchozí. Nevalidní → přejmenovat na `config.invalid.toml`, načíst výchozí, zobrazit varování (nikdy nepadat).
 - [ ] Atomický zápis (dočasný soubor + přejmenování).
 - [ ] Pole `version` pro budoucí migrace.
@@ -324,7 +344,8 @@ Rozhodnutí z výzkumu (29. 9. 2026): **vlastní malý klient ViGEmBus** (~250 �
 | Stejná klávesa pro dvě akce | Validace zamítne |
 | Zkratka přepnutí přiřazena akci | Validace zamítne |
 | ViGEmBus není nainstalován | Aplikace běží, přepnutí zakázáno, tlačítko „Nainstalovat ViGEmBus“ (KeyPadSetup /vigembus, UAC od Windows) |
-| ViGEmBus nainstalovaný, ale neběží (zakázaný, čeká na restart, blokovaný) | Aplikace běží, rada podle stavu zařízení, instalátor se nespouští |
+| ViGEmBus nainstalovaný, ale neběží (zakázaný, čeká na restart, blokovaný) | Aplikace běží, rada podle stavu zařízení; instalátor se spustí jen tehdy, když je ovladač prokazatelně starší a nečeká na restart |
+| ViGEmBus starší než 1.21.442 | KeyPadSetup ho aktualizuje (UAC); předtím KeyPad slušně ukončí a po aktualizaci ho zase spustí |
 | Chyba ViGEm během hry | Vynucená Klávesnice + hláška + „Zkusit znovu“ |
 | Pad vlákno spadne / zasekne se | Watchdog do 1 s vynutí Klávesnici |
 | Panika v hook callbacku | Klávesa propuštěna, režim Klávesnice, `held` vyprázdněn (`reset_held`) — i její key-up dostane OS |
@@ -336,7 +357,9 @@ Rozhodnutí z výzkumu (29. 9. 2026): **vlastní malý klient ViGEmBus** (~250 �
 | Nevalidní `config.toml` | Záloha, výchozí hodnoty, varování |
 | Složka s `.exe` jen pro čtení | Konfigurace v `%APPDATA%` |
 | Zavření okna | Okno se schová do oznamovací oblasti, WebView se uspí; ukončení z menu = neutrál → odhook → odpojení padu |
-| Uspání počítače s připojeným padem | Pad se před uspáním odpojí, po probuzení připojí (BSOD ViGEmBus #160) |
+| Uspání počítače s připojeným padem | Pad se před uspáním odpojí a vypne (BSOD ViGEmBus #160); po probuzení zůstane vypnutý |
+| Vypnutí / restart / odhlášení PC | Pad se odpojí a KeyPad skončí (skryté okno `KeyPad.KonecRelace`, WM_ENDSESSION) |
+| Start KeyPadu | Žádný virtuální ovladač — objeví se až po zapnutí přepínače |
 | Pád KeyPadu | Ovladač virtuální pad odpojí sám do ~6 ms (změřeno) |
 | Pád procesu | Hook i virtuální pad zmizí s procesem |
 | Editace mapování v režimu Gamepad | Zakázáno / nejdřív přepnout |
@@ -370,22 +393,26 @@ Nejasnosti ve specifikaci, na které se narazilo. U každé je, jak to **teď** 
 13. **Tlačítko Guide (Xbox logo)** není mezi akcemi — výchozí mapování ho nemá a Steam ho zachytává pro svůj overlay. Přidat?
 14. **Pravidlo ztraceného key-upu (1,5 s)** — přidáno po revizi, ve specifikaci nebylo; mění doslovné „klávesa v `held` = autorepeat“ pro klávesy `Pad`/`Swallow`. Opírá se o to, že Windows opakují jen naposledy stisknutou klávesu a starší se po jejím uvolnění znovu nerozjede. Kdyby nějaká klávesnice/ovladač opakování starší klávesy obnovil, stane se nanejvýš: klávesa padu dostane nové pořadí pro SOCD, nebo spolknutá klávesa pošle do OS jeden úhoz navíc. OK?
 15. **Čím se v hooku měří čas** — čas události (`KBDLLHOOKSTRUCT::time`, 32 bitů, rozšířit na 64) je přesnější pro pravidlo z bodu 14 (nezávisí na zdržení hook vlákna); `GetTickCount64()` je jednodušší. Rozhodne se ve Fázi 3.
-16. **Spouštění po přihlášení** (WinSent ho má) — teď NENÍ. Zápis do `HKCU\…\Run` by porušil princip 6 (aplikace nezapisuje do registru; šla by zkratka ve složce Po spuštění) a hlavně: běžící KeyPad drží připojený virtuální Xbox ovladač, takže by ho hry a Steam viděly pořád, i když KeyPad nepoužíváš. _Návrh:_ nechat bez, případně volitelně přes zástupce ve složce Po spuštění.
-17. **Připojení padu hned po startu** (roadmapa kvůli stabilnímu pořadí hráčů) znamená zvuk „zařízení připojeno“ při každém startu KeyPadu a ovladač viditelný pro hry po celou dobu běhu (i schovaného v trayi). Alternativa: připojit až při prvním přepnutí na Gamepad.
+16. ✅ _Rozhodnuto vlastníkem 29. 9.: žádný autostart, KeyPad spouští jen uživatel._ **Spouštění po přihlášení** (WinSent ho má) — teď NENÍ. Zápis do `HKCU\…\Run` by porušil princip 6 (aplikace nezapisuje do registru; šla by zkratka ve složce Po spuštění) a hlavně: běžící KeyPad drží připojený virtuální Xbox ovladač, takže by ho hry a Steam viděly pořád, i když KeyPad nepoužíváš. _Návrh:_ nechat bez, případně volitelně přes zástupce ve složce Po spuštění.
+17. ✅ _Rozhodnuto 29. 9.: ovladač jen po interakci uživatele (Fáze 2b)._ **Připojení padu hned po startu** (roadmapa kvůli stabilnímu pořadí hráčů) znamená zvuk „zařízení připojeno“ při každém startu KeyPadu a ovladač viditelný pro hry po celou dobu běhu (i schovaného v trayi). Alternativa: připojit až při prvním přepnutí na Gamepad.
 18. **Oficiálně podporované minimum Windows.** Naše binárky mají běžet na každém Windows 10 od 1507 (po opravě instalátoru žádný novější statický import). Microsoft ale oficiálně podporuje WebView2 až od Windows 10 **1709** (+ LTSC 2015/2016). _Návrh do README:_ „Windows 10 1709 a novější (vč. LTSC) a Windows 11, 64bit; doporučeno 22H2 / 11“. Na 1507/1511 navíc chybí ochrana `/DEPENDENTLOADFLAG` (Windows ji ignorují) — přijatelné u nepodporovaných buildů?
-19. **Rozmazané pozadí okna (blur)** — vzhled jako WinSent, ale jde přes nedokumentované API, na Windows 10 před 1809 chybí a na Windows 11 22H2 podle autora knihovny zpomaluje tažení okna. Kvůli principu 10 zvážit neprůhledné pozadí.
-20. **Záloha instalátoru ViGEmBus** — repo ViGEmBus je archivované; kdyby zmizelo, instalace ovladače z KeyPadSetup přestane fungovat (bezpečně — jen „nepodařilo se stáhnout“). Zrcadlit ho jako asset vydání v `iva-exe/KeyPad` (stejný hash), nebo ne?
+19. ✅ _Rozhodnuto 29. 9.: jako WinSent — blur na Windows 10, Mica na Windows 11 22H2+ (Fáze 2b)._ **Rozmazané pozadí okna (blur)** — vzhled jako WinSent, ale jde přes nedokumentované API, na Windows 10 před 1809 chybí a na Windows 11 22H2 podle autora knihovny zpomaluje tažení okna. Kvůli principu 10 zvážit neprůhledné pozadí.
+20. ✅ _Schváleno 29. 9.: zrcadlit do `iva-exe/KeyPad` (Fáze 2b)._ **Záloha instalátoru ViGEmBus** — repo ViGEmBus je archivované; kdyby zmizelo, instalace ovladače z KeyPadSetup přestane fungovat (bezpečně — jen „nepodařilo se stáhnout“). Zrcadlit ho jako asset vydání v `iva-exe/KeyPad` (stejný hash), nebo ne?
 21. **Schované okno v režimu Gamepad** — zavření okna ho jen schová do trayе a pad zůstává připojený; režim se nemění. Má schování v režimu Gamepad vynutit Klávesnici? _Návrh:_ ne — schovat okno a hrát je hlavní scénář (okno nepřekáží streamu).
 22. **„Vyzkoušet páčku“** jede plnou výchylkou (kruh ~1,2 s, pak neutrál). Ve Fázi 4 povolit jen v režimu Klávesnice; stav z klávesnice test přeruší.
 23. **Paměť WebView2 schovaného v trayi** — _rozhodnuto:_ při schování `MemoryUsageTargetLevel = LOW`. Fyzická paměť (co ukazuje Správce úloh) klesne z ~345 MB na ~50 MB (po 2 min ~120 MB), soukromá zůstává ~160 MB; CPU ~0. Víc bez zavření WebView nejde.
-24. **Zaškrtávátko „Nainstalovat i ovladač ViGEmBus“ je předvyplněné**, když ovladač chybí — na přání vlastníka, ať kamarád nepotřebuje nic dalšího. Souhlas = viditelné zaškrtávátko s vysvětlením + klik + výzva UAC od Windows. Nabízí se i při ručním spuštění KeyPadSetup nad už nainstalovaným KeyPadem, nikdy při aktualizaci z aplikace (`/quiet`). Nechat předvyplněné?
+24. ✅ _Rozhodnuto 29. 9.: ViGEmBus se instaluje i aktualizuje automaticky, bez zaškrtávátka, i při aktualizaci z aplikace (Fáze 2b); souhlas = výzva UAC od Windows._ **Zaškrtávátko „Nainstalovat i ovladač ViGEmBus“ je předvyplněné**, když ovladač chybí — na přání vlastníka, ať kamarád nepotřebuje nic dalšího. Souhlas = viditelné zaškrtávátko s vysvětlením + klik + výzva UAC od Windows. Nabízí se i při ručním spuštění KeyPadSetup nad už nainstalovaným KeyPadem, nikdy při aktualizaci z aplikace (`/quiet`). Nechat předvyplněné?
 25. **Zbytkové riziko instalace ViGEmBus:** oficiální instalátor (s právy správce) běží ze složky v %TEMP%, do které může psát i uživatel. Soubor sám je zamčený a ověřený, ale jestli si instalátor Advanced Installer bezpečně načítá své DLL, závisí na jeho vlastním zabezpečení (neověřeno spuštěním). Okno = výzva UAC + běh instalace. KeyPad je přesto bezpečnější než WinSent, jehož instalátor běží celý jako správce ze Stažených souborů.
 26. **Instalace ViGEmBus není ověřená naostro** — na tomhle PC je ViGEmBus nainstalovaný (nesmí se měnit), cesta s UAC se dá otestovat jen ve virtuálu (čistý Windows 10/11). Do té doby ověřeno po kouscích: stažení + hash, zámek souboru, podpis, stav ovladače, obrazovky.
-27. **„Připojit znovu“ ve spánku** — když po probuzení nepřijde oznámení (Modern Standby…), tlačítko pad připojí ručně. Teoreticky kdyby ho někdo zmáčkl v mezičase mezi oznámením o uspání a skutečným spánkem, pad by se připojil těsně před spánkem (oblast BSOD #160). Přijatelné?
+27. ✅ _Zastaralé: „Připojit znovu“ zmizelo (Fáze 2b) — po probuzení zůstává ovladač vypnutý; kliknutí těsně před spánkem hlídá 5s pojistka._ **„Připojit znovu“ ve spánku** — když po probuzení nepřijde oznámení (Modern Standby…), tlačítko pad připojí ručně. Teoreticky kdyby ho někdo zmáčkl v mezičase mezi oznámením o uspání a skutečným spánkem, pad by se připojil těsně před spánkem (oblast BSOD #160). Přijatelné?
 28. **Nesouhlasná verze ovladače** (odpověď 1/50/87 na kontrolu verze) → chyba padu s radou odebrat „ViGEm Bus Driver“ v Aplikacích a zkusit znovu; potom aplikace nabídne instalaci.
+29. **Tahání okna na Windows 10** — KeyPad má na Windows 10 přesně stejné nastavení pozadí jako WinSent (blur, bez vlastních rohů a rámečku). Pokud tahání zadrhává i tak, je potřeba vědět na jakém PC/buildu — ověřit se to dá jen skutečným tažením myší (zakázané v testech). Na Windows 11 je Mica.
+30. **Číslo hráče u víc ovladačů** — ViGEmBus vrací při dvou virtuálních ovladačích stejný index pro oba (naměřeno), okno proto „hráč N“ neukazuje. Pro Fázi 4 (víc ovladačů) najít jiný spolehlivý zdroj.
+31. **Aktualizace ViGEmBus, která starý ovladač odebere a nový nepřidá** (známá chyba dodavatele „spusť instalaci dvakrát“): co udělá instalátor MSI nad už zaregistrovaným produktem, se dá ověřit jen ve virtuálu. Do té doby KeyPad v tomhle stavu nic neopakuje (druhé automatické spuštění instalátoru bylo odebráno — nikdy víc než jedno spuštění) a poradí odebrat „ViGEm Bus Driver“ v Aplikacích a spustit KeyPadSetup znovu.
+32. **Aktualizace ovladače zavře KeyPad** (nesmí držet sběrnici) a pak ho znovu spustí — ve všech režimech, i z tlačítka v aplikaci. Tlačítko „Aktualizovat ovladač“ se ukazuje i při zapnutém ovladači; kliknutí ovladač nejdřív vypne.
 
 ---
 
 ## Mimo rozsah verze 1
 
-Myš jako pravá páčka, více virtuálních padů, podpora macOS/Linux, analogový „chůze“ modifikátor, podpis kódu. Architektura je nesmí znemožnit, ale neimplementují se. _(Automatické aktualizace už mimo rozsah nejsou — viz „Instalace a aktualizace“.)_
+Myš jako pravá páčka, podpora macOS/Linux, analogový „chůze“ modifikátor, podpis kódu. Architektura je nesmí znemožnit, ale neimplementují se. _(Automatické aktualizace a víc virtuálních ovladačů už mimo rozsah nejsou — viz „Instalace a aktualizace“ a Fázi 4.)_

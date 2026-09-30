@@ -49,8 +49,13 @@ pub const VERSION_FILE: &str = "version.txt";
 /// k tomu, že se KeyPad slušně ukončí.
 pub const QUIT_EVENT_NAME: &str = "Local\\KeyPad.Ukoncit";
 
-/// Přepínač instalátoru pro samostatnou instalaci ovladače ViGEmBus
-/// (spouští ho aplikace, když ovladač chybí).
+/// Přepínač instalátoru jen pro ovladač ViGEmBus: chybí → instalace,
+/// je starší ([`vigembus::needs_update`]) → aktualizace, jinak jen stav.
+/// Spouští ho aplikace; kód návratu 0 = ovladač běží, 3010 = poběží po
+/// restartu, 1 = jinak. Před aktualizací instalátor nainstalovaný KeyPad
+/// zavře (drží sběrnici; [`QUIT_EVENT_NAME`] → WM_CLOSE → natvrdo)
+/// a potom ho spustí znovu — kód návratu si pak nikdo nepřečte, nový
+/// KeyPad si stav ovladače zjistí sám.
 pub const SETUP_ARG_VIGEMBUS: &str = "/vigembus";
 
 /// Instalátor WebView2 Runtime od Microsoftu (Evergreen Bootstrapper).
@@ -86,12 +91,58 @@ pub fn roaming_dir() -> Option<PathBuf> {
 /// POZOR: GitHub API má pro nepřihlášené limit 60 dotazů za hodinu na
 /// IP. Volat jen tehdy, když se opravdu stahuje — na pravidelnou
 /// kontrolu je [`remote_version`].
-pub fn latest_commit() -> Result<String, String> {
+pub fn latest_commit() -> Result<String, ReleaseError> {
     let body = http::get(API_HOST, &format!("/repos/{REPO}/commits/main"), |_| {})
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| ReleaseError::Http { file: None, error })?;
     parse_commit_sha(&String::from_utf8_lossy(&body))
-        .ok_or_else(|| "odpověď GitHubu neobsahuje platný commit".to_string())
+        .ok_or_else(|| ReleaseError::Invalid("odpověď GitHubu neobsahuje platný commit".into()))
 }
+
+/// Věta pro okno instalátoru, když stažený obsah nedává smysl (prázdná
+/// verze, místo binárky chybová stránka…). Bez velikostí a kódů — ty jdou
+/// do logu.
+pub const BAD_DOWNLOAD: &str = "Stažený soubor nebyl v pořádku — zkus to znovu.";
+
+/// Proč se commit nebo soubor vydání nepodařilo získat.
+///
+/// `Display` nese podrobnosti stejně jako dřív řetězec (log, hlášky
+/// aplikace). Okno instalátoru ukazuje jen [`ReleaseError::sentence`] —
+/// jednu krátkou větu bez kódů (Fáze 2b).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseError {
+    /// Síť nebo odpověď serveru; `file` = který soubor vydání.
+    Http {
+        file: Option<String>,
+        error: http::Error,
+    },
+    /// Server odpověděl, ale s obsahem, se kterým nejde nic dělat.
+    Invalid(String),
+}
+
+impl ReleaseError {
+    /// Věta pro okno instalátoru.
+    pub fn sentence(&self) -> &'static str {
+        match self {
+            ReleaseError::Http { error, .. } => error.sentence(),
+            ReleaseError::Invalid(_) => BAD_DOWNLOAD,
+        }
+    }
+}
+
+impl std::fmt::Display for ReleaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReleaseError::Http {
+                file: Some(name),
+                error,
+            } => write!(f, "{name}: {error}"),
+            ReleaseError::Http { file: None, error } => write!(f, "{error}"),
+            ReleaseError::Invalid(d) => f.write_str(d),
+        }
+    }
+}
+
+impl std::error::Error for ReleaseError {}
 
 /// Vytáhne SHA z odpovědi `GET /repos/{repo}/commits/main`.
 ///
@@ -133,9 +184,13 @@ pub fn fetch_release_file(
     sha: &str,
     name: &str,
     progress: impl FnMut(usize),
-) -> Result<Vec<u8>, String> {
-    http::get(RAW_HOST, &format!("/{REPO}/{sha}/release/{name}"), progress)
-        .map_err(|e| format!("{name}: {e}"))
+) -> Result<Vec<u8>, ReleaseError> {
+    http::get(RAW_HOST, &format!("/{REPO}/{sha}/release/{name}"), progress).map_err(|error| {
+        ReleaseError::Http {
+            file: Some(name.to_string()),
+            error,
+        }
+    })
 }
 
 /// Vypadá stažený obsah jako spustitelný soubor?
@@ -216,7 +271,7 @@ pub fn runs_from_install_dir(exe: &std::path::Path) -> bool {
 /// nepotřebuje práva správce, takže instalace ani aktualizace KeyPadu
 /// o ně nikdy nežádá (princip 6 v ROADMAP.md). Jediná výzva UAC, kterou
 /// může KeyPadSetup vyvolat, patří oficiálnímu instalátoru ViGEmBus —
-/// jen když ovladač úplně chybí a uživatel ho výslovně chce (viz
+/// jen když ovladač chybí nebo je starší než poslední vydání (viz
 /// [`vigembus`]).
 pub fn install_dir() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
@@ -251,6 +306,28 @@ mod tests {
         let body =
             r#"{"sha":"6f39a52c0ffee1234","node_id":"x","commit":{"tree":{"sha":"aaaaaaa"}}}"#;
         assert_eq!(parse_commit_sha(body).as_deref(), Some("6f39a52c0ffee1234"));
+    }
+
+    /// Podrobnosti zůstávají v `Display` (log, hlášky aplikace) ve stejném
+    /// tvaru jako dřív; okno instalátoru dostane jen větu bez kódů.
+    #[test]
+    fn chyba_vydani_podrobnosti_do_logu_veta_do_okna() {
+        let e = ReleaseError::Http {
+            file: Some(APP_EXE.into()),
+            error: http::Error::Http { status: 502 },
+        };
+        assert_eq!(e.to_string(), "KeyPad.exe: server odpověděl chybou 502");
+        assert_eq!(e.sentence(), http::NO_CONNECTION);
+        let e = ReleaseError::Http {
+            file: None,
+            error: http::Error::Http { status: 403 },
+        };
+        assert!(e.to_string().starts_with("GitHub dočasně omezil"));
+        assert_eq!(e.sentence(), http::RATE_LIMITED);
+        let e = ReleaseError::Invalid("odpověď GitHubu neobsahuje platný commit".into());
+        assert_eq!(e.to_string(), "odpověď GitHubu neobsahuje platný commit");
+        assert_eq!(e.sentence(), BAD_DOWNLOAD);
+        assert!(!BAD_DOWNLOAD.chars().any(|c| c.is_ascii_digit()));
     }
 
     #[test]

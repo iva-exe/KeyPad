@@ -55,6 +55,8 @@ features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_LibraryLoader",
     "Win32_System_Console",
+    # Razítko času v KeyPadSetup.log (GetLocalTime, kernel32).
+    "Win32_System_SystemInformation",
     # Instalace ovladače ViGEmBus (src/driver.rs): podpis Authenticode
     # (WinVerifyTrust + jméno vydavatele z certifikátu) a vlastník složky
     # v ProgramData. Samotné spuštění jde přes ShellExecuteExW (UI_Shell).

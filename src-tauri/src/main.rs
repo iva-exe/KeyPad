@@ -2,8 +2,10 @@
 //!
 //! Fáze 0: okno ve stylu WinSentu, logger, panic hook a aktualizace.
 //! Fáze 2: virtuální pad (vlastní klient ViGEmBus, pad vlákno), ikona
-//! v oznamovací oblasti, uspání, ukončení z instalátoru. Hook klávesnice
-//! přijde ve Fázi 3 (viz ROADMAP.md).
+//! v oznamovací oblasti, uspání, ukončení z instalátoru. Fáze 2b: pad
+//! jen na povel přepínače, vypnutí před spánkem i koncem relace
+//! Windows, pozadí okna podle systému. Hook klávesnice přijde ve Fázi 3
+//! (viz ROADMAP.md).
 
 // Release bez konzolového okna. Ve vývoji konzole zůstává — je v ní
 // vidět výchozí výpis paniky a výstup Tauri.
@@ -22,7 +24,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use tauri::Manager;
 
-/// Odpověď příkazu `app_info` (patička okna).
+/// Odpověď příkazu `app_info` („O aplikaci", titulek okna).
 #[derive(Debug, Clone, Serialize)]
 struct AppInfo {
     /// Verze z `version.txt` vedle programu, u vývojového buildu verze
@@ -32,10 +34,23 @@ struct AppInfo {
     log_path: String,
     /// Vývojový build (bez `version.txt`) — aktualizace se nenabízí.
     dev: bool,
+    /// Ikona v oznamovací oblasti existuje — zavření okna jen schová.
+    /// Bez ní zavření aplikaci ukončí a okno to nesmí tvrdit jinak.
+    tray: bool,
+    /// V instalační složce je KeyPadSetup.exe — okno nabídne instalaci
+    /// a aktualizaci ViGEmBus. Bez něj jen odkaz na ruční stažení.
+    setup: bool,
+    /// Credit ViGEmBus („ViGEmBus — autor"), licence a repozitář — z
+    /// `updater::vigembus`, týž text jako v instalátoru. Okno žádnou
+    /// vlastní kopii nemá; odkaz otevírá backend (`open_link`), adresa
+    /// jde do okna jen jako popisek.
+    vigembus_credit: &'static str,
+    vigembus_license: &'static str,
+    vigembus_url: &'static str,
 }
 
 /// Stav sdílený s příkazy. Počítá se jednou při startu: nic z toho se
-/// za běhu nemění a patička se ptá při každém otevření okna.
+/// za běhu nemění.
 struct Stav {
     info: AppInfo,
     log: Option<PathBuf>,
@@ -43,7 +58,13 @@ struct Stav {
 
 #[tauri::command]
 fn app_info(stav: tauri::State<'_, Stav>) -> AppInfo {
-    stav.info.clone()
+    AppInfo {
+        // Ikona vzniká až v `setup` a instalace může přibýt za běhu —
+        // ptát se pokaždé, ne jednou při startu.
+        tray: tray::schovavat(),
+        setup: updater::install_dir().join(updater::SETUP_EXE).is_file(),
+        ..stav.info.clone()
+    }
 }
 
 /// Otevře Průzkumníka s označeným souborem logu.
@@ -259,6 +280,11 @@ fn main() {
             .map(|p| p.display().to_string())
             .unwrap_or_default(),
         dev: verze.is_none(),
+        tray: false,
+        setup: false,
+        vigembus_credit: updater::vigembus::CREDIT,
+        vigembus_license: updater::vigembus::LICENSE,
+        vigembus_url: updater::vigembus::REPO_URL,
     };
 
     log::info!("start KeyPad {} (pid {})", info.version, std::process::id());
@@ -300,9 +326,12 @@ fn main() {
             update::check_update,
             update::run_update,
             gamepad::pad_status,
+            gamepad::pad_on,
+            gamepad::pad_off,
             gamepad::pad_test,
             gamepad::pad_retry,
-            gamepad::install_vigembus
+            gamepad::install_vigembus,
+            gamepad::open_link
         ])
         .setup(|app| {
             // Okna z konfigurace Tauri vytváří těsně před tímhle voláním,
@@ -328,7 +357,12 @@ fn main() {
                     ),
                 );
             };
-            okno::zaobli_a_ztmav(&w);
+            // Tmavý motiv okna drží tauri.conf.json („theme": „Dark"),
+            // ne DWM odsud — viz `okno::zaobli`.
+            okno::zaobli(&w);
+            // Blur na Windows 10, Mica na Windows 11 (tažení okna bez
+            // zadrhávání) — proto ne pevně v tauri.conf.json.
+            okno::nastav_pozadi(&w);
             // Ikona dřív než pad: bez ní se zavřením okna aplikace
             // ukončí (viz `tray::schovavat`) — nikdy neviditelný proces.
             if let Err(e) = tray::nastav(app) {
@@ -336,9 +370,9 @@ fn main() {
                     "ikona v oznamovací oblasti nejde vytvořit: {e} — zavření okna KeyPad ukončí"
                 );
             }
-            // Pad hned po startu (stabilní pořadí hráčů). Jeho stav jde
-            // do okna událostí `pad-stav` — náhrada za egui
-            // `request_repaint` z ROADMAP. Hook přibude ve Fázi 3.
+            // Pad vlákno ViGEmBus jen ověří; virtuální ovladač připojí
+            // až přepínač v okně (Fáze 2b). Stav jde do okna událostí
+            // `pad-stav`. Hook přibude ve Fázi 3.
             gamepad::spust(app);
             let handle = app.handle().clone();
             let ukonceni = platform::windows::ukonceni::hlidej(move || {
@@ -351,12 +385,31 @@ fn main() {
             if let Err(e) = ukonceni {
                 log::error!("{e} — instalátor KeyPad při aktualizaci ukončí natvrdo");
             }
+            let handle = app.handle().clone();
+            let relace = platform::windows::relace::hlidej(move |duvod| {
+                // Synchronně, ještě v obsluze WM_ENDSESSION: po návratu
+                // z ní smí Windows proces kdykoli ukončit. Pad nejdřív
+                // (neutrál → odpojit), pak log na disk, pak konec
+                // aplikace stejnou cestou jako „Ukončit" v nabídce.
+                log::info!("Windows končí relaci ({duvod}) — vypínám ovladač a končím");
+                gamepad::ukonci(&handle);
+                logger::flush(Duration::from_millis(500));
+                let h = handle.clone();
+                let _ = handle.run_on_main_thread(move || {
+                    tray::ukonci(&h, "konec relace Windows");
+                });
+            });
+            if let Err(e) = relace {
+                // Záloha: hlavní okno (tao) při WM_ENDSESSION spustí
+                // RunEvent::Exit, a ten pad taky uklidí.
+                log::error!("{e} — konec relace obslouží jen hlavní okno");
+            }
             Ok(())
         })
         .on_window_event(|window, udalost| {
             // Zavření okna (křížek, Alt+F4, WM_CLOSE) = schovat do
-            // oznamovací oblasti; pad a aplikace běží dál. Jen hlavní
-            // okno a jen když je kam ho schovat.
+            // oznamovací oblasti; pad (zapnutý i vypnutý) a aplikace
+            // běží dál. Jen hlavní okno a jen když je kam ho schovat.
             if let tauri::WindowEvent::CloseRequested { api, .. } = udalost {
                 if window.label() == "main" && tray::schovavat() {
                     api.prevent_close();
@@ -374,15 +427,36 @@ fn main() {
         ),
     };
 
-    aplikace.run(|app, udalost| {
+    // Kód, se kterým proces skončí: z `app.exit(kód)` (ExitRequested).
+    // Konec relace Windows přes smyčku tao žádné ExitRequested nemá → 0.
+    let mut kod_konce = 0;
+    aplikace.run(move |app, udalost| match udalost {
+        tauri::RunEvent::ExitRequested {
+            code: Some(kod), ..
+        } => kod_konce = kod,
         // `run` se nevrací — smyčka událostí končí přímo ukončením
         // procesu. Exit je tedy poslední chvíle, kdy jde pad uklidit
         // a log dopsat. Pořadí: neutrál → odpojit → zavřít, pak log.
-        if let tauri::RunEvent::Exit = udalost {
+        tauri::RunEvent::Exit => {
             gamepad::ukonci(app);
             log::info!("konec");
             logger::flush(Duration::from_secs(1));
+            // A proces skončí TADY, ne až v tao. Při vypnutí, restartu
+            // a odhlášení dostane WM_ENDSESSION i skryté okno smyčky
+            // událostí tao („Tao Thread Event Target"); tao po něm přejde
+            // do stavu Destroyed a KAŽDÁ další událost na hlavním vlákně
+            // (WM_ENDSESSION pro okno relace nebo hlavní okno, požadavek
+            // na konec od `relace`) v něm zpanikaří — „cannot move state
+            // from Destroyed", kód 101 a PANIKA v logu po každém vypnutí
+            // PC (naměřeno na skryté ploše, obě pořadí oken). Úklid, který
+            // by Tauri udělalo po návratu odsud (ikona v oznamovací
+            // oblasti, schování oken), proto hned a konec. Tauri by po
+            // Exit stejně jen uklidilo a skončilo — restart_on_exit KeyPad
+            // nepoužívá.
+            app.cleanup_before_exit();
+            std::process::exit(kod_konce);
         }
+        _ => {}
     });
 }
 

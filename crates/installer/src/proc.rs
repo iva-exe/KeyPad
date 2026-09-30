@@ -1,4 +1,5 @@
-//! Zavření běžícího KeyPadu před přepsáním nebo smazáním jeho souborů.
+//! Zavření běžícího KeyPadu před přepsáním nebo smazáním jeho souborů
+//! a před aktualizací ovladače ViGEmBus (KeyPad drží sběrnici — `driver.rs`).
 //!
 //! Pořadí je důležité: nejdřív SLUŠNĚ, teprve když do ~3 s neskončí,
 //! NATVRDO. Slušné zavření dává aplikaci šanci poslat neutrální stav
@@ -160,16 +161,16 @@ pub fn close_app(
         .filter(|p| !p.wait(deadline.saturating_duration_since(Instant::now())))
         .count();
     if stuck > 0 {
-        // Typicky KeyPad spuštěný „jako správce": neprivilegovaný
-        // instalátor mu nesmí poslat zprávu ani ho ukončit (UIPI).
-        return Err(
-            "Běžící KeyPad se nepodařilo zavřít (možná běží jako správce) — zavři ho ručně \
-             a zkus to znovu."
-                .into(),
-        );
+        return Err(CLOSE_FAILED.into());
     }
     Ok(Closed::Forced)
 }
+
+/// Běžící KeyPad nejde zavřít ani natvrdo. Typicky KeyPad spuštěný „jako
+/// správce": neprivilegovaný instalátor mu nesmí poslat zprávu ani ho
+/// ukončit (UIPI).
+pub const CLOSE_FAILED: &str = "Běžící KeyPad se nepodařilo zavřít (možná běží jako správce) — \
+                                zavři ho ručně a zkus to znovu.";
 
 /// Nastaví pojmenovanou událost ukončení; `true` = existovala, tedy na
 /// ni běžící KeyPad čeká. Stačí právo EVENT_MODIFY_STATE — nic víc

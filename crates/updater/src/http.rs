@@ -12,12 +12,35 @@ use windows::Win32::Networking::WinHttp::{
     WINHTTP_QUERY_CONTENT_LENGTH, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
 };
 
-/// Chyby stahování — hlášky jdou rovnou uživateli.
+/// Věty pro okno instalátoru (Fáze 2b: žádné kódy ani vnitřnosti WinHttp
+/// v okně — ty jdou do logu). Sdílené, ať se texty nerozejdou.
+pub const NO_CONNECTION: &str =
+    "Nepodařilo se spojit s GitHubem — zkontroluj připojení a zkus to znovu.";
+pub const RATE_LIMITED: &str = "GitHub teď omezil počet dotazů — zkus to za hodinu.";
+pub const NOT_PUBLISHED: &str = "Vydání KeyPadu na GitHubu teď není — zkus to později.";
+
+/// Chyby stahování. `Display` jde do logu a do hlášek aplikace — známé
+/// stavové kódy mají větu místo čísla (číslo nese `{:?}`). Okno
+/// instalátoru ukazuje jen [`Error::sentence`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     Connect(String),
     Http { status: u32 },
     Read(String),
+}
+
+impl Error {
+    /// Jedna krátká věta pro okno instalátoru, bez kódů. Spojení,
+    /// přerušený přenos i chyba serveru znamenají pro uživatele totéž —
+    /// zkusit to znovu. Vlastní větu mají jen stavy, kde hned znovu
+    /// nepomůže: vyčerpaný limit dotazů API (403) a nic vydaného (404/409).
+    pub fn sentence(&self) -> &'static str {
+        match self {
+            Error::Http { status: 403 } => RATE_LIMITED,
+            Error::Http { status: 404 | 409 } => NOT_PUBLISHED,
+            _ => NO_CONNECTION,
+        }
+    }
 }
 
 impl std::fmt::Display for Error {
@@ -26,20 +49,17 @@ impl std::fmt::Display for Error {
             Error::Connect(d) => write!(f, "nepodařilo se spojit se serverem ({d})"),
             // GitHub API pouští nepřihlášené na 60 dotazů za hodinu z IP;
             // po vyčerpání vrací 403. Obecné „chyba 403" by radilo špatně.
-            Error::Http { status: 403 } => write!(
-                f,
-                "GitHub dočasně omezil počet dotazů (403) — zkus to za hodinu"
-            ),
+            Error::Http { status: 403 } => {
+                write!(f, "GitHub dočasně omezil počet dotazů — zkus to za hodinu")
+            }
             // API tak odpovídá na repozitář bez jediného commitu.
             Error::Http { status: 409 } => {
-                write!(f, "repozitář je zatím prázdný (409) — nic není vydané")
+                write!(f, "repozitář je zatím prázdný — nic není vydané")
             }
             Error::Http { status: 404 } => {
-                write!(
-                    f,
-                    "soubor na serveru není (404) — vydavatel ho ještě nenahrál"
-                )
+                write!(f, "soubor na serveru není — vydavatel ho ještě nenahrál")
             }
+            // Neznámý kód: číslo je jediná informace, kterou máme.
             Error::Http { status } => write!(f, "server odpověděl chybou {status}"),
             Error::Read(d) => write!(f, "přenos se přerušil ({d})"),
         }
@@ -202,5 +222,45 @@ pub fn get_limited(
             )));
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Do okna instalátoru jde věta bez kódů a bez vnitřností WinHttp;
+    /// podrobnosti zůstávají v `Display` (log, hlášky aplikace).
+    #[test]
+    fn veta_do_okna_je_bez_kodu() {
+        let errs = [
+            Error::Connect("WinHttpOpen".into()),
+            Error::Connect("spojení na api.github.com".into()),
+            Error::Connect("odeslání požadavku".into()),
+            Error::Http { status: 0 },
+            Error::Http { status: 403 },
+            Error::Http { status: 404 },
+            Error::Http { status: 409 },
+            Error::Http { status: 500 },
+            Error::Http { status: 502 },
+            Error::Read("dorazilo 123 z 456 B".into()),
+            Error::Read("server posílá 9 B, čekáno nejvýš 1 B".into()),
+        ];
+        for e in &errs {
+            let s = e.sentence();
+            assert!(!s.chars().any(|c| c.is_ascii_digit()), "{e:?}: {s}");
+            for bad in ["WinHttp", "http", "(", " B"] {
+                assert!(!s.contains(bad), "{e:?}: {s}");
+            }
+            assert!(s.ends_with('.') && s.chars().count() < 90, "{s}");
+        }
+        assert_eq!(errs[0].sentence(), NO_CONNECTION);
+        assert_eq!(errs[4].sentence(), RATE_LIMITED);
+        assert_eq!(errs[5].sentence(), NOT_PUBLISHED);
+        assert_eq!(errs[8].sentence(), NO_CONNECTION);
+        assert_eq!(errs[9].sentence(), NO_CONNECTION);
+        // Podrobnosti pro log zůstaly.
+        assert!(errs[0].to_string().contains("WinHttpOpen"));
+        assert!(errs[8].to_string().contains("502"));
     }
 }

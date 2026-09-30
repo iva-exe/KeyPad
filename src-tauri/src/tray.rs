@@ -1,10 +1,12 @@
 //! Oznamovací oblast a schovávání okna (stejně jako WinSent).
 //!
 //! Zavření okna (křížek, Alt+F4, WM_CLOSE) KeyPad neukončí, jen schová:
-//! virtuální pad má zůstat připojený (stabilní pořadí hráčů ve hře)
-//! a ve Fázi 3+ i hook. Ikona v oznamovací oblasti je vidět pořád —
-//! nic neběží skrytě (princip 8). Ukončit jde z její nabídky, a na
-//! žádost instalátoru pojmenovanou událostí (`platform::windows::ukonceni`).
+//! zapnutý virtuální ovladač má zůstat zapnutý (hraje se se schovaným
+//! oknem, aby nepřekáželo streamu) a ve Fázi 3+ i hook. Ikona
+//! v oznamovací oblasti je vidět pořád — nic neběží skrytě (princip 8).
+//! Ukončit jde z její nabídky, na žádost instalátoru pojmenovanou
+//! událostí (`platform::windows::ukonceni`) a při konci relace Windows
+//! (`platform::windows::relace`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

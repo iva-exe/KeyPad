@@ -1,22 +1,31 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import Footer from './lib/Footer.svelte';
 	import PadCard from './lib/PadCard.svelte';
 	import Titlebar from './lib/Titlebar.svelte';
 	import UpdateBanner from './lib/UpdateBanner.svelte';
+	import { nactiAplikaci } from './lib/aplikace.svelte';
 	import { startPad } from './lib/pad.svelte';
 	import { startUpdateChecks, updater } from './lib/updater.svelte';
 
 	// Jedno okno, žádné routování: KeyPad má jednu práci (přepnout
 	// klávesnici na gamepad a zpátky) a všechno k ní má být vidět naráz.
+	// Co nejméně textu — podrobnosti jsou v bublinách a v logu.
 	//
 	// Stav z backendu teče událostmi Tauri (náhrada za egui
 	// request_repaint z ROADMAP): zatím stav virtuálního padu, ve Fázi 4
 	// přibude režim Klávesnice / Gamepad.
 
 	onMount(() => {
+		void nactiAplikaci();
 		startPad();
 		startUpdateChecks();
+		// Po návratu okna z oznamovací oblasti: ikona i instalace se
+		// mohly mezitím změnit.
+		const zpet = () => {
+			if (!document.hidden) void nactiAplikaci();
+		};
+		document.addEventListener('visibilitychange', zpet);
+		return () => document.removeEventListener('visibilitychange', zpet);
 	});
 </script>
 
@@ -26,21 +35,17 @@
 	<main class="panel">
 		<PadCard />
 
-		<!-- Tichý placeholder (WinSent DESIGN.md kap. 8): co tu bude
-		     a kdy — žádný předstíraný obsah. -->
+		<!-- Tichý placeholder (WinSent DESIGN.md kap. 8): co tu bude —
+		     žádný předstíraný obsah. -->
 		<div class="ph">
-			<span class="label-tech">// přepínání</span>
-			<!-- Pevné mezery drží „klávesnice ↔ gamepad" pohromadě — šipka
-			     na začátku řádku by vypadala jako odrážka. -->
-			<p>Přepínání klávesnice&nbsp;↔&nbsp;gamepad přijde v&nbsp;další fázi.</p>
+			<span class="label-tech">// klávesy</span>
+			<p>Přijde v další fázi.</p>
 		</div>
 	</main>
 
 	{#if updater.available}
 		<UpdateBanner />
 	{/if}
-
-	<Footer />
 </div>
 
 <style>
@@ -48,6 +53,8 @@
 		display: flex;
 		flex-direction: column;
 		height: 100%;
+		/* Spodní okraj místo patičky — panel nesmí sahat k hraně okna. */
+		padding-bottom: 10px;
 	}
 
 	/* Jeden obsahový panel (WinSent „Frame 5" bez sidebaru — v úzkém
@@ -72,15 +79,13 @@
 		flex-direction: column;
 		align-items: center;
 		justify-content: center;
-		gap: 0.5rem;
+		gap: 0.4rem;
 		min-height: 6rem;
 		text-align: center;
 	}
 	.ph p {
 		margin: 0;
-		max-width: 32ch;
 		color: var(--text-faint);
-		font-size: var(--fs-md);
-		text-wrap: balance;
+		font-size: var(--fs-sm);
 	}
 </style>

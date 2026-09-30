@@ -15,10 +15,10 @@ ovladače jen namapované klávesy (WASD, šipky…), všechno ostatní funguje
 dál normálně — Alt+Tab, Win, Alt+F4.
 
 > **Poctivě: tahle verze ještě klávesy nepřevádí.** Instalace, okno,
-> aktualizace a virtuální ovladač fungují (v okně ho vyzkoušíš tlačítkem
-> **Vyzkoušet páčku**), samotné přepínání kláves na gamepad přibude
-> v dalších verzích. Nic nemusíš stahovat znovu — nové verze ti KeyPad
-> nabídne sám (viz [Aktualizace](#aktualizace)).
+> aktualizace a virtuální ovladač fungují (zapneš ho přepínačem, tlačítkem
+> **Vyzkoušet** s ním krátce zakroužíš), samotné převádění kláves na
+> gamepad přibude v dalších verzích. Nic nemusíš stahovat znovu — nové
+> verze ti KeyPad nabídne sám (viz [Aktualizace](#aktualizace)).
 
 ## Co budeš potřebovat
 
@@ -37,12 +37,12 @@ dál normálně — Alt+Tab, Win, Alt+F4.
 2. Spusť ho dvojklikem. Stáhne aktuální KeyPad a nainstaluje ho do tvého
    profilu, do `%LOCALAPPDATA%\Programs\KeyPad`. KeyPad sám **práva
    správce nepotřebuje nikdy**.
-3. Když ti chybí ovladač ViGEmBus, je v okně zaškrtnuté **„Nainstalovat
-   i ovladač ViGEmBus“**. Nech to zaškrtnuté a Windows se jednou zeptají
-   na povolení správce — to je jediné místo, kde ho kdy uvidíš (patří
-   oficiálnímu instalátoru ovladače, ne KeyPadu).
+3. Když ti chybí ovladač ViGEmBus (nebo máš starou verzi), instalátor ho
+   nainstaluje sám a Windows se jednou zeptají na povolení správce —
+   patří oficiálnímu instalátoru ovladače, ne KeyPadu.
 4. V nabídce Start přibude **KeyPad**. Instalátor ho na konci rovnou
-   spustí.
+   spustí. S Windows se KeyPad **nikdy nespouští sám** — jen když ho
+   zapneš.
 
 ### „Systém Windows ochránil váš počítač“
 
@@ -72,22 +72,27 @@ Autor: Nefarius Software Solutions e.U., licence BSD-3-Clause
 (<https://github.com/nefarius/ViGEmBus>). Projekt už se dál nevyvíjí
 (je archivovaný), ale na Windows 10 i 11 funguje.
 
-**Nemusíš nic stahovat sám.** Když ovladač chybí, KeyPadSetup nabídne
-jeho instalaci (zaškrtávátko v instalátoru, v aplikaci tlačítko
-**Nainstalovat ViGEmBus**). Co se přitom děje:
+**Nemusíš nic stahovat sám.** KeyPadSetup ovladač automaticky
+nainstaluje, když chybí, a aktualizuje, když je starší než poslední
+verze. Co se přitom děje:
 
-- stáhne se **oficiální** instalátor ViGEmBus 1.22.0 přímo z GitHubu
-  autora — vždycky přesně tentýž soubor; KeyPad ho před spuštěním
-  ověří otiskem SHA-256 a podpisem vydavatele, jinak ho nespustí;
+- stáhne se **oficiální** instalátor ViGEmBus 1.22.0 z GitHubu autora
+  (kdyby tam už nebyl, z kopie v repu KeyPadu) — vždycky přesně tentýž
+  soubor; KeyPad ho před spuštěním ověří otiskem SHA-256 a podpisem
+  vydavatele, jinak ho nespustí;
 - Windows se zeptají na povolení správce (ukážou ověřeného vydavatele
   „Nefarius Software Solutions e.U.“) — ovladač se bez toho nainstalovat
-  nedá;
+  nedá. Při aktualizaci staré verze se KeyPad na chvilku zavře a pak
+  sám znovu spustí (ovladač nesmí být během aktualizace používaný);
+  někdy je potom potřeba restart;
+- když odmítneš, KeyPad se nainstaluje i tak — ovladač doinstaluješ
+  později tlačítkem **Nainstalovat ovladač** v aplikaci;
 - po instalaci KeyPad ověří, že ovladač opravdu běží.
 
-Když je ViGEmBus nainstalovaný, ale neběží (čeká na restart, je vypnutý
-ve Správci zařízení…), KeyPad nic neinstaluje a jen poradí, co s tím.
-Odinstalace KeyPadu ViGEmBus **nechá** — může ho používat i jiný
-program; odebereš ho v Nastavení → Aplikace.
+Aktuální, funkční ViGEmBus KeyPad nikdy nepřeinstalovává. Když je
+nainstalovaný, ale neběží (čeká na restart, je vypnutý ve Správci
+zařízení…), jen poradí, co s tím. Odinstalace KeyPadu ViGEmBus **nechá**
+— může ho používat i jiný program; odebereš ho v Nastavení → Aplikace.
 
 Ruční cesta, kdyby cokoli selhalo: <https://github.com/nefarius/ViGEmBus/releases>
 → nejnovější vydání → `ViGEmBus_…_x64_x86_arm64.exe`.
@@ -96,22 +101,24 @@ Ruční cesta, kdyby cokoli selhalo: <https://github.com/nefarius/ViGEmBus/relea
 
 KeyPad sedí v oznamovací oblasti vedle hodin (jako WinSent). Zavřením
 okna se KeyPad **neukončí** — jen se schová a přestane zatěžovat
-počítač; virtuální ovladač zůstane připojený. Okno otevřeš kliknutím
-na ikonu, **ukončíš** ho pravým tlačítkem na ikoně → **Ukončit**.
+počítač. Okno otevřeš kliknutím na ikonu, **ukončíš** ho pravým
+tlačítkem na ikoně → **Ukončit**. Verzi, autora ovladače ViGEmBus
+a log najdeš pod ⓘ v liště okna.
 
-Při prvním spuštění na novém počítači chvíli trvá, než Windows
-virtuální ovladač nastaví („připojuji…“). Při každém startu KeyPadu
-Windows přehrají obvyklý zvuk připojení zařízení.
-
-Co ukazuje lišta okna:
+**Virtuální ovladač zapíná jen přepínač v okně.** Po spuštění KeyPadu
+ani po probuzení počítače žádný ovladač v systému není. Před uspáním
+počítače se ovladač vypne (jinak hrozí modrá obrazovka — známá chyba
+ViGEmBus) a vypnutý zůstane; před vypnutím nebo restartem počítače se
+vypne a KeyPad skončí.
 
 | Stav | Co to znamená |
 |---|---|
-| **gamepad připojen** (zelená, „hráč N“) | virtuální ovladač běží; **Vyzkoušet páčku** s ním krátce zakrouží — uvidíš to v `joy.cpl` (Win+R → `joy.cpl`) |
-| **připojuji…** | Windows ovladač nastavují (první spuštění), chvilku počkej |
-| **ViGEmBus chybí** | tlačítko **Nainstalovat ViGEmBus** (viz výš) |
-| **ovladač neběží** (jantarová) | ViGEmBus je nainstalovaný, ale nespustil se — KeyPad poradí proč (restart, vypnutý ve Správci zařízení…) |
-| **odpojeno** (kvůli spánku) | před uspáním počítače se virtuální ovladač odpojí (jinak hrozí modrá obrazovka — známá chyba ViGEmBus); po probuzení se připojí sám, jinak **Připojit znovu** |
+| **Vypnutý** | ovladač v systému není; zapneš ho přepínačem |
+| **Nezapnul se** | zapnutí se nepovedlo — důvod v bublině, zkus to znovu |
+| **Zapínám…** | Windows ovladač nastavují (napoprvé na novém PC chvíli trvá) |
+| **Zapnutý** | ovladač běží — **Vyzkoušet** s ním krátce zakrouží (Win+R → `joy.cpl`) |
+| **Chybí ViGEmBus** | tlačítko **Nainstalovat ovladač** |
+| **ViGEmBus neběží** | nainstalovaný, ale nespustil se — rada v bublině (restart, Správce zařízení…) |
 
 ## Aktualizace
 
@@ -138,6 +145,8 @@ Odinstalace odebere program, zástupce v nabídce Start a záznam
 v Aplikacích. Smaže i logy (`keypad.log` — jestli mi ho chceš poslat,
 udělej to předtím), data okna (WebView2, `%LOCALAPPDATA%\cz.hexel.keypad`)
 a instalátory stažené při aktualizacích (`%TEMP%\keypad-update`).
+Log instalátoru (`%TEMP%\KeyPadSetup.log` — kdyby instalace nešla,
+pošli mi ho) smaže taky.
 **Tvoje nastavení (`config.toml`) nechá** — kdybys KeyPad instaloval
 znovu, mapování kláves tě počká. Když ho už nechceš, smaž ho ručně.
 **Ovladač ViGEmBus taky nechá** (může ho používat i jiný program);
@@ -152,6 +161,7 @@ odebereš ho v Nastavení → Aplikace → „ViGEm Bus Driver“.
 | Nastavení | přibude později — ve stejné složce nebo v `%APPDATA%\KeyPad` |
 | Data okna (WebView2) | `%LOCALAPPDATA%\cz.hexel.keypad` — cache a data, která si okno ukládá samo (desítky MB) |
 | Stažený instalátor | `%TEMP%\keypad-update` — `KeyPadSetup-….exe` z tlačítka Aktualizovat |
+| Log instalátoru | `%TEMP%\KeyPadSetup.log` — podrobnosti instalace včetně kódů chyb |
 
 Složku otevřeš rychle přes **Win+R** → `%LOCALAPPDATA%\Programs\KeyPad` → Enter.
 Když něco nefunguje, pošli mi `keypad.log`.

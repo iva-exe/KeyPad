@@ -6,29 +6,35 @@
 //!      se nestahuje, jen se KeyPad spustí)
 //!   3. stáhne KeyPad.exe do paměti, zavře běžící KeyPad, přepíše ho
 //!   4. udělá zástupce v nabídce Start a záznam v Nastavení → Aplikace
-//!   5. když ovladač ViGEmBus úplně chybí a uživatel nechal zapnutý
-//!      přepínač, nainstaluje i ten (viz `driver.rs`)
+//!   5. když ovladač ViGEmBus chybí, nainstaluje ho, a když je starší
+//!      než poslední vydání, aktualizuje ho (viz `driver.rs`)
 //!
 //! `KeyPadSetup.exe /uninstall` = odeber všechno (ViGEmBus ne).
 //! `KeyPadSetup.exe /quiet`     = okno, které se spustí i zavře samo
-//!                                (tudy jde aktualizace z aplikace;
-//!                                ovladač NIKDY neinstaluje); platí
-//!                                i pro `/uninstall /quiet`.
-//! `KeyPadSetup.exe /vigembus`  = jen ovladač ViGEmBus, po kliknutí
-//!                                (spouští ho aplikace, když ovladač chybí;
-//!                                `/quiet` se s ním ignoruje).
+//!                                (tudy jde aktualizace z aplikace, i s
+//!                                ovladačem); platí i pro `/uninstall /quiet`.
+//! `KeyPadSetup.exe /vigembus`  = jen ovladač ViGEmBus: rovnou nainstaluje
+//!                                chybějící, aktualizuje starší (spouští ho
+//!                                aplikace; `/quiet` se s ním ignoruje —
+//!                                výsledek zůstane v okně).
 //! `KeyPadSetup.exe /headless`  = bez okna, výpis do konzole (skripty);
-//!                                s `/vigembus` instaluje jen ovladač.
+//!                                s `/vigembus` jen ovladač. Bez něj
+//!                                ovladač jen poradí příkaz — skript
+//!                                nemá sám od sebe vyvolat výzvu UAC.
 //!
 //! Kód návratu `/vigembus` (okno i konzole) se skládá z ověřeného stavu:
-//! 0 = ovladač běží, 3010 = je v systému a poběží po restartu, 1 = jinak.
+//! 0 = ovladač běží, 3010 = poběží po restartu, 1 = jinak.
+//!
+//! Aktualizace ovladače (v každém režimu) nejdřív zavře běžící KeyPad —
+//! drží sběrnici — a potom ho zase spustí (`driver.rs`, krok 5).
 //!
 //! KeyPad se instaluje do profilu uživatele (`%LOCALAPPDATA%\Programs\
 //! KeyPad`, HKCU, jeho nabídka Start) — instalátor sám nikdy neběží
 //! s právy správce a manifest to říká výslovně (`asInvoker`). Jediná
 //! výzva UAC, kterou kdy uvidí uživatel, patří oficiálnímu instalátoru
-//! ViGEmBus: jen když ovladač chybí, jen po výslovném kliknutí a jen
-//! s ověřeným otiskem a podpisem (`driver.rs`).
+//! ViGEmBus: jen když ovladač chybí nebo je starší, a jen s ověřeným
+//! otiskem a podpisem (`driver.rs`). Výzva je souhlas; odmítnutá
+//! instalaci KeyPadu nezkazí.
 //!
 //! Podsystém je „windows", ne „console": jinak by u grafického
 //! instalátoru bliklo černé okno. V headless režimu se konzole rodiče
@@ -38,6 +44,7 @@
 
 mod driver;
 mod gui;
+mod log;
 mod prereq;
 mod proc;
 mod shell;
@@ -53,7 +60,7 @@ use updater::vigembus::{self, BusState};
 use updater::{APP_EXE, QUIT_EVENT_NAME, SETUP_ARG_VIGEMBUS, SETUP_EXE, VERSION_FILE};
 
 /// Kroky instalace tak, jak je vidí uživatel v okně. Poslední krok
-/// (ovladač) se ukáže, jen když se ovladač nabízí.
+/// (ovladač) se ukáže, jen když se s ovladačem něco udělá.
 const INSTALL_STEPS: &[&str] = &[
     "Zjišťuji aktuální verzi",
     "Stahuji KeyPad",
@@ -65,8 +72,32 @@ const STEP_REGISTER: usize = 4;
 /// Krok ovladače — za všemi kroky KeyPadu. Ovladač přichází až po
 /// zápisu KeyPadu (jeho selhání nesmí instalaci KeyPadu shodit) a před
 /// spuštěním KeyPadu (ať aplikace sběrnici najde hned při startu).
-const DRIVER_STEP_LABEL: &str = "Ovladač ViGEmBus";
 const STEP_DRIVER: usize = INSTALL_STEPS.len();
+
+/// Popisek kroku ovladače.
+fn driver_step_label(work: driver::Work) -> &'static str {
+    match work {
+        driver::Work::Install => "Ovladač ViGEmBus",
+        driver::Work::Update => "Aktualizace ovladače ViGEmBus",
+    }
+}
+
+/// Patička úvodní obrazovky — předem a krátce, co se stane (princip 8):
+/// KeyPad bez práv správce, ovladač přes výzvu Windows.
+const FOOTER: &str = "Do tvého profilu, bez práv správce.";
+const FOOTER_DRIVER: &str = "KeyPad bez práv správce. Ovladač ViGEmBus potvrdíš ve výzvě Windows.";
+/// Patička odinstalace — co zůstane (ViGEmBus se s KeyPadem neodebírá).
+const UNINSTALL_FOOTER: &str = "Tvoje nastavení zůstane.";
+const UNINSTALL_FOOTER_BUS: &str = "Tvoje nastavení i ovladač ViGEmBus zůstanou.";
+
+/// Credit ViGEmBus s odkazem na repo autora (texty sdílí s aplikací
+/// `updater::vigembus`).
+fn credit() -> gui::Credit {
+    gui::Credit {
+        text: vigembus::CREDIT.into(),
+        url: vigembus::REPO_URL.into(),
+    }
+}
 
 const UNINSTALL_STEPS: &[&str] = &[
     "Zavírám běžící KeyPad",
@@ -163,6 +194,9 @@ struct Done {
 }
 
 impl Done {
+    /// Jen zpráva (ladicí náhledy a testy; skutečné výsledky skládá
+    /// `outcome` / `driver_done` / odinstalace).
+    #[cfg(any(test, debug_assertions))]
     fn plain(message: impl Into<String>) -> Self {
         Done {
             message: message.into(),
@@ -188,10 +222,11 @@ struct Args {
     mode: Mode,
     headless: bool,
     /// Tichý režim = okno se spustí i zavře samo (aktualizace z aplikace,
-    /// skripty). Platí pro instalaci i odinstalaci jako od první verze —
-    /// ovladače se netýká ani jedna (instalace ho v tichém režimu nenabízí,
-    /// odinstalace na něj nesahá nikdy). `/vigembus` ho ignoruje schválně:
-    /// ovladač se instaluje vždy až po kliknutí v okně.
+    /// skripty). Platí pro instalaci i odinstalaci jako od první verze;
+    /// instalace v něm ovladač nainstaluje / aktualizuje stejně jako
+    /// v okně (souhlas je výzva UAC). Okno se samo zavře jen po čistém
+    /// úspěchu. `/vigembus` ho ignoruje: výsledek ovladače (a credit)
+    /// v okně zůstane, dokud ho uživatel nezavře.
     quiet: bool,
 }
 
@@ -265,28 +300,29 @@ fn refuse_to_start(headless: bool, e: &windows::core::Error) -> ! {
 
 // ── Stav ovladače pro okno ─────────────────────────────────────────
 
-/// Stav ViGEmBus, podle kterého se okno rozhodne, co nabídne.
+/// Stav ViGEmBus (a „je starší"), podle kterého okno ukáže krok
+/// ovladače.
 ///
 /// Ladicí build umí stav předstírat přes proměnnou
-/// `KEYPAD_SETUP_TEST_VIGEMBUS` (`chybi`, `bezi`, `vypnuty`, `blokovany`,
-/// `restart`, `bez-zarizeni`, `bez-zaznamu`) — kvůli snímkům obrazovky
-/// na PC, kde ViGEmBus je. Release build proměnnou vůbec nečte. A ani
-/// v ladicím buildu se podle ní nic neinstaluje: pojistka
-/// v `driver::install` čte vždy skutečný stav, takže na PC s ovladačem
-/// skončí „už běží".
-fn shown_bus_state() -> BusState {
+/// `KEYPAD_SETUP_TEST_VIGEMBUS` (`chybi`, `bezi`, `stary`,
+/// `stary-vypnuty`, `vypnuty`, `blokovany`, `restart`, `bez-zarizeni`,
+/// `bez-zaznamu`) — kvůli snímkům obrazovky na PC, kde ViGEmBus je.
+/// Release build proměnnou vůbec nečte. A ani v ladicím buildu se podle
+/// ní nic neinstaluje: pojistka v `driver::install` čte vždy skutečný
+/// stav, takže na PC s aktuálním ovladačem skončí „v pořádku".
+fn shown_bus() -> (BusState, bool) {
     #[cfg(debug_assertions)]
     if let Some(s) = std::env::var("KEYPAD_SETUP_TEST_VIGEMBUS")
         .ok()
-        .and_then(|v| fake_bus_state(&v))
+        .and_then(|v| fake_bus(&v))
     {
         return s;
     }
-    vigembus::state()
+    driver::current()
 }
 
 #[cfg(debug_assertions)]
-fn fake_bus_state(v: &str) -> Option<BusState> {
+fn fake_bus(v: &str) -> Option<(BusState, bool)> {
     use vigembus::DeviceStatus;
     let dev = |problem, need_restart| {
         Some(DeviceStatus {
@@ -297,53 +333,18 @@ fn fake_bus_state(v: &str) -> Option<BusState> {
     };
     let there = |device, in_apps| BusState::InstalledNotRunning { device, in_apps };
     Some(match v {
-        "chybi" => BusState::NotInstalled,
-        "bezi" => BusState::Ready,
-        "vypnuty" => there(dev(Some(22), false), true),
-        "blokovany" => there(dev(Some(48), false), true),
-        "restart" => there(dev(None, true), true),
-        "bez-zarizeni" => there(None, true),
+        "chybi" => (BusState::NotInstalled, false),
+        "bezi" => (BusState::Ready, false),
+        "stary" => (BusState::Ready, true),
+        "stary-vypnuty" => (there(dev(Some(22), false), true), true),
+        "vypnuty" => (there(dev(Some(22), false), true), false),
+        "blokovany" => (there(dev(Some(48), false), true), false),
+        "restart" => (there(dev(None, true), true), false),
+        "bez-zarizeni" => (there(None, true), false),
         // Zbytek bez záznamu v Aplikacích (devcon, nefcon, jiný program).
-        "bez-zaznamu" => there(None, false),
+        "bez-zaznamu" => (there(None, false), false),
         _ => return None,
     })
-}
-
-/// Text přepínače ovladače na úvodní obrazovce.
-///
-/// Přepínač je ZAPNUTÝ, když ovladač chybí — rozhodnutí vlastníka:
-/// kamarád nemá nic stahovat a hledat zvlášť. Souhlas je pak v tom, že
-/// přepínač i poznámka pod ním jsou vidět před kliknutím na
-/// Nainstalovat, a ve výzvě Windows, kterou může odmítnout (instalace
-/// KeyPadu se tím nezkazí). Rozhodnutí je zapsané v ROADMAP.
-const DRIVER_TOGGLE: &str =
-    "Nainstalovat i ovladač ViGEmBus — potřebný pro gamepad; Windows se zeptá na povolení správce";
-
-/// Co se stane, když přepínač necháš zapnutý — předem a bez zamlčování
-/// (princip 8): čí ovladač, pod jakou licencí, odkud, jak ověřený a čí
-/// je výzva Windows.
-fn driver_toggle_note() -> String {
-    format!(
-        "Nainstaluje se oficiální ViGEmBus {} od {} (licence {}) z GitHubu — před spuštěním \
-         ověřím otisk SHA-256 i podpis. Výzva Windows k povolení správce patří jeho instalátoru; \
-         KeyPad sám práva správce nikdy nemá.",
-        vigembus::VERSION,
-        vigembus::SIGNER,
-        vigembus::LICENSE
-    )
-}
-
-/// Vysvětlení na úvodní obrazovce režimu `/vigembus`.
-fn driver_intro() -> String {
-    format!(
-        "KeyPad potřebuje ovladač ViGEmBus — virtuální gamepad od {} (licence {}). Stáhnu \
-         jeho oficiální instalátor {} z GitHubu, ověřím, že je to bajt po bajtu ten správný \
-         soubor (otisk SHA-256 a podpis), a spustím ho.\nWindows se zeptá na povolení \
-         správce — patří instalátoru ovladače, KeyPad sám práva správce nikdy nemá.",
-        vigembus::SIGNER,
-        vigembus::LICENSE,
-        vigembus::VERSION
-    )
 }
 
 fn main() {
@@ -363,7 +364,9 @@ fn main() {
     if let Some(setup) = std::env::var_os("KEYPAD_SETUP_TEST_KNIHOVNY") {
         attach_console();
         let r = driver::load_probe(Path::new(&setup)).and_then(|m| {
-            updater::latest_commit().map(|sha| format!("{m}; HTTPS v pořádku (commit {sha})"))
+            updater::latest_commit()
+                .map(|sha| format!("{m}; HTTPS v pořádku (commit {sha})"))
+                .map_err(|e| e.to_string())
         });
         match r {
             Ok(m) => {
@@ -400,19 +403,25 @@ fn main() {
         let mut rep = ConsoleReport;
         if args.mode == Mode::Driver {
             // Headless /vigembus je výslovný příkaz — to je to kliknutí.
-            let o = driver::install(&mut rep, 0);
-            println!("\n  {}", o.message().replace('\n', "\n  "));
-            std::process::exit(o.exit_code());
+            let (o, relaunched) = driver_only(&mut rep, 0);
+            print_driver(&o);
+            if let Some(n) = relaunch_note(&relaunched) {
+                println!("  {n}");
+            }
+            std::process::exit(driver_exit_code(vigembus::state(), Some(o.exit_code())));
         }
         let r = match args.mode {
             Mode::Uninstall => do_uninstall(&mut rep),
-            // Skript nikdy neinstaluje ovladač sám od sebe — jen poradí
-            // příkaz, kterým to uživatel udělá výslovně.
+            // Skript nikdy nespustí instalátor ovladače sám od sebe (výzva
+            // UAC by visela bez člověka) — jen poradí příkaz.
             _ => do_install(&mut rep, false, Missing::Hint),
         };
         match r {
             Ok(done) => {
                 println!("\n  {}", done.message.replace('\n', "\n  "));
+                if let Some(gui::Next::Link(l)) = &done.next {
+                    println!("  {}: {}", l.label, l.url);
+                }
                 if args.mode == Mode::Uninstall && running_from_install {
                     schedule_self_delete(&own_copy, &dir);
                 }
@@ -420,6 +429,8 @@ fn main() {
             }
             Err(e) => {
                 println!("\n  CHYBA: {}", e.replace('\n', "\n  "));
+                // Věta je krátká a bez kódů; podrobnosti jsou v logu.
+                println!("  Podrobnosti: {}", log::path().display());
                 std::process::exit(1);
             }
         }
@@ -433,51 +444,31 @@ fn main() {
         return;
     }
 
-    let bus = shown_bus_state();
-    // Ovladač se nabízí jen tam, kde úplně chybí, a nikdy v tichém
-    // režimu (aktualizace z aplikace).
-    let offer = args.mode == Mode::Install && bus == BusState::NotInstalled && !args.quiet;
+    let (bus, outdated) = shown_bus();
+    // Krok ovladače jen tam, kde se s ním něco udělá (chybí → instalace,
+    // starší → aktualizace), v okně i v tichém režimu.
+    let work = match args.mode {
+        Mode::Install => driver::decide(bus, outdated).ok(),
+        _ => None,
+    };
     let state = match args.mode {
         Mode::Uninstall => {
-            // Poctivý výčet toho, co zmizí — i logy, o které README žádá
-            // při hlášení chyby, a data okna. Patička má místo na dva
-            // řádky, proto je výčet v podtitulku a patička říká, co zůstane.
+            // Poctivý výčet toho, co zmizí (i logy, o které README žádá
+            // při hlášení chyby); patička říká, co zůstane.
             gui::State::new(
                 "Odebrat KeyPad",
-                "smaže aplikaci, zástupce, záznam v Aplikacích, logy a data okna (WebView2)",
+                "smaže aplikaci, zástupce, záznam v Aplikacích, logy a data okna",
                 if bus == BusState::NotInstalled {
-                    "Tvoje nastavení (config.toml) zůstane."
+                    UNINSTALL_FOOTER
                 } else {
-                    "Tvoje nastavení (config.toml) i ovladač ViGEmBus zůstanou."
+                    UNINSTALL_FOOTER_BUS
                 },
                 UNINSTALL_STEPS,
                 "Odebrat",
             )
         }
-        Mode::Driver => driver_screen(bus),
-        Mode::Install => {
-            let mut steps = INSTALL_STEPS.to_vec();
-            if offer {
-                steps.push(DRIVER_STEP_LABEL);
-            }
-            let st = gui::State::new(
-                "KeyPad",
-                "klávesnice jako Xbox ovladač",
-                "KeyPad se nainstaluje do tvého profilu — bez práv správce.",
-                &steps,
-                "Nainstalovat",
-            );
-            if offer {
-                st.with_option(gui::Toggle {
-                    label: DRIVER_TOGGLE.into(),
-                    note: driver_toggle_note(),
-                    on: true,
-                    step: STEP_DRIVER,
-                })
-            } else {
-                st
-            }
-        }
+        Mode::Driver => driver_screen(bus, outdated),
+        Mode::Install => install_screen(work),
     };
     let state: gui::Shared = Arc::new(Mutex::new(state));
 
@@ -489,13 +480,7 @@ fn main() {
     let driver_code = Arc::new(AtomicI32::new(NO_ATTEMPT));
     let (flag, code) = (Arc::clone(&succeeded), Arc::clone(&driver_code));
     let mode = args.mode;
-    // Tlačítko „Nainstalovat ovladač" jen tam, kde okno krok ovladače
-    // ukazuje; jinak (tichý režim, ovladač při startu nechyběl) odkaz.
-    let missing = if offer {
-        Missing::Button
-    } else {
-        Missing::Link
-    };
+    let with_driver = work.is_some();
     let action: gui::Action = Arc::new(move |job, st: gui::Shared, note: gui::Notifier| {
         let mut rep = GuiReport {
             state: Arc::clone(&st),
@@ -503,21 +488,25 @@ fn main() {
         };
         let r = match (mode, job) {
             (Mode::Uninstall, _) => do_uninstall(&mut rep),
-            (Mode::Install, gui::Job::Main) => {
-                let with_driver = st.lock().map(|s| s.option_on()).unwrap_or(false);
-                do_install(&mut rep, with_driver, missing)
-            }
+            (Mode::Install, gui::Job::Main) => do_install(&mut rep, with_driver, Missing::Link),
             // Ovladač sám: v režimu /vigembus, nebo „Zkusit znovu
             // ovladač" po instalaci KeyPadu.
             (Mode::Driver, _) | (Mode::Install, gui::Job::Driver) => {
                 let step = if mode == Mode::Driver { 0 } else { STEP_DRIVER };
-                let o = driver::install(&mut rep, step);
+                let (o, relaunched) = driver_only(&mut rep, step);
                 code.store(o.exit_code(), Ordering::SeqCst);
-                Ok(driver_done(&o))
+                Ok(driver_done(&o, &relaunched))
             }
         };
         if r.is_ok() {
             flag.store(true, Ordering::SeqCst);
+        }
+        // Odinstalace log maže (je mezi logy, které slibuje smazat).
+        if mode != Mode::Uninstall {
+            match &r {
+                Ok(done) => log::line(&format!("hotovo: {}", done.message)),
+                Err(e) => log::line(&format!("chyba: {e}")),
+            }
         }
         if let Ok(mut s) = st.lock() {
             match r {
@@ -533,7 +522,13 @@ fn main() {
         Mode::Uninstall => "KeyPad — odinstalace",
         Mode::Driver => "KeyPad — ovladač ViGEmBus",
     };
-    gui::run(title, state, action, args.quiet, args.quiet);
+    // /vigembus spouští aplikace po kliknutí uživatele — začne hned
+    // (souhlas je výzva UAC) a výsledek nechá v okně.
+    let (autostart, autoclose) = match args.mode {
+        Mode::Driver => (true, false),
+        _ => (args.quiet, args.quiet),
+    };
+    gui::run(title, state, action, autostart, autoclose);
 
     match args.mode {
         Mode::Uninstall if running_from_install && succeeded.load(Ordering::SeqCst) => {
@@ -552,55 +547,86 @@ fn main() {
     }
 }
 
-/// „Žádný pokus o ovladač neproběhl" v `driver_code`.
-const NO_ATTEMPT: i32 = -1;
-
-/// Kód návratu okna `/vigembus` — stejná pravidla jako headless
-/// (`Outcome::exit_code`), jen se na konci čte skutečný stav znovu:
-/// běžící ovladač je 0 i bez kliknutí (nebo když ho mezitím nainstaloval
-/// někdo jiný). Jinak výsledek posledního pokusu, a bez pokusu to, co
-/// by řekla pojistka (je a čeká na restart → 3010, jinak 1).
-fn driver_exit_code(now: BusState, last_attempt: Option<i32>) -> i32 {
-    match driver::precheck(now) {
-        Some(o) if o.is_ready() => 0,
-        pre => last_attempt.unwrap_or_else(|| pre.map_or(1, |o| o.exit_code())),
+/// Úvodní obrazovka instalace: kroky KeyPadu, k nim krok ovladače
+/// a credit, když se s ovladačem něco udělá.
+fn install_screen(work: Option<driver::Work>) -> gui::State {
+    let mut steps = INSTALL_STEPS.to_vec();
+    steps.extend(work.map(driver_step_label));
+    let st = gui::State::new(
+        "KeyPad",
+        "klávesnice jako Xbox ovladač",
+        if work.is_some() {
+            FOOTER_DRIVER
+        } else {
+            FOOTER
+        },
+        &steps,
+        "Nainstalovat",
+    );
+    if work.is_some() {
+        st.with_credit(credit())
+    } else {
+        st
     }
 }
 
-/// Úvodní obrazovka režimu `/vigembus` podle stavu ovladače.
-fn driver_screen(bus: BusState) -> gui::State {
-    let footer = "Stahuje se jen z github.com/nefarius; jiný soubor se nespustí.";
-    match bus {
-        BusState::NotInstalled => {
-            let mut st = gui::State::new(
-                "Ovladač ViGEmBus",
-                "virtuální Xbox ovladač pro KeyPad",
-                footer,
-                &[DRIVER_STEP_LABEL],
-                "Nainstalovat ViGEmBus",
-            );
-            st.message = driver_intro();
-            st
-        }
-        // Ovladač běží, nebo je a neběží — instalovat se nic nebude,
-        // okno jen řekne, jak to je a co s tím (stejná pojistka jako
-        // v `driver::install`). Kroky žádné.
-        other => {
-            let mut st = gui::State::new(
-                "Ovladač ViGEmBus",
-                "virtuální Xbox ovladač pro KeyPad",
-                "",
-                &[],
-                "",
-            );
-            match driver::precheck(other) {
-                Some(o) if !o.is_ready() => st.finish(&o.message(), true, driver_next(&o)),
-                _ => st.finish(
-                    "Ovladač ViGEmBus je nainstalovaný a běží — není co dělat.",
-                    false,
-                    None,
-                ),
-            }
+/// Výsledek ovladače do konzole: věta, podrobnosti (kódy), adresa ruční
+/// instalace a credit.
+fn print_driver(o: &driver::Outcome) {
+    println!("\n  {}", o.message().replace('\n', "\n  "));
+    if !o.detail().is_empty() {
+        println!("  ({})", o.detail());
+    }
+    if o.manual_install() {
+        println!("  Ruční instalace: {}", vigembus::RELEASES_URL);
+    }
+    println!(
+        "  {} · {} · licence {}",
+        vigembus::CREDIT,
+        vigembus::REPO_URL,
+        vigembus::LICENSE
+    );
+}
+
+/// „Žádný pokus o ovladač neproběhl" v `driver_code`.
+const NO_ATTEMPT: i32 = -1;
+
+/// Kód návratu režimu `/vigembus` (okno i konzole) — podle něj aplikace
+/// pozná, jestli má gamepad zkusit připojit znovu: 0 = ovladač běží,
+/// 3010 = poběží po restartu, 1 = neběží. Na konci se čte skutečný stav
+/// znovu: běžící ovladač je 0 i bez pokusu (nebo když aktualizace
+/// neprošla a starší běží dál) — jen ne, když poslední pokus řekl
+/// „restartuj" (aktualizace nedoběhla, běží ještě starý). Jinak výsledek
+/// posledního pokusu, a bez pokusu to, co by řekla pojistka.
+fn driver_exit_code(now: BusState, last_attempt: Option<i32>) -> i32 {
+    match (now, last_attempt) {
+        (BusState::Ready, Some(3010)) => 3010,
+        (BusState::Ready, _) => 0,
+        (_, Some(c)) => c,
+        (s, None) => driver::decide(s, false).err().map_or(1, |o| o.exit_code()),
+    }
+}
+
+/// Obrazovka režimu `/vigembus` podle stavu ovladače: je co dělat →
+/// krok a credit (okno začne samo); jinak rovnou výsledek (v pořádku,
+/// nebo rada — stejná pojistka jako v `driver::install`).
+fn driver_screen(bus: BusState, outdated: bool) -> gui::State {
+    let (title, subtitle) = ("Ovladač ViGEmBus", "virtuální Xbox ovladač pro KeyPad");
+    match driver::decide(bus, outdated) {
+        Ok(work) => gui::State::new(
+            title,
+            subtitle,
+            "",
+            &[driver_step_label(work)],
+            match work {
+                driver::Work::Install => "Nainstalovat",
+                driver::Work::Update => "Aktualizovat",
+            },
+        )
+        .with_credit(credit()),
+        Err(o) => {
+            let mut st = gui::State::new(title, subtitle, "", &[], "");
+            st.finish(&o.message(), o.needs_attention(), driver_next(&o));
             // Nic neproběhlo — plný pruh průběhu by lhal.
             st.progress = None;
             st
@@ -608,30 +634,60 @@ fn driver_screen(bus: BusState) -> gui::State {
     }
 }
 
-/// Závěr samotné instalace ovladače (`/vigembus`, „Zkusit znovu ovladač").
-fn driver_done(o: &driver::Outcome) -> Done {
-    let mut message = o.message();
-    if o == &driver::Outcome::Installed {
-        message.push_str(" Jestli máš KeyPad otevřený, klikni v něm na „Zkusit znovu“.");
-    }
-    Done {
-        message,
-        attention: !o.is_ready(),
-        next: driver_next(o),
-    }
+/// Ovladač sám (`/vigembus`, „Zkusit znovu ovladač"). Když aktualizace
+/// zavřela běžící KeyPad (drží sběrnici — `driver.rs`, krok 5), spustí
+/// ho zase: kdo KeyPad zavřel, ten ho vrací. (Instalace KeyPadu ho na
+/// konci spouští sama, viz `launch_and_report`.) Vrací výsledek ovladače
+/// a výsledek nového spuštění (`None` = KeyPad se nezavíral).
+fn driver_only(rep: &mut dyn Report, step: usize) -> (driver::Outcome, Option<Result<(), String>>) {
+    let ran = driver::install(rep, step);
+    let relaunched = ran.closed_app.then(|| {
+        let r = launch(&updater::install_dir());
+        match &r {
+            Ok(()) => log::line("KeyPad po aktualizaci ovladače znovu spuštěn"),
+            Err(e) => log::line(&format!("KeyPad se po aktualizaci ovladače nespustil: {e}")),
+        }
+        r
+    });
+    (ran.outcome, relaunched)
 }
 
-/// Tlačítko po nepovedené instalaci ovladače: znovu, kde to má smysl
-/// (zrušená výzva, síť, zaneprázdněný instalátor Windows, smazaná
-/// složka rozbalování), jinak odkaz na ruční instalaci (soubor není ten
-/// oficiální, neznámý kód, ovladač bez zařízení a bez záznamu
-/// v Aplikacích).
+/// Věta, když se KeyPad zavřený kvůli aktualizaci ovladače nespustil
+/// znovu (důvod je v logu); jinak nic.
+fn relaunch_note(relaunched: &Option<Result<(), String>>) -> Option<&'static str> {
+    matches!(relaunched, Some(Err(_)))
+        .then_some("KeyPad se znovu nespustil — spusť ho z nabídky Start.")
+}
+
+/// Závěr samotného ovladače (`/vigembus`, „Zkusit znovu ovladač").
+/// KeyPad, který se po aktualizaci nevrátil, musí zůstat na očích.
+fn driver_done(o: &driver::Outcome, relaunched: &Option<Result<(), String>>) -> Done {
+    let mut done = Done {
+        message: o.message(),
+        attention: o.needs_attention(),
+        next: driver_next(o),
+    };
+    if let Some(n) = relaunch_note(relaunched) {
+        done.message.push('\n');
+        done.message.push_str(n);
+        done.attention = true;
+    }
+    done
+}
+
+/// Tlačítko po ovladači: znovu, kde to má smysl (zrušená výzva, síť,
+/// zaneprázdněný instalátor Windows, smazaná složka rozbalování, KeyPad,
+/// který nešel zavřít, ovladač, po kterém aktualizace nic nenechala), odkaz
+/// na ruční instalaci, kde vede cesta tudy (soubor není ten oficiální,
+/// instalátor nic nenainstaloval, ovladač bez zařízení a bez záznamu
+/// v Aplikacích), jinak nic.
 fn driver_next(o: &driver::Outcome) -> Option<gui::Next> {
-    match o {
-        o if o.retry_makes_sense() => Some(gui::Next::Driver("Zkusit znovu ovladač".into())),
-        driver::Outcome::Failed { .. } => Some(gui::Next::Link(vigembus_link())),
-        driver::Outcome::NotRunning { advice, .. } => advice_next(advice),
-        _ => None,
+    if o.retry_makes_sense() {
+        Some(gui::Next::Driver("Zkusit znovu ovladač".into()))
+    } else if o.manual_install() {
+        Some(gui::Next::Link(vigembus_link()))
+    } else {
+        None
     }
 }
 
@@ -651,126 +707,189 @@ fn vigembus_link() -> gui::Link {
 
 /// Ladicí náhled hotových obrazovek: `KEYPAD_SETUP_TEST_NAHLED` =
 /// `nejdelsi` | `odmitnuta-slozka` | `preteceni` | `ovladac-zrusen` |
-/// `ovladac-vynechan` | `ovladac-hotovo` | `prepinac-vypnuty` |
-/// `odinstalovano`. Nic se
-/// neinstaluje ani nemaže — jen se ukáže okno s výsledkem, jaký by
-/// složila skutečná instalace. `preteceni` = nejdelší zpráva a k ní
-/// všechny tři poznámky „Pozor:" (profil bez práva zápisu) — kontrola,
-/// že okno přejde na menší písmo místo useknutí (`gui::Fit`).
+/// `ovladac-hotovo` | `ovladac-aktualizovan` | `aktualizace-hotova` |
+/// `restart` | `nestazeno` | `aktualizace-bez-zarizeni` |
+/// `aktualizace-vypnuty` | `aktualizace-blokovany` | `aktualizace-odebrala` |
+/// `keypad-nejde-zavrit` | `keypad-nespusten` | `chyba-site` |
+/// `chyba-souboru` | `odinstalovano`. Nic se neinstaluje ani nemaže —
+/// jen se ukáže okno s výsledkem, jaký by složila skutečná instalace
+/// (výsledky po instalátoru ovladače jdou přes `driver::preview_settle`,
+/// tedy přes skutečné rozhodnutí). `preteceni` = nejdelší zpráva a k ní
+/// všechny poznámky „Pozor:" (profil bez práva zápisu) — kontrola, že
+/// okno přejde na menší písmo místo useknutí (`gui::Fit`).
 #[cfg(debug_assertions)]
 fn preview(which: &str) {
+    use driver::Work;
     let action: gui::Action = Arc::new(|_, _, _| {});
-    if which == "prepinac-vypnuty" {
-        // Úvodní obrazovka s vypnutým přepínačem (bez klikání do okna).
-        let st = gui::State::new(
-            "KeyPad",
-            "klávesnice jako Xbox ovladač",
-            "KeyPad se nainstaluje do tvého profilu — bez práv správce.",
-            &INSTALL_STEPS
-                .iter()
-                .copied()
-                .chain([DRIVER_STEP_LABEL])
-                .collect::<Vec<_>>(),
-            "Nainstalovat",
-        )
-        .with_option(gui::Toggle {
-            label: DRIVER_TOGGLE.into(),
-            note: driver_toggle_note(),
-            on: false,
-            step: STEP_DRIVER,
-        });
-        gui::run(
-            "KeyPad — náhled",
-            Arc::new(Mutex::new(st)),
-            action,
-            false,
-            false,
-        );
-        return;
-    }
-    let h = PREVIEW_HEADLINE;
-    let (title, with_driver_step, done) = match which {
-        "nejdelsi" => ("KeyPad", true, longest_done(h)),
+    let install = Some(Work::Install);
+    let update = Some(Work::Update);
+    let preview_update = Plan::Update {
+        from: "0.1.0+20260924.2345".into(),
+        to: "0.1.0+20260929.2241".into(),
+    };
+    // Závěr instalace KeyPadu (aktualizace) s daným výsledkem ovladače.
+    let after_update = |o: driver::Outcome| {
+        Ok(outcome(
+            &headline(&preview_update),
+            true,
+            Some(Ok(())),
+            &Driver::Step(o),
+            &[],
+        ))
+    };
+    // Závěr režimu /vigembus.
+    let alone = |o: driver::Outcome| Ok(driver_done(&o, &None));
+    let (title, work, done): (&str, Option<Work>, Result<Done, String>) = match which {
+        "nejdelsi" => ("KeyPad", install, Ok(longest_done(Plan::Fresh))),
         // Kombinace z review: chybí WebView2 + odmítnutá složka
         // rozbalování + „Pozor:" (dřív se useknul konec).
         "odmitnuta-slozka" => {
             let refused = driver::sample_outcomes()
                 .into_iter()
-                .find(|o| o.message().contains("už existuje"))
+                .find(|o| o.message().contains("brání složka"))
                 .expect("odmítnutá složka mezi ukázkami");
-            let notes = [setup_copy_note("Přístup byl odepřen. (os error 5)")];
+            let notes = [setup_copy_note()];
             (
                 "KeyPad",
-                true,
-                outcome(h, false, None, &Driver::Step(refused), &notes),
+                install,
+                Ok(outcome(
+                    &headline(&Plan::Fresh),
+                    false,
+                    None,
+                    &Driver::Step(refused),
+                    &notes,
+                )),
             )
         }
         "preteceni" => {
-            let mut d = longest_done(h);
-            let denied = "Přístup byl odepřen. (0x80070005)";
-            for n in [
-                shortcut_note(&format!("zástupce nelze uložit: {denied}")),
-                arp_note("nelze zapsat do registru: WIN32_ERROR(5)"),
-            ] {
+            let mut d = longest_done(Plan::Fresh);
+            for n in [shortcut_note(), arp_note()] {
                 d.message.push_str("\nPozor: ");
                 d.message.push_str(&n);
             }
-            ("KeyPad", true, d)
+            ("KeyPad", install, Ok(d))
         }
         "ovladac-zrusen" => (
             "KeyPad",
-            true,
-            outcome(
-                h,
-                true,
-                Some(Ok(())),
-                &Driver::Step(driver::Outcome::Cancelled),
-                &[],
+            update,
+            after_update(driver::Outcome::Cancelled { update: true }),
+        ),
+        "aktualizace-hotova" => (
+            "KeyPad",
+            update,
+            after_update(driver::Outcome::Updated { restart: true }),
+        ),
+        "restart" => (
+            "KeyPad",
+            update,
+            after_update(driver::Outcome::RebootRequired),
+        ),
+        // Skutečný stav po upgradu, který starou verzi odebral a novou
+        // nepřidal: záznam v Aplikacích, zařízení žádné, MSI 3010.
+        "aktualizace-bez-zarizeni" => (
+            "KeyPad",
+            update,
+            after_update(driver::preview_settle(Work::Update, 3010, None, false)),
+        ),
+        // Neprošlá aktualizace (1603) vypnutého / zablokovaného ovladače.
+        "aktualizace-vypnuty" => (
+            "Ovladač ViGEmBus",
+            update,
+            alone(driver::preview_settle(Work::Update, 1603, Some(22), true)),
+        ),
+        "aktualizace-blokovany" => (
+            "Ovladač ViGEmBus",
+            update,
+            alone(driver::preview_settle(Work::Update, 1603, Some(48), true)),
+        ),
+        // Po aktualizaci po ovladači nic (ani záznam v Aplikacích).
+        "aktualizace-odebrala" => ("Ovladač ViGEmBus", update, alone(driver::preview_removed())),
+        "keypad-nejde-zavrit" => (
+            "Ovladač ViGEmBus",
+            update,
+            alone(
+                driver::sample_outcomes()
+                    .into_iter()
+                    .find(|o| o.message().contains("KeyPad nejde zavřít"))
+                    .expect("KeyPad nejde zavřít mezi ukázkami"),
             ),
         ),
-        "ovladac-vynechan" => (
+        // Aktualizace ovladače KeyPad zavřela a ten se znovu nespustil.
+        "keypad-nespusten" => (
+            "Ovladač ViGEmBus",
+            update,
+            Ok(driver_done(
+                &driver::Outcome::Updated { restart: true },
+                &Some(Err("přístup odepřen".into())),
+            )),
+        ),
+        "chyba-site" => (
             "KeyPad",
-            true,
-            outcome(
-                h,
-                true,
-                Some(Ok(())),
-                &Driver::Missing(Missing::Button),
-                &[],
+            None,
+            Err(untouched(
+                updater::ReleaseError::Http {
+                    file: None,
+                    error: updater::http::Error::Connect("odeslání požadavku".into()),
+                }
+                .sentence(),
+            )),
+        ),
+        "chyba-souboru" => ("KeyPad", None, Err(untouched(updater::BAD_DOWNLOAD))),
+        "nestazeno" => (
+            "Ovladač ViGEmBus",
+            install,
+            alone(
+                driver::sample_outcomes()
+                    .into_iter()
+                    .find(|o| o.manual_install() && matches!(o, driver::Outcome::Failed { .. }))
+                    .expect("neoficiální soubor mezi ukázkami"),
             ),
         ),
         "ovladac-hotovo" => (
             "Ovladač ViGEmBus",
-            false,
-            driver_done(&driver::Outcome::Installed),
+            install,
+            alone(driver::Outcome::Installed),
+        ),
+        "ovladac-aktualizovan" => (
+            "Ovladač ViGEmBus",
+            update,
+            Ok(driver_done(
+                &driver::Outcome::Updated { restart: false },
+                &Some(Ok(())),
+            )),
         ),
         _ => (
             "Odebrat KeyPad",
-            false,
-            Done::plain(uninstall_message(true, None, None, BusLeft::InApps)),
+            None,
+            Ok(Done::plain(uninstall_message(
+                true,
+                None,
+                None,
+                BusLeft::InApps,
+            ))),
         ),
     };
-    let labels: Vec<&str> = match (title, with_driver_step) {
-        ("Odebrat KeyPad", _) => UNINSTALL_STEPS.to_vec(),
-        ("Ovladač ViGEmBus", _) => vec![DRIVER_STEP_LABEL],
-        (_, true) => INSTALL_STEPS
+    let labels: Vec<&str> = match title {
+        "Odebrat KeyPad" => UNINSTALL_STEPS.to_vec(),
+        "Ovladač ViGEmBus" => work.map(driver_step_label).into_iter().collect(),
+        _ => INSTALL_STEPS
             .iter()
             .copied()
-            .chain([DRIVER_STEP_LABEL])
+            .chain(work.map(driver_step_label))
             .collect(),
-        _ => INSTALL_STEPS.to_vec(),
     };
     let mut st = gui::State::new(title, "náhled (ladicí build)", "", &labels, "");
-    if which == "ovladac-vynechan" {
-        // Jako ve skutečnosti: vypnutý přepínač nechá krok vynechaný.
-        st = st.with_option(gui::Toggle {
-            label: DRIVER_TOGGLE.into(),
-            note: String::new(),
-            on: false,
-            step: STEP_DRIVER,
-        });
+    if work.is_some() {
+        st = st.with_credit(credit());
     }
-    st.finish(&done.message, done.attention, done.next);
+    match done {
+        Ok(done) => st.finish(&done.message, done.attention, done.next),
+        // Chyba stažení přichází v prvním kroku (zjištění verze).
+        Err(e) => {
+            st.step(0, "");
+            st.fail(&e);
+        }
+    }
     gui::run(
         "KeyPad — náhled",
         Arc::new(Mutex::new(st)),
@@ -780,24 +899,19 @@ fn preview(which: &str) {
     );
 }
 
-/// Nadpis ladicích náhledů a testů délky zprávy (skutečně dlouhá verze).
-#[cfg(any(test, debug_assertions))]
-const PREVIEW_HEADLINE: &str = "KeyPad 0.1.0+20260929.1200 je nainstalovaný";
-
 /// Nejdelší skutečná závěrečná zpráva instalace: chybí WebView2,
 /// nejdelší možný výsledek kroku ovladače (všechny skutečné varianty
-/// z `driver::sample_outcomes`, změřené písmem okna) a poznámka „Pozor:"
-/// se skutečnou chybou Windows. Pro ladicí náhled `nejdelsi` i test, že
-/// se vejde do okna.
+/// z `driver::sample_outcomes`, změřené písmem okna) a poznámka „Pozor:".
+/// Pro ladicí náhled `nejdelsi` i test, že se vejde do okna.
 #[cfg(any(test, debug_assertions))]
-fn longest_done(headline: &str) -> Done {
-    let notes = [setup_copy_note("Přístup byl odepřen. (os error 5)")];
+fn longest_done(plan: Plan) -> Done {
+    let notes = [setup_copy_note()];
     driver::sample_outcomes()
         .into_iter()
-        .map(|o| outcome(headline, false, None, &Driver::Step(o), &notes))
+        .map(|o| outcome(&headline(&plan), false, None, &Driver::Step(o), &notes))
         .max_by_key(|d| {
             (
-                gui::message_height_96(&d.message, INSTALL_STEPS.len() + 1),
+                gui::message_height_96(&d.message, INSTALL_STEPS.len() + 1, true),
                 d.message.len(),
             )
         })
@@ -853,27 +967,27 @@ fn plan(installed: Option<&str>, remote: &str, files_ok: bool) -> Plan {
     }
 }
 
-/// Jak zní úspěch pro daný plán („KeyPad … je …").
-fn headline(plan: &Plan, version: &str) -> String {
+/// Jak zní úspěch pro daný plán („KeyPad je …"). Bez čísla verze —
+/// razítko buildu uživateli nic neřekne; verzi ukazuje popisek kroku
+/// během instalace, konzole a log.
+fn headline(plan: &Plan) -> String {
     match plan {
-        Plan::UpToDate => format!("KeyPad {version} je aktuální"),
-        Plan::Repair => format!("KeyPad {version} je opravený"),
-        Plan::Update { to, .. } => format!("KeyPad je aktualizovaný na {to}"),
-        Plan::Fresh => format!("KeyPad {version} je nainstalovaný"),
+        Plan::UpToDate => "KeyPad je aktuální",
+        Plan::Repair => "KeyPad je opravený",
+        Plan::Update { .. } => "KeyPad je aktualizovaný",
+        Plan::Fresh => "KeyPad je nainstalovaný",
     }
+    .into()
 }
 
-/// Jak nabídnout ovladač ViGEmBus, který chybí a tentokrát se
-/// neinstaloval.
+/// Jak připomenout ovladač ViGEmBus, se kterým se tentokrát nic nedělalo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Missing {
-    /// Okno: uživatel přepínač vypnul — tlačítko „Nainstalovat ovladač"
-    /// (zase jen po kliknutí).
-    Button,
-    /// Tichý režim (aktualizace z aplikace): ovladač se tu nenabízí,
-    /// jen odkaz; stav hlásí aplikace sama.
+    /// Okno, kde se krok ovladače neukázal (při startu okna ovladač
+    /// nechyběl a mezitím zmizel): odkaz na ruční instalaci; stav hlásí
+    /// i aplikace.
     Link,
-    /// Konzole: příkaz, kterým ho uživatel doinstaluje.
+    /// Konzole: příkaz, kterým ho uživatel nainstaluje / aktualizuje.
     Hint,
 }
 
@@ -884,46 +998,31 @@ enum Driver {
     Ready,
     /// Chybí a krok se nespouštěl.
     Missing(Missing),
+    /// Je starší a krok se nespouštěl (jen konzole — okno ho aktualizuje).
+    Outdated,
     /// Je, ale neběží — rada, co s tím.
     NotRunning(vigembus::Advice),
-    /// Krok instalace ovladače proběhl s tímto výsledkem.
+    /// Krok ovladače proběhl s tímto výsledkem.
     Step(driver::Outcome),
 }
 
 impl Driver {
     /// Věta do závěrečné zprávy; `None` = není co říkat.
     fn note(&self) -> Option<String> {
-        let gamepad = "bez něj KeyPad nevytvoří gamepad";
         match self {
             Driver::Ready => None,
-            Driver::Missing(Missing::Button) => Some(format!(
-                "Ovladač ViGEmBus jsi vynechal — {gamepad}. Doinstaluješ ho tlačítkem níž nebo \
-                 později z KeyPadu."
-            )),
-            Driver::Missing(Missing::Link) => Some(format!(
-                "Chybí ještě ovladač ViGEmBus — {gamepad}. Stáhneš ho z {} (ovladač chce práva \
-                 správce, KeyPad sám ne).",
-                vigembus::RELEASES_URL
-            )),
+            Driver::Missing(Missing::Link) => {
+                Some("Chybí ovladač ViGEmBus — bez něj KeyPad nevytvoří gamepad.".into())
+            }
             Driver::Missing(Missing::Hint) => Some(format!(
-                "Chybí ještě ovladač ViGEmBus — {gamepad}. Nainstaluješ ho příkazem \
-                 KeyPadSetup.exe {SETUP_ARG_VIGEMBUS} (Windows se zeptá na povolení správce)."
+                "Chybí ovladač ViGEmBus — nainstaluješ ho příkazem KeyPadSetup.exe \
+                 {SETUP_ARG_VIGEMBUS}."
+            )),
+            Driver::Outdated => Some(format!(
+                "Ovladač ViGEmBus je starší — aktualizuješ ho příkazem KeyPadSetup.exe \
+                 {SETUP_ARG_VIGEMBUS}."
             )),
             Driver::NotRunning(advice) => Some(advice.text()),
-            // Nenainstalovaný ovladač: připomenout, co to znamená — hned
-            // za první větu, ne až za adresu ruční instalace.
-            Driver::Step(
-                o @ (driver::Outcome::Cancelled
-                | driver::Outcome::Busy
-                | driver::Outcome::Failed { .. }),
-            ) => {
-                let m = o.message();
-                let extra = "Bez ovladače KeyPad nevytvoří gamepad.";
-                Some(match m.split_once('\n') {
-                    Some((first, rest)) => format!("{first} {extra}\n{rest}"),
-                    None => format!("{m} {extra}"),
-                })
-            }
             Driver::Step(o) => Some(o.message()),
         }
     }
@@ -931,9 +1030,6 @@ impl Driver {
     /// Tlačítko, které k ovladači nabídnout.
     fn next(&self) -> Option<gui::Next> {
         match self {
-            Driver::Missing(Missing::Button) => {
-                Some(gui::Next::Driver("Nainstalovat ovladač".into()))
-            }
             Driver::Missing(Missing::Link) => Some(gui::Next::Link(vigembus_link())),
             Driver::NotRunning(advice) => advice_next(advice),
             Driver::Step(o) => driver_next(o),
@@ -942,14 +1038,16 @@ impl Driver {
     }
 
     /// Musí to uživatel vědět, než okno zavře? Ovladač, který se měl
-    /// nainstalovat a nenainstaloval (nebo čeká na restart), ano.
-    /// Vynechaný nebo dávno chybějící ne — to hlásí i aplikace.
+    /// nainstalovat / aktualizovat a nepovedlo se to (nebo čeká na
+    /// restart), ano — i v tichém režimu. Dávno chybějící ne — to hlásí
+    /// i aplikace.
     fn attention(&self) -> bool {
-        matches!(self, Driver::Step(o) if !o.is_ready())
+        matches!(self, Driver::Step(o) if o.needs_attention())
     }
 }
 
-/// Závěrečná zpráva podle stavu systému.
+/// Závěrečná zpráva podle stavu systému — krátce; adresy jsou
+/// v tlačítku (okno) nebo pod zprávou (konzole), podrobnosti v logu.
 ///
 /// `launched` je `None`, když se aplikace vůbec nespouštěla (chybí
 /// WebView2), jinak výsledek spuštění.
@@ -965,14 +1063,10 @@ fn outcome(
         // nic a nevěděl proč. Proto se nespouští a zpráva říká, co dál.
         // Odkaz na WebView2 má přednost: bez něj se KeyPad neotevře
         // vůbec, bez ovladače jen nevytvoří gamepad.
-        // (Bez „víc není potřeba": pod tím může být i nenainstalovaný
-        // ovladač, a pak by to nebyla pravda.)
         Done {
             message: format!(
-                "{headline}, ale zatím ho nespouštím — chybí Microsoft Edge WebView2 Runtime, \
-                 bez kterého se okno KeyPadu neotevře.\nNainstaluj ho z {} a spusť KeyPadSetup \
-                 znovu.",
-                prereq::WEBVIEW2_URL
+                "{headline}, ale chybí Microsoft Edge WebView2 Runtime — bez něj se KeyPad \
+                 neotevře. Nainstaluj ho a spusť KeyPadSetup znovu."
             ),
             attention: true,
             next: Some(gui::Next::Link(gui::Link {
@@ -984,15 +1078,13 @@ fn outcome(
         // Nepovedené spuštění musí zůstat na očích i v tichém režimu:
         // při aktualizaci z aplikace uživatel viděl, jak se KeyPad zavřel,
         // a bez zprávy by nevěděl, proč se nevrátil (typicky ho zablokoval
-        // antivirus).
+        // antivirus). Důvod jde do logu (`launch_and_report`).
         let failed_launch = matches!(launched, Some(Err(_)));
         Done {
-            message: match launched {
-                Some(Err(e)) => format!(
-                    "Hotovo — {headline}, jen se ho nepodařilo spustit ({e}). Spusť ho z nabídky \
-                     Start."
-                ),
-                _ => format!("Hotovo — {headline} a běží. Najdeš ho i v nabídce Start."),
+            message: if failed_launch {
+                format!("Hotovo — {headline}, jen se nespustil. Spusť ho z nabídky Start.")
+            } else {
+                format!("Hotovo — {headline} a běží. Najdeš ho v nabídce Start.")
             },
             attention: failed_launch || driver.attention(),
             next: driver.next(),
@@ -1020,10 +1112,29 @@ fn mb(bytes: usize) -> String {
     format!("{:.1} MB", bytes as f64 / 1e6)
 }
 
-/// Chyba z doby, kdy se ještě na nic nesáhlo. Uživatel má vědět, že
-/// stará instalace (pokud byla) zůstala celá a funkční.
-fn untouched(what: &str, e: impl std::fmt::Display) -> String {
-    format!("{what}: {e}.\nNa disku se nic nezměnilo.")
+/// Chyba z doby, kdy se ještě na nic nesáhlo: krátká věta bez kódů
+/// a k ní, že stará instalace (pokud byla) zůstala celá a funkční.
+fn untouched(sentence: &str) -> String {
+    format!("{sentence}\nNa disku se nic nezměnilo.")
+}
+
+/// Stažení se nepovedlo (síť, server, nesmyslná odpověď): do okna jen
+/// věta, podrobnosti (`what` a chyba WinHttp / HTTP) do logu.
+fn download_failed(what: &str, e: &updater::ReleaseError) -> String {
+    log::line(&format!("{what}: {e} ({e:?})"));
+    download_message(e)
+}
+
+/// Co z chyby stažení uvidí okno.
+fn download_message(e: &updater::ReleaseError) -> String {
+    untouched(e.sentence())
+}
+
+/// Stažený obsah nedává smysl (prázdná verze, místo binárky chybová
+/// stránka); `detail` jde do logu.
+fn bad_download(detail: &str) -> String {
+    log::line(detail);
+    untouched(updater::BAD_DOWNLOAD)
 }
 
 fn do_install(rep: &mut dyn Report, with_driver: bool, missing: Missing) -> Result<Done, String> {
@@ -1036,16 +1147,15 @@ fn do_install(rep: &mut dyn Report, with_driver: bool, missing: Missing) -> Resu
     // Commit se zjišťuje zvlášť a všechno se pak stahuje z něj: adresa
     // s konkrétním commitem obchází pětiminutovou CDN cache větve, takže
     // se nesmíchá stará version.txt s novou binárkou (viz updater).
-    let sha = updater::latest_commit()
-        .map_err(|e| untouched("Nepodařilo se zjistit aktuální verzi", e))?;
+    let sha =
+        updater::latest_commit().map_err(|e| download_failed("zjištění posledního commitu", &e))?;
     let version = updater::fetch_release_file(&sha, VERSION_FILE, |_| {})
-        .map_err(|e| untouched("Nepodařilo se zjistit aktuální verzi", e))?;
+        .map_err(|e| download_failed("zjištění verze", &e))?;
     let version = String::from_utf8_lossy(&version).trim().to_string();
     if version.is_empty() {
-        return Err(untouched(
-            "Nepodařilo se zjistit aktuální verzi",
-            "server vrátil prázdnou verzi",
-        ));
+        return Err(bad_download(&format!(
+            "{VERSION_FILE} v commitu {sha} je prázdný"
+        )));
     }
 
     let decision = plan(
@@ -1066,12 +1176,7 @@ fn do_install(rep: &mut dyn Report, with_driver: bool, missing: Missing) -> Resu
             ensure_setup_copy(&dir, &mut notes);
             register(&dir, &version, &mut notes);
             let drv = driver_step(rep, with_driver, missing);
-            return Ok(launch_and_report(
-                &dir,
-                &headline(&decision, &version),
-                notes,
-                &drv,
-            ));
+            return Ok(launch_and_report(&dir, &headline(&decision), notes, &drv));
         }
         Plan::Repair => format!("verze {version} sedí, ale chybí {APP_EXE} — opravuji"),
         Plan::Update { from, to } => format!("aktualizuji {from} → {to}"),
@@ -1091,12 +1196,12 @@ fn do_install(rep: &mut dyn Report, with_driver: bool, missing: Missing) -> Resu
             rep.download(APP_EXE, n);
         }
     })
-    .map_err(|e| untouched("Stažení se nepovedlo", e))?;
+    .map_err(|e| download_failed("stažení", &e))?;
     if !updater::looks_like_exe(&data) {
-        return Err(untouched(
-            &format!("{APP_EXE} se stáhl poškozený ({} B)", data.len()),
-            "zkus to za chvíli znovu",
-        ));
+        return Err(bad_download(&format!(
+            "{APP_EXE} se stáhl poškozený ({} B)",
+            data.len()
+        )));
     }
     rep.status(&format!("{APP_EXE} — {}", mb(data.len())));
     rep.progress(Some(0.5));
@@ -1106,7 +1211,7 @@ fn do_install(rep: &mut dyn Report, with_driver: bool, missing: Missing) -> Resu
     rep.step(2, "hledám běžící KeyPad…");
     rep.progress(None);
     let closed = proc::close_app(&app, QUIT_EVENT_NAME, &mut |s| rep.status(s))
-        .map_err(|e| format!("{e}\nNa disku se nic nezměnilo."))?;
+        .map_err(|e| untouched(&e))?;
 
     // ── 4. Zápis na disk ───────────────────────────────────────────
     rep.step(3, "zapisuji do profilu…");
@@ -1120,9 +1225,7 @@ fn do_install(rep: &mut dyn Report, with_driver: bool, missing: Missing) -> Resu
         // aplikace jen proto, že se nepovedla aktualizace. Zpráva proto
         // neříká „původní": může to být i nová binárka.
         if closed != proc::Closed::NotRunning && app.is_file() && launch(&dir).is_ok() {
-            return Err(format!(
-                "{e}\nKeyPad jsem zase spustil, ať nezůstaneš bez aplikace."
-            ));
+            return Err(relaunched_after_failure(&e));
         }
         return Err(e);
     }
@@ -1135,31 +1238,39 @@ fn do_install(rep: &mut dyn Report, with_driver: bool, missing: Missing) -> Resu
     rep.progress(Some(0.9));
     register(&dir, &version, &mut notes);
 
-    // ── 6. Ovladač ViGEmBus (jen když ho uživatel nechal zapnutý) ──
+    // ── 6. Ovladač ViGEmBus (chybí → instalace, starší → aktualizace) ──
     let drv = driver_step(rep, with_driver, missing);
 
-    Ok(launch_and_report(
-        &dir,
-        &headline(&decision, &version),
-        notes,
-        &drv,
-    ))
+    Ok(launch_and_report(&dir, &headline(&decision), notes, &drv))
 }
 
-/// Krok ovladače: nainstalovat (když ho uživatel nechal zapnutý), nebo
-/// jen zjistit, jak na tom je.
+/// Krok ovladače: nainstalovat / aktualizovat (když ho okno ukázalo),
+/// nebo jen zjistit, jak na tom je.
 ///
 /// Běží PŘED spuštěním KeyPadu — aplikace pak sběrnici najde hned při
-/// startu. Jeho výsledek instalaci KeyPadu nikdy neshodí: KeyPad je
-/// v tu chvíli zapsaný a zaregistrovaný, ovladač se dá zkusit znovu.
+/// startu. Při aktualizaci KeyPadu je v tu chvíli zavřený (krok 3);
+/// když se KeyPad nestahoval (stejná verze), aktualizace ovladače ho
+/// zavře sama (drží sběrnici, `driver.rs` krok 5). Znovu ho v obou
+/// případech spustí `launch_and_report`. Výsledek ovladače instalaci
+/// KeyPadu nikdy neshodí: KeyPad je v tu chvíli zapsaný
+/// a zaregistrovaný, ovladač se dá zkusit znovu.
 fn driver_step(rep: &mut dyn Report, with_driver: bool, missing: Missing) -> Driver {
     if with_driver {
-        return Driver::Step(driver::install(rep, STEP_DRIVER));
+        return Driver::Step(driver::install(rep, STEP_DRIVER).outcome);
     }
-    match vigembus::state() {
-        BusState::Ready => Driver::Ready,
-        BusState::NotInstalled => Driver::Missing(missing),
-        s => Driver::NotRunning(s.advice().unwrap_or(vigembus::Advice::Restart)),
+    let (state, outdated) = driver::current();
+    match driver::decide(state, outdated) {
+        Ok(driver::Work::Install) => Driver::Missing(missing),
+        Ok(driver::Work::Update) if missing == Missing::Hint => Driver::Outdated,
+        // Okno bez kroku ovladače (stav se změnil až za běhu): starší,
+        // ale běžící ovladač počká na příští spuštění instalátoru.
+        Ok(driver::Work::Update) => match state.advice() {
+            Some(a) => Driver::NotRunning(a),
+            None => Driver::Ready,
+        },
+        Err(o) if o.is_ready() => Driver::Ready,
+        Err(driver::Outcome::NotRunning(a)) => Driver::NotRunning(a),
+        Err(_) => Driver::NotRunning(vigembus::Advice::Restart),
     }
 }
 
@@ -1167,6 +1278,12 @@ fn driver_step(rep: &mut dyn Report, with_driver: bool, missing: Missing) -> Dri
 fn launch_and_report(dir: &Path, headline: &str, notes: Vec<String>, drv: &Driver) -> Done {
     let webview2 = prereq::webview2_present();
     let launched = webview2.then(|| launch(dir));
+    if !webview2 {
+        log::line("WebView2 Runtime chybí — KeyPad se nespouští");
+    }
+    if let Some(Err(e)) = &launched {
+        log::line(&format!("KeyPad se nespustil: {e}"));
+    }
     outcome(headline, webview2, launched, drv, &notes)
 }
 
@@ -1177,8 +1294,10 @@ fn write_files(
     version: &str,
     notes: &mut Vec<String>,
 ) -> Result<(), String> {
-    std::fs::create_dir_all(dir)
-        .map_err(|e| format!("Nelze vytvořit složku {}: {e}", dir.display()))?;
+    std::fs::create_dir_all(dir).map_err(|e| {
+        log::line(&format!("{}: {e}", dir.display()));
+        cant_create_dir(dir)
+    })?;
     replace_file(&dir.join(APP_EXE), exe)?;
     ensure_setup_copy(dir, notes);
     // Verze se zapisuje až nakonec: kdyby zápis binárky selhal, zůstane
@@ -1213,10 +1332,31 @@ fn replace_file(path: &Path, data: &[u8]) -> Result<(), String> {
         }
     }
     let _ = std::fs::remove_file(&tmp);
-    Err(format!(
-        "{} nejde přepsat ({last}) — nejspíš ho pořád něco drží. Zavři KeyPad a zkus to znovu.",
+    log::line(&format!("{}: {last}", path.display()));
+    Err(cant_replace(path))
+}
+
+// Chybové věty zápisu — cesta v nich je, protože s ní uživatel jedná;
+// chyba Windows (kód) jde do logu. Zvlášť kvůli testu bez kódů.
+
+fn cant_create_dir(dir: &Path) -> String {
+    format!("Nelze vytvořit složku {}.", dir.display())
+}
+
+fn cant_replace(path: &Path) -> String {
+    format!(
+        "{} nejde přepsat — nejspíš ho pořád něco drží. Zavři KeyPad a zkus to znovu.",
         path.display()
-    ))
+    )
+}
+
+fn cant_write(path: &Path) -> String {
+    format!("Nelze zapsat {}.", path.display())
+}
+
+/// Dovětek, když se po nepovedeném zápisu KeyPad zase spustil.
+fn relaunched_after_failure(e: &str) -> String {
+    format!("{e}\nKeyPad jsem zase spustil, ať nezůstaneš bez aplikace.")
 }
 
 /// Zápis s několika pokusy (důvod viz `replace_file`).
@@ -1231,7 +1371,8 @@ fn write_retry(path: &Path, data: &[u8]) -> Result<(), String> {
             }
         }
     }
-    Err(format!("Nelze zapsat {}: {last}", path.display()))
+    log::line(&format!("{}: {last}", path.display()));
+    Err(cant_write(path))
 }
 
 /// Uloží kopii běžícího instalátoru vedle aplikace — odinstalace přes
@@ -1244,7 +1385,8 @@ fn ensure_setup_copy(dir: &Path, notes: &mut Vec<String>) {
     let me = match std::env::current_exe() {
         Ok(me) => me,
         Err(e) => {
-            notes.push(format!("kopie instalátoru pro odinstalaci chybí ({e})"));
+            log::line(&format!("kopie instalátoru: {e}"));
+            notes.push(setup_copy_note());
             return;
         }
     };
@@ -1262,23 +1404,24 @@ fn ensure_setup_copy(dir: &Path, notes: &mut Vec<String>) {
             }
         }
     }
-    notes.push(setup_copy_note(&last));
+    log::line(&format!("kopie instalátoru {}: {last}", dst.display()));
+    notes.push(setup_copy_note());
 }
 
 /// Poznámka „Pozor:", když se kopie instalátoru nezapsala (sdílí ji
-/// instalace a náhled nejdelší zprávy).
-fn setup_copy_note(err: &str) -> String {
-    format!(
-        "kopie instalátoru pro odinstalaci se nezapsala ({err}) — odinstaluješ příkazem \
-         KeyPadSetup.exe /uninstall"
-    )
+/// instalace a náhled nejdelší zprávy). Příkaz v ní je místo, kde
+/// uživatel jednat musí; chyba Windows jde do logu.
+fn setup_copy_note() -> String {
+    "kopie instalátoru se nezapsala — odinstaluješ příkazem KeyPadSetup.exe /uninstall".into()
 }
 
 /// Zástupce v nabídce Start a záznam v Nastavení → Aplikace. Obojí je
-/// pohodlí navíc — selhání instalaci nezastaví, jen se ohlásí.
+/// pohodlí navíc — selhání instalaci nezastaví, jen se ohlásí (chyba
+/// do logu).
 fn register(dir: &Path, version: &str, notes: &mut Vec<String>) {
     if let Err(e) = shell::create_shortcut(&dir.join(APP_EXE), &shell::start_menu_lnk()) {
-        notes.push(shortcut_note(&e));
+        log::line(&format!("zástupce: {e}"));
+        notes.push(shortcut_note());
     }
     let size_kb = [APP_EXE, SETUP_EXE]
         .iter()
@@ -1286,18 +1429,19 @@ fn register(dir: &Path, version: &str, notes: &mut Vec<String>) {
         .map(|m| (m.len() / 1024) as u32)
         .sum();
     if let Err(e) = shell::register_uninstall(&dir.join(SETUP_EXE), dir, version, size_kb) {
-        notes.push(arp_note(&e));
+        log::line(&format!("záznam v Aplikacích: {e}"));
+        notes.push(arp_note());
     }
 }
 
 /// Poznámky „Pozor:" k zápisům do systému (sdílí je instalace a ladicí
 /// náhled přetečení).
-fn shortcut_note(err: &str) -> String {
-    format!("zástupce v nabídce Start se nepodařilo vytvořit: {err}")
+fn shortcut_note() -> String {
+    "zástupce v nabídce Start se nevytvořil.".into()
 }
 
-fn arp_note(err: &str) -> String {
-    format!("záznam v Nastavení → Aplikace: {err}")
+fn arp_note() -> String {
+    "záznam v Nastavení → Aplikace se nezapsal.".into()
 }
 
 /// Spustí nainstalovaný KeyPad.
@@ -1367,8 +1511,10 @@ fn do_uninstall(rep: &mut dyn Report) -> Result<Done, String> {
         let _ = std::fs::remove_dir(&roaming);
     }
     remove_update_downloads(&updater::update_temp_dir());
-    // Zbytky přerušené instalace ovladače v %TEMP% (jen naše soubory).
+    // Zbytky přerušené instalace ovladače v %TEMP% (jen naše soubory)
+    // a log instalátoru.
     driver::remove_leftovers();
+    let _ = std::fs::remove_file(log::path());
 
     rep.step(2, "odebírám zástupce a záznam v systému…");
     rep.progress(Some(0.8));
@@ -1395,12 +1541,18 @@ fn do_uninstall(rep: &mut dyn Report) -> Result<Done, String> {
     } else {
         BusLeft::Elsewhere
     };
-    Ok(Done::plain(uninstall_message(
-        found,
-        config_left.then_some(dir.as_path()),
-        webview_left.as_deref(),
-        bus,
-    )))
+    Ok(Done {
+        message: uninstall_message(
+            found,
+            config_left.then_some(dir.as_path()),
+            webview_left.as_deref(),
+            bus,
+        ),
+        // Nesmazaná data okna chtějí ruční zásah — v tichém režimu
+        // (`/uninstall /quiet`) by jinak okno zmizelo i s pokynem.
+        attention: webview_left.is_some(),
+        next: None,
+    })
 }
 
 /// Zůstal po odinstalaci KeyPadu v systému ViGEmBus, a jde odebrat
@@ -1429,9 +1581,9 @@ fn uninstall_message(
 ) -> String {
     let mut msg = match (found, config_dir) {
         (false, _) => String::from("KeyPad tu nainstalovaný nebyl — nebylo co odebírat."),
+        // Cesta zůstává: kdo nastavení nechce, smaže ho ručně.
         (true, Some(dir)) => format!(
-            "KeyPad je odebraný.\nTvoje nastavení ({CONFIG_FILE}) zůstalo v {} — smaž ho ručně, \
-             pokud ho už nechceš.",
+            "KeyPad je odebraný. Tvoje nastavení zůstalo v {}.",
             dir.display()
         ),
         (true, None) => String::from("KeyPad je odebraný."),
@@ -1440,21 +1592,19 @@ fn uninstall_message(
     // zbyly megabajty, které čekal smazané.
     if let Some(wv) = webview_left {
         msg.push_str(&format!(
-            "\nData okna (WebView2) v {} se nepodařilo smazat celá — nejspíš je ještě drží \
-             dobíhající proces WebView2. Smaž tu složku ručně.",
+            "\nData okna v {} se nesmazala celá — smaž tu složku ručně.",
             wv.display()
         ));
     }
     match bus {
         BusLeft::No => {}
         BusLeft::InApps => msg.push_str(
-            "\nViGEmBus zůstává — může ho používat i jiný program; odebereš ho v Aplikacích \
-             („ViGEm Bus Driver“).",
+            "\nOvladač ViGEmBus zůstává (může ho používat i jiný program) — odebereš ho \
+             v Aplikacích jako „ViGEm Bus Driver“.",
         ),
-        BusLeft::Elsewhere => msg.push_str(
-            "\nViGEmBus v systému zůstává — v Aplikacích záznam nemá, nejspíš ho přinesl jiný \
-             program, který ho může dál používat.",
-        ),
+        BusLeft::Elsewhere => {
+            msg.push_str("\nOvladač ViGEmBus zůstává (může ho používat i jiný program).")
+        }
     }
     msg
 }
@@ -1514,8 +1664,10 @@ fn remove_retry(path: &Path) -> Result<(), String> {
             }
         }
     }
+    // Selhání přijde dřív, než odinstalace log smaže — důvod v něm zůstane.
+    log::line(&format!("{}: {last}", path.display()));
     Err(format!(
-        "{} nejde smazat ({last}) — zavři KeyPad a zkus to znovu.",
+        "{} nejde smazat — zavři KeyPad a zkus to znovu.",
         path.display()
     ))
 }
@@ -1623,96 +1775,107 @@ mod tests {
 
     const READY: Driver = Driver::Ready;
     const MISSING_LINK: Driver = Driver::Missing(Missing::Link);
+    const H: &str = "KeyPad je nainstalovaný";
 
     #[test]
     fn bez_webview2_se_nespousti_a_okno_zustane() {
-        let d = outcome("KeyPad 1 je nainstalovaný", false, None, &READY, &[]);
+        let d = outcome(H, false, None, &READY, &[]);
         assert!(d.attention);
-        assert!(d.message.contains(prereq::WEBVIEW2_URL));
+        assert!(d.message.contains("WebView2"));
         assert!(d.message.contains("KeyPadSetup znovu"));
+        // Adresa je v tlačítku (z GDI okna se text zkopírovat nedá).
+        assert!(!d.message.contains("http"));
         assert_eq!(url(d.next), Some(prereq::WEBVIEW2_URL.to_string()));
     }
 
     #[test]
-    fn chybejici_vigembus_v_tichem_rezimu_neni_chyba() {
-        let d = outcome(
-            "KeyPad 1 je nainstalovaný",
-            true,
-            Some(Ok(())),
-            &MISSING_LINK,
-            &[],
-        );
+    fn chybejici_vigembus_bez_kroku_neni_chyba() {
+        let d = outcome(H, true, Some(Ok(())), &MISSING_LINK, &[]);
         assert!(!d.attention);
         assert!(d.message.starts_with("Hotovo"));
-        assert!(d.message.contains(vigembus::RELEASES_URL));
+        assert!(d.message.contains("Chybí ovladač ViGEmBus"));
         assert_eq!(url(d.next), Some(vigembus::RELEASES_URL.to_string()));
     }
 
     #[test]
     fn chybi_oboji_prednost_ma_webview2() {
-        let d = outcome("KeyPad 1 je nainstalovaný", false, None, &MISSING_LINK, &[]);
+        let d = outcome(H, false, None, &MISSING_LINK, &[]);
         assert!(d.attention);
-        assert!(d.message.contains(vigembus::RELEASES_URL));
+        assert!(d.message.contains("Chybí ovladač ViGEmBus"));
         assert_eq!(url(d.next), Some(prereq::WEBVIEW2_URL.to_string()));
     }
 
     #[test]
     fn vse_v_poradku_bez_odkazu() {
-        let d = outcome("KeyPad 1 je aktuální", true, Some(Ok(())), &READY, &[]);
+        let d = outcome("KeyPad je aktuální", true, Some(Ok(())), &READY, &[]);
         assert_eq!(
             d,
-            Done::plain("Hotovo — KeyPad 1 je aktuální a běží. Najdeš ho i v nabídce Start.")
+            Done::plain("Hotovo — KeyPad je aktuální a běží. Najdeš ho v nabídce Start.")
         );
     }
 
     #[test]
     fn nepovedene_spusteni_a_poznamky_jsou_ve_zprave() {
         let d = outcome(
-            "KeyPad 1 je nainstalovaný",
+            H,
             true,
-            Some(Err("přístup odepřen".into())),
+            Some(Err("přístup odepřen (os error 5)".into())),
             &READY,
             &["zástupce nevznikl".into()],
         );
-        assert!(d.message.contains("přístup odepřen"));
+        assert!(d.message.contains("jen se nespustil"));
+        // Chyba Windows jde do logu, ne do okna.
+        assert!(!d.message.contains("os error"));
         assert!(d.message.ends_with("Pozor: zástupce nevznikl"));
         assert!(d.attention);
     }
 
     /// Tichý režim (aktualizace z aplikace) zavře okno jen u čistého
-    /// úspěchu. Nespuštěný KeyPad nebo „Pozor:" musí zůstat na očích.
+    /// úspěchu. Nespuštěný KeyPad, „Pozor:" nebo ovladač, který se
+    /// nenainstaloval, musí zůstat na očích.
     #[test]
     fn nespusteni_nebo_poznamka_nechaji_okno_otevrene() {
-        let h = "KeyPad je aktualizovaný na 2";
-        let d = outcome(h, true, Some(Err("blokováno".into())), &READY, &[]);
-        assert!(d.attention);
-        assert!(d.message.contains("blokováno"));
-
-        let d = outcome(h, true, Some(Ok(())), &READY, &["zástupce nevznikl".into()]);
-        assert!(d.attention);
-
-        // S chybějícím ViGEmBus a nespuštěním: pořád pozornost i odkaz.
+        let h = "KeyPad je aktualizovaný";
+        assert!(outcome(h, true, Some(Err("blokováno".into())), &READY, &[]).attention);
+        assert!(outcome(h, true, Some(Ok(())), &READY, &["zástupce nevznikl".into()]).attention);
         let d = outcome(h, true, Some(Err("x".into())), &MISSING_LINK, &[]);
         assert!(d.attention);
         assert_eq!(url(d.next), Some(vigembus::RELEASES_URL.to_string()));
-
         assert!(!outcome(h, true, Some(Ok(())), &READY, &[]).attention);
+        // Aktualizace ovladače odmítnutá / nutný restart (i když nová
+        // verze už je zapsaná): zůstane otevřené.
+        for o in [
+            driver::Outcome::Cancelled { update: true },
+            driver::Outcome::RebootRequired,
+            driver::Outcome::Updated { restart: true },
+        ] {
+            assert!(outcome(h, true, Some(Ok(())), &Driver::Step(o), &[]).attention);
+        }
+        // Aktualizovaný ovladač bez restartu: čistý úspěch, okno se samo zavře.
+        let d = outcome(
+            h,
+            true,
+            Some(Ok(())),
+            &Driver::Step(driver::Outcome::Updated { restart: false }),
+            &[],
+        );
+        assert!(!d.attention && d.next.is_none());
     }
 
     /// Instalace KeyPadu se povede i se zrušenou výzvou UAC: zpráva to
-    /// řekne a hlavní tlačítko nabídne ovladač znovu (jen ovladač).
+    /// řekne krátce a hlavní tlačítko nabídne ovladač znovu (jen ovladač).
     #[test]
     fn zruseny_ovladac_nezrusi_keypad_a_nabidne_opakovani() {
         let d = outcome(
-            "KeyPad 1 je nainstalovaný",
+            H,
             true,
             Some(Ok(())),
-            &Driver::Step(driver::Outcome::Cancelled),
+            &Driver::Step(driver::Outcome::Cancelled { update: false }),
             &[],
         );
         assert!(d
             .message
-            .starts_with("Hotovo — KeyPad 1 je nainstalovaný a běží."));
+            .starts_with("Hotovo — KeyPad je nainstalovaný a běží."));
         assert!(d.message.contains("výzva Windows nebyla potvrzena"));
         assert!(d.attention);
         assert_eq!(
@@ -1724,24 +1887,26 @@ mod tests {
     #[test]
     fn neoficialni_soubor_vede_na_rucni_instalaci() {
         let d = outcome(
-            "KeyPad 1 je nainstalovaný",
+            H,
             true,
             Some(Ok(())),
-            &Driver::Step(driver::Outcome::Failed {
-                reason: "otisk SHA-256 nesedí".into(),
-                retry: false,
-            }),
+            &Driver::Step(
+                driver::sample_outcomes()
+                    .into_iter()
+                    .find(|o| o.manual_install() && !o.detail().is_empty())
+                    .unwrap(),
+            ),
             &[],
         );
         assert!(d.attention);
-        assert!(d.message.contains("otisk SHA-256 nesedí"));
+        assert!(!d.message.contains("podrobnosti"), "{}", d.message);
         assert_eq!(url(d.next), Some(vigembus::RELEASES_URL.to_string()));
     }
 
     #[test]
     fn nainstalovany_ovladac_se_potvrdi() {
         let d = outcome(
-            "KeyPad 1 je nainstalovaný",
+            H,
             true,
             Some(Ok(())),
             &Driver::Step(driver::Outcome::Installed),
@@ -1749,54 +1914,35 @@ mod tests {
         );
         assert!(!d.attention);
         assert!(d.next.is_none());
-        assert!(d
-            .message
-            .ends_with("Ovladač ViGEmBus je nainstalovaný a běží."));
+        assert!(d.message.ends_with("Ovladač ViGEmBus je nainstalovaný."));
     }
 
+    /// Konzole ovladač sama nespouští (výzva UAC bez člověka) — jen
+    /// poradí příkaz, u chybějícího i u staršího.
     #[test]
-    fn vynechany_ovladac_jde_doinstalovat_tlacitkem() {
-        let d = outcome(
-            "KeyPad 1 je nainstalovaný",
-            true,
-            Some(Ok(())),
-            &Driver::Missing(Missing::Button),
-            &[],
-        );
-        assert!(!d.attention);
-        assert!(d.message.contains("jsi vynechal"));
-        assert_eq!(
-            d.next,
-            Some(gui::Next::Driver("Nainstalovat ovladač".into()))
-        );
-        // Konzole: jen příkaz, žádné tlačítko ani instalace.
-        let d = outcome(
-            "h",
-            true,
-            Some(Ok(())),
-            &Driver::Missing(Missing::Hint),
-            &[],
-        );
-        assert!(d.message.contains("KeyPadSetup.exe /vigembus"));
-        assert!(d.next.is_none());
+    fn konzole_jen_poradi_prikaz() {
+        for drv in [Driver::Missing(Missing::Hint), Driver::Outdated] {
+            let d = outcome("h", true, Some(Ok(())), &drv, &[]);
+            assert!(
+                d.message.contains("KeyPadSetup.exe /vigembus"),
+                "{}",
+                d.message
+            );
+            assert!(d.next.is_none());
+            assert!(!d.attention);
+        }
     }
 
     #[test]
     fn nebezici_ovladac_jen_poradi() {
         let advice = vigembus::Advice::EnableDevice;
-        let d = outcome(
-            "KeyPad 1 je nainstalovaný",
-            true,
-            Some(Ok(())),
-            &Driver::NotRunning(advice),
-            &[],
-        );
+        let d = outcome(H, true, Some(Ok(())), &Driver::NotRunning(advice), &[]);
         assert!(d.message.ends_with(&advice.text()));
         assert!(d.next.is_none(), "nic se neinstaluje, žádné tlačítko");
         // Rada vedoucí na ruční instalaci (bez záznamu v Aplikacích)
         // dostane tlačítko s odkazem — adresu z okna zkopírovat nejde.
         let d = outcome(
-            "KeyPad 1 je nainstalovaný",
+            H,
             true,
             Some(Ok(())),
             &Driver::NotRunning(vigembus::Advice::Reinstall { in_apps: false }),
@@ -1816,7 +1962,7 @@ mod tests {
         assert_eq!(args(&[SETUP_ARG_VIGEMBUS]).mode, Mode::Driver);
         let a = args(&["/headless", "/vigembus"]);
         assert_eq!((a.mode, a.headless), (Mode::Driver, true));
-        // Tichý režim ovladač nikdy nespustí sám — /vigembus čeká na klik.
+        // /vigembus výsledek v okně nechá — /quiet se s ním ignoruje.
         let a = args(&["/quiet", "/vigembus"]);
         assert_eq!((a.mode, a.quiet), (Mode::Driver, false));
         assert!(args(&["/quiet"]).quiet);
@@ -1834,43 +1980,64 @@ mod tests {
     fn odinstalace_rekne_ze_vigembus_zustava() {
         let m = uninstall_message(true, None, None, BusLeft::InApps);
         assert!(m.starts_with("KeyPad je odebraný."));
-        assert!(m.contains(
-            "ViGEmBus zůstává — může ho používat i jiný program; odebereš ho v Aplikacích"
-        ));
+        assert!(m.contains("Ovladač ViGEmBus zůstává"));
+        assert!(m.contains("v Aplikacích jako „ViGEm Bus Driver“"));
         // Bez záznamu v Aplikacích tam uživatele neposílat.
         let m = uninstall_message(true, None, None, BusLeft::Elsewhere);
-        assert!(m.contains("ViGEmBus v systému zůstává"));
-        assert!(!m.contains("odebereš ho v Aplikacích"));
+        assert!(m.contains("Ovladač ViGEmBus zůstává"));
+        assert!(!m.contains("Aplikacích"));
         assert!(!uninstall_message(true, None, None, BusLeft::No).contains("ViGEmBus"));
         let m = uninstall_message(false, None, None, BusLeft::No);
         assert!(m.contains("nebylo co odebírat"));
         let d = Path::new(r"C:\x\KeyPad");
         assert!(uninstall_message(true, Some(d), None, BusLeft::No).contains(r"C:\x\KeyPad"));
+        let wv = Path::new(r"C:\x\cz.hexel.keypad");
+        assert!(uninstall_message(true, None, Some(wv), BusLeft::No).contains("smaž tu složku"));
     }
 
-    /// Přepínač je vidět předem a říká, co se stane: čí ovladač, pod
-    /// jakou licencí, že je oficiální a že se Windows zeptají na správce.
+    /// Úvodní obrazovka: krok ovladače (instalace / aktualizace) a credit
+    /// s odkazem jen tam, kde se s ovladačem něco udělá; patička předem
+    /// řekne, že ovladač chce výzvu Windows.
     #[test]
-    fn prepinac_ovladace_vysvetli_co_se_stane() {
-        assert!(DRIVER_TOGGLE.contains("Windows se zeptá na povolení správce"));
-        assert!(DRIVER_TOGGLE.contains("ViGEmBus"));
-        let note = driver_toggle_note();
-        for part in [
-            "oficiální ViGEmBus",
-            vigembus::VERSION,
-            vigembus::SIGNER,
-            vigembus::LICENSE,
-            "SHA-256",
-            "povolení správce",
-        ] {
-            assert!(note.contains(part), "{part}: {note}");
-        }
-        assert!(driver_intro().contains("SHA-256"));
+    fn uvodni_obrazovka_podle_ovladace() {
+        let st = install_screen(Some(driver::Work::Install));
+        assert_eq!(st.steps.len(), INSTALL_STEPS.len() + 1);
+        assert_eq!(st.steps[STEP_DRIVER].0, "Ovladač ViGEmBus");
+        let c = st.credit.as_ref().expect("credit");
+        assert_eq!(c.text, "ViGEmBus — Nefarius Software Solutions e.U.");
+        assert_eq!(c.url, "https://github.com/nefarius/ViGEmBus");
+        assert!(st.footer.contains("výzvě Windows"));
+
+        let st = install_screen(Some(driver::Work::Update));
+        assert_eq!(st.steps[STEP_DRIVER].0, "Aktualizace ovladače ViGEmBus");
+        assert!(st.credit.is_some());
+
+        let st = install_screen(None);
+        assert_eq!(st.steps.len(), INSTALL_STEPS.len());
+        assert!(st.credit.is_none());
+        assert!(!st.footer.contains("ViGEmBus"));
         assert_eq!(STEP_DRIVER, INSTALL_STEPS.len());
     }
 
-    /// Kód okna /vigembus: běžící ovladač 0 vždy; jinak poslední pokus;
-    /// bez pokusu pojistka (čeká na restart → 3010, jinak 1).
+    /// Patičky se vejdou vedle tlačítek do jejich výšky (změřeno GDI
+    /// jako v okně) — delší text by vyjel pod okraj okna.
+    #[test]
+    fn paticky_se_vejdou_vedle_tlacitek() {
+        for f in [
+            FOOTER,
+            FOOTER_DRIVER,
+            UNINSTALL_FOOTER,
+            UNINSTALL_FOOTER_BUS,
+        ] {
+            assert!(gui::footer_fits_96(f), "{f}");
+        }
+        // Kontrola, že měření něco měří: tři řádky se nevejdou.
+        assert!(!gui::footer_fits_96(&[FOOTER_DRIVER; 3].join(" ")));
+    }
+
+    /// Kód okna /vigembus: běžící ovladač 0 (i starší, když aktualizace
+    /// neprošla) — kromě „restartuj" z posledního pokusu; jinak poslední
+    /// pokus; bez pokusu pojistka (čeká na restart → 3010, jinak 1).
     #[test]
     fn kod_okna_ovladace() {
         let restart = BusState::InstalledNotRunning {
@@ -1887,6 +2054,7 @@ mod tests {
         };
         assert_eq!(driver_exit_code(BusState::Ready, None), 0);
         assert_eq!(driver_exit_code(BusState::Ready, Some(1)), 0);
+        assert_eq!(driver_exit_code(BusState::Ready, Some(3010)), 3010);
         assert_eq!(driver_exit_code(BusState::NotInstalled, None), 1);
         assert_eq!(driver_exit_code(BusState::NotInstalled, Some(1)), 1);
         assert_eq!(driver_exit_code(restart, None), 3010);
@@ -1896,50 +2064,60 @@ mod tests {
 
     /// Nejdelší skutečná závěrečná zpráva (chybí WebView2 + nejdelší
     /// výsledek ovladače + „Pozor:") se při 100 % DPI vejde do okna
-    /// s šesti kroky běžným písmem — změřeno GDI stejně jako při
-    /// kreslení. Delší texty v driver.rs / main.rs tenhle test shodí;
+    /// s šesti kroky a creditem běžným písmem — změřeno GDI stejně jako
+    /// při kreslení. Delší texty v driver.rs / main.rs tenhle test shodí;
     /// okno by pak přešlo na menší písmo (viz `gui::Fit`).
     #[test]
     fn nejdelsi_zprava_se_vejde_do_okna() {
-        let d = longest_done(PREVIEW_HEADLINE);
-        assert!(d.message.contains(prereq::WEBVIEW2_URL));
+        let d = longest_done(Plan::Fresh);
+        assert!(d.message.contains("WebView2"));
         assert!(d.message.contains("\nPozor: "));
-        let steps = INSTALL_STEPS.len() + 1;
         assert_eq!(
-            gui::message_fit_96(&d.message, steps),
+            gui::message_fit_96(&d.message, INSTALL_STEPS.len() + 1, true),
             gui::Fit::Body,
             "{}",
             d.message
         );
     }
 
-    /// `/vigembus` na PC, kde ovladač je: žádné tlačítko instalace, jen
-    /// stav nebo rada.
+    /// `/vigembus`: je co dělat → krok, credit a hned start; jinak rovnou
+    /// výsledek (žádné tlačítko instalace, jen stav nebo rada).
     #[test]
     fn obrazovka_ovladace_podle_stavu() {
-        let st = driver_screen(BusState::NotInstalled);
-        assert_eq!(st.primary, "Nainstalovat ViGEmBus");
+        let st = driver_screen(BusState::NotInstalled, false);
+        assert_eq!(st.phase, gui::Phase::Ready);
         assert_eq!(st.steps.len(), 1);
-        assert!(st.message.contains("povolení"));
+        assert!(st.credit.is_some());
+        assert_eq!(st.primary, "Nainstalovat");
 
-        let st = driver_screen(BusState::Ready);
+        let st = driver_screen(BusState::Ready, true);
+        assert_eq!(st.steps[0].0, "Aktualizace ovladače ViGEmBus");
+        assert_eq!(st.primary, "Aktualizovat");
+
+        let st = driver_screen(BusState::Ready, false);
         assert_eq!(st.phase, gui::Phase::Done);
-        assert!(st.primary.is_empty() && st.steps.is_empty());
+        assert!(st.primary.is_empty() && st.steps.is_empty() && !st.attention);
 
-        let st = driver_screen(BusState::InstalledNotRunning {
-            device: None,
-            in_apps: true,
-        });
+        let st = driver_screen(
+            BusState::InstalledNotRunning {
+                device: None,
+                in_apps: true,
+            },
+            false,
+        );
         assert_eq!(st.phase, gui::Phase::Done);
         assert!(st.attention && st.primary.is_empty());
         assert!(st.message.contains("Aplikace"));
 
         // Bez záznamu v Aplikacích: žádné „odeber v Aplikacích", ale
         // tlačítko na ruční instalaci.
-        let st = driver_screen(BusState::InstalledNotRunning {
-            device: None,
-            in_apps: false,
-        });
+        let st = driver_screen(
+            BusState::InstalledNotRunning {
+                device: None,
+                in_apps: false,
+            },
+            false,
+        );
         assert!(st.attention);
         assert!(!st.message.contains("Aplikace →"));
         assert_eq!(st.primary, "Stáhnout ViGEmBus");
@@ -2053,18 +2231,142 @@ mod tests {
         remove_update_downloads(&dir);
     }
 
+    /// Všechny chybové zprávy, které `do_install` umí ukázat v okně —
+    /// z týchž funkcí jako za běhu, s cestami jako na běžném PC.
+    fn sample_install_errors() -> Vec<String> {
+        use updater::http::Error as H;
+        use updater::ReleaseError as R;
+        let dir = Path::new(r"C:\Users\Kamarad\AppData\Local\Programs\KeyPad");
+        let https = [
+            H::Connect("WinHttpOpen".into()),
+            H::Connect("spojení na api.github.com".into()),
+            H::Connect("WinHttpOpenRequest".into()),
+            H::Connect("odeslání požadavku".into()),
+            H::Connect("čekání na odpověď".into()),
+            H::Http { status: 0 },
+            H::Http { status: 403 },
+            H::Http { status: 404 },
+            H::Http { status: 409 },
+            H::Http { status: 500 },
+            H::Http { status: 502 },
+            H::Read("dotaz na data".into()),
+            H::Read("čtení dat".into()),
+            H::Read("dorazilo 123 z 456 B".into()),
+        ];
+        let mut out = Vec::new();
+        for error in https {
+            for file in [None, Some(APP_EXE.to_string()), Some(VERSION_FILE.into())] {
+                out.push(download_message(&R::Http {
+                    file,
+                    error: error.clone(),
+                }));
+            }
+        }
+        out.push(download_message(&R::Invalid(
+            "odpověď GitHubu neobsahuje platný commit".into(),
+        )));
+        out.push(untouched(updater::BAD_DOWNLOAD));
+        out.push(untouched(proc::CLOSE_FAILED));
+        for e in [
+            cant_create_dir(dir),
+            cant_replace(&dir.join(APP_EXE)),
+            cant_write(&dir.join(VERSION_FILE)),
+        ] {
+            out.push(relaunched_after_failure(&e));
+            out.push(e);
+        }
+        out
+    }
+
+    /// Chyba instalace v okně: krátké věty bez kódů, velikostí a vnitřností
+    /// WinHttp — ty jdou do logu (`download_failed`, `bad_download`). Cesta
+    /// je jen tam, kde s ní uživatel jedná.
+    #[test]
+    fn chyby_instalace_bez_kodu() {
+        let all = sample_install_errors();
+        for m in &all {
+            assert!(!m.chars().any(|c| c.is_ascii_digit()), "číslo v „{m}“");
+            for bad in [
+                "WinHttp",
+                "http",
+                "kód",
+                "0x",
+                "os error",
+                " B",
+                "požadavku",
+                "odpověď",
+                "dorazilo",
+                "commit",
+                "server",
+            ] {
+                assert!(!m.contains(bad), "{bad} v „{m}“");
+            }
+            // Délku hlídá změřené písmo okna (cesty v profilu bývají dlouhé).
+            assert_eq!(
+                gui::message_fit_96(m, INSTALL_STEPS.len(), false),
+                gui::Fit::Body,
+                "{m}"
+            );
+        }
+        // Síť a limit dotazů mají každý svou radu; stará instalace zůstala.
+        let net = download_message(&updater::ReleaseError::Http {
+            file: None,
+            error: updater::http::Error::Connect("WinHttpOpen".into()),
+        });
+        assert_eq!(
+            net,
+            "Nepodařilo se spojit s GitHubem — zkontroluj připojení a zkus to znovu.\n\
+             Na disku se nic nezměnilo."
+        );
+        let limit = download_message(&updater::ReleaseError::Http {
+            file: Some(APP_EXE.into()),
+            error: updater::http::Error::Http { status: 403 },
+        });
+        assert!(limit.starts_with(updater::http::RATE_LIMITED), "{limit}");
+        assert!(all
+            .iter()
+            .any(|m| m.starts_with("Stažený soubor nebyl v pořádku — zkus to znovu.")));
+    }
+
+    /// KeyPad, který aktualizace ovladače zavřela (drží sběrnici), se
+    /// vrací; když se nespustí, okno to řekne a samo se nezavře.
+    #[test]
+    fn keypad_zavreny_kvuli_ovladaci_se_vraci() {
+        let o = driver::Outcome::Updated { restart: false };
+        for relaunched in [None, Some(Ok(()))] {
+            let d = driver_done(&o, &relaunched);
+            assert_eq!(d.message, o.message());
+            assert!(!d.attention);
+        }
+        let d = driver_done(&o, &Some(Err("přístup odepřen (os error 5)".into())));
+        assert!(d.attention);
+        assert!(d
+            .message
+            .ends_with("\nKeyPad se znovu nespustil — spusť ho z nabídky Start."));
+        assert!(!d.message.contains("os error"));
+        // Nejdelší výsledek ovladače i s touhle větou se vejde do okna
+        // /vigembus (jeden krok a credit).
+        for o in driver::sample_outcomes() {
+            let d = driver_done(&o, &Some(Err("x".into())));
+            assert_eq!(
+                gui::message_fit_96(&d.message, 1, true),
+                gui::Fit::Body,
+                "{}",
+                d.message
+            );
+        }
+    }
+
     #[test]
     fn nadpis_podle_planu() {
-        assert_eq!(headline(&Plan::Fresh, "1"), "KeyPad 1 je nainstalovaný");
+        // Bez razítka buildu — uživateli nic neřekne.
+        assert_eq!(headline(&Plan::Fresh), "KeyPad je nainstalovaný");
         assert_eq!(
-            headline(
-                &Plan::Update {
-                    from: "1".into(),
-                    to: "2".into()
-                },
-                "2"
-            ),
-            "KeyPad je aktualizovaný na 2"
+            headline(&Plan::Update {
+                from: "0.1.0+20260924.2345".into(),
+                to: "0.1.0+20260929.2241".into()
+            }),
+            "KeyPad je aktualizovaný"
         );
     }
 

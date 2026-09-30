@@ -24,10 +24,7 @@
         "decorations": false,
         "shadow": false,
         "transparent": true,
-        "windowEffects": {
-          "effects": ["blur"],
-          "color": "#0e0f1299"
-        }
+        "theme": "Dark"
       }
     ],
     "security": {

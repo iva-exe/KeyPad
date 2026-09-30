@@ -1,22 +1,25 @@
-//! Instalace ovladače ViGEmBus z KeyPadSetupu.
+//! Instalace a aktualizace ovladače ViGEmBus z KeyPadSetupu.
 //!
 //! Jediné místo, kde se kvůli KeyPadu něco spouští s právy správce —
 //! a ani tady to není KeyPad: instalátor požádá Windows, aby s právy
 //! správce spustily oficiální podepsaný instalátor Nefarius, ověřený
 //! bajt po bajtu (pin v `updater::vigembus`). Výzvu UAC ukazují Windows
-//! i se jménem ověřeného vydavatele. Vlastník si to výslovně přál, aby
-//! kamarád nemusel nic stahovat zvlášť; principy 6 a 8 to připouštějí
-//! jen takhle: po kliknutí, vysvětlené předem, ověřené potom.
+//! i se jménem ověřeného vydavatele — ta je souhlasem (Fáze 2b: ovladač
+//! se instaluje i aktualizuje sám, bez zaškrtávátka, aby kamarád nemusel
+//! nic hledat). Odmítnutá výzva instalaci KeyPadu nikdy nezkazí.
 //!
 //! Postup:
-//! 1. **Pojistka.** ViGEmBus v systému úplně chybí (jinak by MSI při
-//!    „první instalaci" odebralo cizí zařízení sběrnice nebo při upgradu
-//!    vynutilo restart) a složka, kam zavaděč Advanced Installer rozbaluje
-//!    MSI, neexistuje ani nepatří běžnému uživateli (klasický vektor
-//!    zvýšení práv — složku v ProgramData smí založit kdokoli předem).
-//!    Stav se tu VŽDY čte skutečný — ladicí předstírání stavu v `main.rs`
-//!    sem nedosáhne.
-//! 2. **Stažení** do paměti, přesná velikost + SHA-256.
+//! 1. **Pojistka.** Co se smí ([`decide`]): ovladač úplně chybí →
+//!    instalace; je, ale prokazatelně starší než poslední vydání →
+//!    aktualizace. Aktuální, neznámý nebo na restart čekající ovladač se
+//!    nikdy nepřeinstalovává (MSI by při „první instalaci" odebralo jeho
+//!    zařízení a při upgradu chtělo restart). Složka, kam zavaděč Advanced
+//!    Installer rozbaluje MSI, nesmí existovat ani patřit běžnému
+//!    uživateli (klasický vektor zvýšení práv — složku v ProgramData smí
+//!    založit kdokoli předem). Stav se tu VŽDY čte skutečný — ladicí
+//!    předstírání stavu v `main.rs` sem nedosáhne.
+//! 2. **Stažení** do paměti (oficiální adresa, pak zrcadlo), přesná
+//!    velikost + SHA-256.
 //! 3. **Zápis a zámek.** Čerstvá náhodná složka v `%TEMP%`, soubor přes
 //!    CREATE_NEW, pak znovu otevřený jen pro čtení se zákazem zápisu
 //!    a mazání a druhý SHA-256 z téhož handlu. Soubor se až do konce
@@ -25,18 +28,38 @@
 //! 4. **Podpis** Authenticode přes týž handle (`WinVerifyTrust`, bez UI,
 //!    bez kontroly odvolání — hlavní kontrolou je otisk a síťové dotazy
 //!    by uměly viset) a jméno vydavatele.
-//! 5. **Pojistka znovu**, těsně před spuštěním: stažení a zápis trvají
-//!    sekundy až minuty a složku rozbalování mezitím mohl kdokoli
-//!    založit (stejně jako mohl ovladač nainstalovat jiný program).
-//! 6. **Spuštění** `ShellExecuteExW("runas")` plnou cestou, s oknem
-//!    instalátoru jako vlastníkem — jediná výzva UAC.
-//! 7. **Čekání** na pracovním vlákně (okno se dál překresluje).
-//! 8. **Ověření.** Kód návratu nic nedokazuje — 0 z MSI ani 3010 (vlastní
+//! 5. **Běžící KeyPad pryč — jen u aktualizace.** KeyPad drží sběrnici
+//!    otevřenou (a zapnutý pad na ní); MSI by pak odebrání starého
+//!    zařízení odložilo na restart, nebo by pad zmizel uprostřed hry.
+//!    Proto se nainstalovaný KeyPad před aktualizací zavře stejně jako
+//!    před aktualizací aplikace (událost → WM_CLOSE → natvrdo,
+//!    `proc::close_app`) — v každém režimu, i v `/vigembus`, který
+//!    spouští sama aplikace. Kdo ho zavřel, spustí ho potom znovu
+//!    ([`Ran::closed_app`]). Když zavřít nejde, aktualizace se nespustí.
+//!    U čisté instalace sběrnice není, takže ji nikdo držet nemůže.
+//! 6. **Pojistka znovu**, těsně před spuštěním: stažení a zápis trvají
+//!    sekundy až minuty a složku rozbalování mezitím mohl kdokoli založit
+//!    (stejně jako mohl ovladač změnit jiný program).
+//! 7. **Spuštění** `ShellExecuteExW("runas")` plnou cestou, s oknem
+//!    instalátoru jako vlastníkem — výzva UAC.
+//! 8. **Čekání** na pracovním vlákně (okno se dál překresluje).
+//! 9. **Ověření.** Kód návratu nic nedokazuje — 0 z MSI ani 3010 (vlastní
 //!    akce, které ovladač instalují, mají chyby ignorovat). Po KAŽDÉM
-//!    kódu se stav ovladače čte znovu (u 0 a 3010 se na rozhraní sběrnice
-//!    čeká až 15 s) a výsledek říká jen to, co se ověřilo.
-//! 9. **Úklid.** Nikdy se nic nezkouší znovu samo, nikdy se ViGEmBus
-//!    neaktualizuje, neopravuje ani neodinstaluje.
+//!    kódu se stav i verze ovladače čtou znovu a výsledek říká jen to, co
+//!    se ověřilo ([`settle`]). Instalátor běží vždy jen JEDNOU. Vydání
+//!    1.22.0 sice píše, že aktualizace na místě nemusí fungovat (upgrade
+//!    starou verzi odebere a novou nepřidá), jenže po takovém upgradu
+//!    zůstává záznam nové verze v Aplikacích a co MSI udělá, když ho
+//!    spustíme nad už zapsaným ProductCode (údržba / oprava), jsme
+//!    neověřili. Takový stav (ovladač bez zařízení) proto dostane radu
+//!    odebrat „ViGEm Bus Driver" v Aplikacích a spustit KeyPadSetup
+//!    znovu — nikdy „restartuj, pak naběhne": kořenové zařízení sběrnice
+//!    zakládá instalátor a restart ho nevytvoří.
+//! 10. **Úklid.** Ovladač se nikdy neopravuje ani neodinstalovává.
+//!
+//! Uživatel vidí krátkou větu; kódy (MSI, WinVerifyTrust, HTTP) a přesné
+//! chyby jdou do `KeyPadSetup.log` (a v headless režimu do konzole) —
+//! [`Outcome::detail`].
 //!
 //! **Zbytkové riziko, vědomě přijaté** (zámek chrání jen soubor, ne jeho
 //! složku): čerstvá složka `%TEMP%\keypad-vigembus-…` má zděděná
@@ -65,7 +88,7 @@ use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use updater::vigembus::{self, BusState, DownloadError};
+use updater::vigembus::{self, Advice, BusState, DownloadError, Source};
 use windows::core::{w, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, LocalFree, ERROR_CANCELLED, HANDLE, HLOCAL, HWND, WAIT_OBJECT_0,
@@ -91,7 +114,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-use crate::Report;
+use crate::{log, proc, Report};
 
 /// Konstanty z `Win32_Storage_FileSystem` — kvůli dvěma číslům se ta
 /// obří feature netahá (stejně jako WM_MOUSELEAVE v gui.rs).
@@ -105,8 +128,9 @@ const TEMP_PREFIX: &str = "keypad-vigembus-";
 /// déle visí jen, když ho něco drží (dotaz jiné instalace, antivir).
 /// Pak se přestane čekat, nechá se doběhnout a uživatel se to dozví.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-/// Jak dlouho po úspěšném konci instalátoru čekat, než se objeví
-/// rozhraní sběrnice (ovladač se rozbíhá chvíli po skončení MSI).
+/// Jak dlouho po úspěšném konci instalátoru čekat, než ovladač naběhne
+/// (rozhraní sběrnice, u aktualizace i nová verze) — rozbíhá se chvíli
+/// po skončení MSI.
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const READY_POLL: Duration = Duration::from_millis(500);
 
@@ -123,91 +147,205 @@ const TRUSTED_OWNERS: [&str; 3] = [
 /// Jméno mutexu „instalace ovladače běží" (v relaci uživatele).
 const SINGLE_RUN_MUTEX: &str = "Local\\KeyPad.InstalaceViGEmBus";
 
-/// Jak instalace ovladače dopadla.
+/// Co se s ovladačem udělá.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Work {
+    /// Ovladač v systému úplně chybí.
+    Install,
+    /// Ovladač je, ale starší než poslední vydání
+    /// (`vigembus::needs_update`).
+    Update,
+}
+
+/// Proč se to nepovedlo — podle toho zpráva a co nabídnout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fail {
+    /// Instalátor nejde stáhnout z žádného zdroje (síť).
+    Download,
+    /// Stažený soubor (nebo soubor na disku) není ten oficiální, případně
+    /// neprošel podpis. Opakování by dopadlo stejně → ruční instalace.
+    NotOfficial,
+    /// Instalátor nejde uložit do `%TEMP%`.
+    Disk,
+    /// Windows instalátor nespustily (jinak než odmítnutou výzvou).
+    Launch,
+    /// Instalátor doběhl, ale ovladač v systému není → ruční instalace.
+    Setup,
+    /// Aktualizace neprošla; starší ovladač zůstal a dál běží.
+    Update,
+    /// Po aktualizaci po ovladači nezbyla ani stopa (ani záznam
+    /// v Aplikacích) — „Zkusit znovu" ho nainstaluje načisto (vlastní
+    /// výzvou UAC, na povel uživatele).
+    Removed,
+    /// Běžící KeyPad nejde před aktualizací zavřít (drží sběrnici);
+    /// instalátor ovladače se proto nespustil.
+    AppRunning,
+    /// Složka rozbalování nevyhověla pojistce. Po jejím smazání má smysl
+    /// zkusit znovu; ruční instalace NE — oficiální instalátor spuštěný
+    /// ručně by rozbaloval do téže složky.
+    Folder(PathBuf),
+    /// Ovladač už instaluje jiné okno KeyPadSetupu.
+    OtherWindow,
+}
+
+/// Jak instalace / aktualizace ovladače dopadla.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// Nainstalováno a rozhraní sběrnice je vidět.
     Installed,
-    /// Ovladač už běžel — nebylo co instalovat.
+    /// Aktualizováno: běží a verze je aktuální. `restart` = instalátor
+    /// chtěl restart (3010/1641) — u upgradu z 1.18–1.21 ho MSI chce
+    /// vždy (ForceReboot, potlačený `/norestart`): nová verze je zapsaná,
+    /// dokončí se po restartu. Uživatel to má vědět.
+    Updated { restart: bool },
+    /// Ovladač běží v aktuální verzi — nebylo co dělat.
     AlreadyReady,
-    /// Ovladač v systému je a poběží po restartu: instalátor skončil
-    /// kódem 3010/1641, nebo to říká stav zařízení.
+    /// Ovladač poběží po restartu: instalátor skončil kódem 3010/1641,
+    /// říká to stav zařízení, nebo aktualizace nedoběhla celá.
     RebootRequired,
-    /// Uživatel nepotvrdil výzvu UAC nebo instalaci zrušil.
-    Cancelled,
+    /// Uživatel nepotvrdil výzvu UAC nebo instalaci zrušil. `update` =
+    /// starší ovladač zůstal (jinak ovladač v systému není).
+    Cancelled { update: bool },
     /// Windows zrovna instalují něco jiného (1618).
     Busy,
-    /// Ovladač v systému je, ale neběží. `after_setup` = zjištěno až po
-    /// doběhnutí instalátoru (jinak se instalátor vůbec nespouštěl).
-    NotRunning {
-        advice: vigembus::Advice,
-        after_setup: bool,
-    },
+    /// Ovladač v systému je, ale neběží — rada, co s tím.
+    NotRunning(Advice),
     /// Instalátor běží déle než [`SETUP_TIMEOUT`] — nechává se doběhnout.
     /// Ruční instalace ani „zkusit znovu" tu nepomůžou (běží pořád
-    /// tentýž); cesta je restart a nové spuštění KeyPadSetupu.
+    /// tentýž); cesta je restart.
     TimedOut,
-    /// Nepovedlo se. `retry` = má smysl zkusit znovu (síť, disk);
-    /// jinak vede cesta přes ruční instalaci.
-    Failed { reason: String, retry: bool },
+    /// Nepovedlo se; `detail` jde do logu, ne do okna.
+    Failed { fail: Fail, detail: String },
+}
+
+fn failed(fail: Fail, detail: impl Into<String>) -> Outcome {
+    Outcome::Failed {
+        fail,
+        detail: detail.into(),
+    }
 }
 
 impl Outcome {
-    /// Ovladač běží.
+    /// Ovladač běží (v aktuální verzi).
     pub fn is_ready(&self) -> bool {
-        matches!(self, Outcome::Installed | Outcome::AlreadyReady)
+        matches!(
+            self,
+            Outcome::Installed | Outcome::Updated { .. } | Outcome::AlreadyReady
+        )
+    }
+
+    /// Musí to uživatel vědět, než se okno samo zavře (tichý režim)?
+    /// Vše, co neběží — a aktualizace, která chce restart.
+    pub fn needs_attention(&self) -> bool {
+        !self.is_ready() || matches!(self, Outcome::Updated { restart: true })
     }
 
     /// Má smysl nabídnout „Zkusit znovu ovladač"?
     pub fn retry_makes_sense(&self) -> bool {
         matches!(
             self,
-            Outcome::Cancelled | Outcome::Busy | Outcome::Failed { retry: true, .. }
+            Outcome::Cancelled { .. }
+                | Outcome::Busy
+                | Outcome::Failed {
+                    fail: Fail::Download
+                        | Fail::Disk
+                        | Fail::Launch
+                        | Fail::Removed
+                        | Fail::AppRunning
+                        | Fail::Folder(_)
+                        | Fail::OtherWindow,
+                    ..
+                }
         )
     }
 
-    /// Česká věta pro okno i konzoli.
-    pub fn message(&self) -> String {
+    /// Vede cesta přes ruční instalaci ze stránky vydání? (Okno k ní
+    /// nabídne tlačítko, konzole adresu.)
+    pub fn manual_install(&self) -> bool {
         match self {
-            Outcome::Installed => "Ovladač ViGEmBus je nainstalovaný a běží.".into(),
-            Outcome::AlreadyReady => {
-                "Ovladač ViGEmBus už v systému běží — nebylo co instalovat.".into()
-            }
-            Outcome::RebootRequired => {
-                "Ovladač ViGEmBus je nainstalovaný; Windows ho spustí po restartu počítače.".into()
-            }
-            Outcome::Cancelled => {
-                "Ovladač ViGEmBus se nenainstaloval — výzva Windows nebyla potvrzena.".into()
-            }
-            Outcome::Busy => "Ovladač ViGEmBus se nenainstaloval — Windows zrovna instalují \
-                              něco jiného. Zkus to za chvíli znovu."
-                .into(),
-            Outcome::NotRunning {
-                advice,
-                after_setup: true,
-            } => format!("Instalátor skončil, ale ovladač neběží. {}", advice.text()),
-            Outcome::NotRunning { advice, .. } => advice.text(),
-            Outcome::TimedOut => format!(
-                "Instalátor ViGEmBus běží přes {} minut — nechám ho doběhnout. Pak restartuj \
-                 počítač a spusť KeyPadSetup znovu.",
-                SETUP_TIMEOUT.as_secs() / 60
-            ),
             Outcome::Failed {
-                reason,
-                retry: true,
-            } => format!("Ovladač ViGEmBus se nepodařilo nainstalovat: {reason}."),
-            Outcome::Failed { reason, .. } => format!(
-                "Ovladač ViGEmBus se nepodařilo nainstalovat: {reason}.\nRuční instalace: {}",
-                vigembus::RELEASES_URL
-            ),
+                fail: Fail::NotOfficial | Fail::Setup,
+                ..
+            } => true,
+            Outcome::NotRunning(a) => a.suggests_manual_install(),
+            _ => false,
         }
     }
 
-    /// Kód návratu režimu `/vigembus` — podle něj aplikace pozná, jestli
-    /// má zkusit gamepad připojit znovu: 0 = ovladač běží, 3010 = je
-    /// v systému a poběží po restartu (stejný kód jako u MSI), 1 = neběží.
-    /// Protože se výsledek skládá z ověřeného stavu (ne z kódu
-    /// instalátoru), je 0 jen tam, kde rozhraní sběrnice opravdu je.
+    /// Krátká česká věta pro okno i konzoli — bez kódů; ty jsou
+    /// v [`Outcome::detail`].
+    pub fn message(&self) -> String {
+        match self {
+            Outcome::Installed => "Ovladač ViGEmBus je nainstalovaný.".into(),
+            Outcome::Updated { restart: false } => "Ovladač ViGEmBus je aktualizovaný.".into(),
+            Outcome::Updated { restart: true } => {
+                "Ovladač ViGEmBus je aktualizovaný — dokončí se po restartu počítače.".into()
+            }
+            Outcome::AlreadyReady => "Ovladač ViGEmBus je v pořádku.".into(),
+            Outcome::RebootRequired => Advice::Restart.text(),
+            Outcome::Cancelled { update: false } => {
+                "Ovladač ViGEmBus se nenainstaloval — výzva Windows nebyla potvrzena.".into()
+            }
+            Outcome::Cancelled { update: true } => {
+                "Ovladač ViGEmBus se neaktualizoval — výzva Windows nebyla potvrzena.".into()
+            }
+            Outcome::Busy => {
+                "Windows zrovna instalují něco jiného — ovladač ViGEmBus zkus za chvíli.".into()
+            }
+            Outcome::NotRunning(advice) => advice.text(),
+            Outcome::TimedOut => {
+                "Instalátor ViGEmBus pořád běží — nech ho doběhnout a restartuj počítač.".into()
+            }
+            Outcome::Failed { fail, .. } => match fail {
+                Fail::Download => {
+                    "Instalátor ViGEmBus se nepodařilo stáhnout — zkontroluj připojení a zkus \
+                     to znovu."
+                        .into()
+                }
+                Fail::NotOfficial => {
+                    "Stažený instalátor ViGEmBus neprošel kontrolou, proto se nespustil.".into()
+                }
+                Fail::Disk => "Instalátor ViGEmBus nejde uložit — zkus to znovu.".into(),
+                Fail::Launch => "Instalátor ViGEmBus nejde spustit — zkus to znovu.".into(),
+                Fail::Setup => "Ovladač ViGEmBus se nepodařilo nainstalovat.".into(),
+                Fail::Update => {
+                    "Ovladač ViGEmBus se nepodařilo aktualizovat — zůstává starší verze.".into()
+                }
+                Fail::Removed => {
+                    "Aktualizace starý ovladač ViGEmBus odebrala a nový nepřidala — zkus to \
+                     znovu."
+                        .into()
+                }
+                Fail::AppRunning => {
+                    "Ovladač ViGEmBus se neaktualizoval — běžící KeyPad nejde zavřít. Zavři ho \
+                     a zkus to znovu."
+                        .into()
+                }
+                // Tady uživatel jednat musí — cesta ke složce do zprávy patří.
+                Fail::Folder(p) => format!(
+                    "Instalaci ovladače ViGEmBus brání složka {} — smaž ji a zkus to znovu.",
+                    p.display()
+                ),
+                Fail::OtherWindow => {
+                    "Ovladač ViGEmBus už instaluje jiné okno — počkej, až doběhne.".into()
+                }
+            },
+        }
+    }
+
+    /// Technické podrobnosti pro log a konzoli (prázdné, když nejsou).
+    pub fn detail(&self) -> &str {
+        match self {
+            Outcome::Failed { detail, .. } => detail,
+            _ => "",
+        }
+    }
+
+    /// Kód návratu — 0 = ovladač běží, 3010 = je v systému a poběží po
+    /// restartu (stejný kód jako u MSI), 1 = jinak. Protože se výsledek
+    /// skládá z ověřeného stavu (ne z kódu instalátoru), je 0 jen tam,
+    /// kde rozhraní sběrnice opravdu je. (Konečný kód procesu skládá
+    /// `main::driver_exit_code` ještě se skutečným stavem na konci.)
     pub fn exit_code(&self) -> i32 {
         match self {
             o if o.is_ready() => 0,
@@ -217,187 +355,327 @@ impl Outcome {
     }
 }
 
-/// Stav ovladače → výsledek, když se instalovat nebude; `None` =
-/// ovladač úplně chybí a instalovat se smí (pojistka z kroku 1 a 5).
-pub fn precheck(state: BusState) -> Option<Outcome> {
+/// Skutečný stav ovladače a jestli je starší než poslední vydání.
+pub fn current() -> (BusState, bool) {
+    (vigembus::state(), vigembus::needs_update())
+}
+
+/// Pojistka (krok 1 a 5): co se s ovladačem smí udělat, nebo výsledek,
+/// když se instalátor spouštět nebude.
+///
+/// Ovladač, který čeká na restart, dostane radu „restartuj", i když je
+/// starší — instalátor nad nedokončenou změnou (typicky předchozí
+/// aktualizace) nic nespraví a jen by přidal další restart. Neznámou
+/// verzi (`outdated` = false) KeyPad nikdy nepřeinstalovává.
+pub fn decide(state: BusState, outdated: bool) -> Result<Work, Outcome> {
     match state {
-        BusState::NotInstalled => None,
-        BusState::Ready => Some(Outcome::AlreadyReady),
-        s @ BusState::InstalledNotRunning { .. } => Some(not_running(
-            s.advice().unwrap_or(vigembus::Advice::Restart),
-            false,
-            false,
-        )),
+        BusState::NotInstalled => Ok(Work::Install),
+        BusState::Ready if outdated => Ok(Work::Update),
+        BusState::Ready => Err(Outcome::AlreadyReady),
+        s @ BusState::InstalledNotRunning { .. } => {
+            let advice = s.advice().unwrap_or(Advice::Restart);
+            if outdated && advice != Advice::Restart {
+                Ok(Work::Update)
+            } else {
+                Err(not_running(advice, false))
+            }
+        }
     }
 }
 
 /// Ovladač je, ale neběží. Když pomůže restart (říká to instalátor
 /// kódem 3010/1641, nebo stav zařízení), je to [`Outcome::RebootRequired`]
 /// — aplikace podle kódu 3010 pozná, že nemá co zkoušet hned.
-fn not_running(advice: vigembus::Advice, after_setup: bool, setup_said_reboot: bool) -> Outcome {
-    if setup_said_reboot || advice == vigembus::Advice::Restart {
+fn not_running(advice: Advice, setup_said_reboot: bool) -> Outcome {
+    if setup_said_reboot || advice == Advice::Restart {
         Outcome::RebootRequired
     } else {
-        Outcome::NotRunning {
-            advice,
-            after_setup,
-        }
+        Outcome::NotRunning(advice)
     }
 }
 
-/// Čisté rozhodnutí po doběhnutí instalátoru: kód návratu `code`
-/// a stav ovladače `now`, přečtený ZNOVU až po něm.
+/// Čisté rozhodnutí po doběhnutí instalátoru: co se dělalo (`work`),
+/// kód návratu `code` a stav ovladače `now` + `outdated`, přečtené ZNOVU
+/// až po něm.
 ///
 /// Rozhoduje stav, ne kód (princip 8 — hlásit jen ověřené): kód 0 bez
 /// ovladače (vlastní akce MSI chyby ignorují) je selhání a 3010 u už
-/// běžícího ovladače je úspěch. Kód rozhoduje jen tam, kde ovladač
-/// v systému není: zrušená výzva a zaneprázdněný instalátor Windows
-/// mají vlastní radu (zkusit znovu), ostatní je selhání s ruční cestou.
-fn settle(code: u32, now: BusState) -> Outcome {
+/// běžícího aktuálního ovladače úspěch. Kód rozhoduje jen tam, kde se
+/// nic neověřilo: zrušená výzva a zaneprázdněný instalátor Windows mají
+/// vlastní radu (zkusit znovu), a „restartuj" smí říct jen instalátor,
+/// který doběhl (0 / 3010), nebo zařízení samo.
+fn settle(work: Work, code: u32, now: BusState, outdated: bool) -> Outcome {
     let exit = map_exit(code);
-    match now {
-        BusState::Ready => Outcome::Installed,
-        s @ BusState::InstalledNotRunning { .. } => not_running(
-            s.advice().unwrap_or(vigembus::Advice::Restart),
-            true,
-            exit == Exit::Reboot,
-        ),
-        BusState::NotInstalled => match exit {
-            Exit::Cancelled => Outcome::Cancelled,
-            Exit::Busy => Outcome::Busy,
-            Exit::Ok | Exit::Reboot | Exit::Other(_) => Outcome::Failed {
-                reason: format!(
-                    "instalátor ViGEmBus skončil kódem {code}, ale ovladač v systému není"
-                ),
-                retry: false,
+    let update = work == Work::Update;
+    // Běží a je aktuální (u čisté instalace stačí, že běží — starší
+    // verzi instalátor 1.22.0 dodat neumí).
+    if now == BusState::Ready && (!outdated || !update) {
+        return if update {
+            Outcome::Updated {
+                restart: exit == Exit::Reboot,
+            }
+        } else {
+            Outcome::Installed
+        };
+    }
+    match exit {
+        Exit::Cancelled => {
+            return Outcome::Cancelled {
+                update: update && now != BusState::NotInstalled,
+            }
+        }
+        Exit::Busy => return Outcome::Busy,
+        _ => {}
+    }
+    let finished = matches!(exit, Exit::Ok | Exit::Reboot);
+    match (work, now) {
+        // Ovladač je (záznam v Aplikacích / služba), ale jeho zařízení
+        // ne — typicky upgrade, který starou verzi odebral a novou
+        // nepřidal. Kořenové zařízení sběrnice zakládá instalátor, restart
+        // ho nevytvoří: „pak naběhne" by lhalo, i když MSI hlásilo 3010.
+        // Druhý běh sám nespouštíme (viz hlavička, krok 9).
+        (
+            _,
+            BusState::InstalledNotRunning {
+                device: None,
+                in_apps,
             },
-        },
+        ) => Outcome::NotRunning(Advice::Reinstall { in_apps }),
+        // Zařízení je a neběží. Doběhnutá aktualizace (0 / 3010) má novou
+        // verzi zapsanou a zařízení se rozběhne po restartu. Neprošlá
+        // (1603…) MSI vrátilo zpátky — zařízení je ve stejném stavu jako
+        // předtím a restart by nepomohl (vypnuté zůstane vypnuté): rada
+        // podle zařízení.
+        (Work::Update, s @ BusState::InstalledNotRunning { .. }) => {
+            not_running(s.advice().unwrap_or(Advice::Restart), finished)
+        }
+        (Work::Install, s @ BusState::InstalledNotRunning { .. }) => {
+            not_running(s.advice().unwrap_or(Advice::Restart), exit == Exit::Reboot)
+        }
+        // Pořád běží starší ovladač.
+        (Work::Update, BusState::Ready) if finished => Outcome::RebootRequired,
+        (Work::Update, BusState::Ready) => failed(
+            Fail::Update,
+            format!("instalátor ViGEmBus skončil kódem {code}, ovladač zůstal ve starší verzi"),
+        ),
+        // Po ovladači nezbylo nic ani po aktualizaci. Po doběhnutém MSI
+        // zůstává záznam nové verze a po neprošlém MSI (návrat) záznam
+        // staré, takže sem se nejspíš nedojde — kdyby přece, nový běh
+        // spustí až uživatel („Zkusit znovu" = čistá instalace).
+        (Work::Update, BusState::NotInstalled) => failed(
+            Fail::Removed,
+            format!(
+                "instalátor ViGEmBus (aktualizace) skončil kódem {code} a ovladač v systému není"
+            ),
+        ),
+        (Work::Install, _) => failed(
+            Fail::Setup,
+            format!("instalátor ViGEmBus skončil kódem {code}, ale ovladač v systému není"),
+        ),
     }
 }
 
-/// Nainstaluje ViGEmBus (celý postup z hlavičky modulu). `step` = index
-/// kroku „Ovladač ViGEmBus" v okně.
-pub fn install(rep: &mut dyn Report, step: usize) -> Outcome {
-    rep.step(step, "kontroluji, že ovladač v systému opravdu chybí…");
+/// Výsledek kroku ovladače.
+#[derive(Debug)]
+pub struct Ran {
+    pub outcome: Outcome,
+    /// Kvůli aktualizaci se zavíral běžící nainstalovaný KeyPad (krok 5).
+    /// Volající, který KeyPad na konci sám nespouští (`/vigembus`,
+    /// „Zkusit znovu ovladač"), ho podle toho spustí znovu.
+    pub closed_app: bool,
+}
+
+/// Musí se před spuštěním instalátoru ViGEmBus zavřít běžící KeyPad?
+/// Jen u aktualizace — u čisté instalace sběrnice není a držet ji nejde.
+fn closes_app(work: Work) -> bool {
+    work == Work::Update
+}
+
+/// Nainstaluje nebo aktualizuje ViGEmBus (celý postup z hlavičky
+/// modulu). `step` = index kroku ovladače v okně. Průběh i výsledek
+/// s podrobnostmi jde do logu.
+pub fn install(rep: &mut dyn Report, step: usize) -> Ran {
+    let mut closed_app = false;
+    let o = run(rep, step, &mut closed_app);
+    log::line(&format!(
+        "ovladač: {:?} → {} {}",
+        o,
+        o.message(),
+        o.detail()
+    ));
+    Ran {
+        outcome: o,
+        closed_app,
+    }
+}
+
+/// Zavře nainstalovaný KeyPad před aktualizací ovladače (krok 5).
+/// `closed` = opravdu běžel a skončil.
+fn close_app_for_update(rep: &mut dyn Report, closed: &mut bool) -> Result<(), Outcome> {
+    let app = updater::install_dir().join(updater::APP_EXE);
+    match proc::close_app(&app, updater::QUIT_EVENT_NAME, &mut |s| rep.status(s)) {
+        Ok(proc::Closed::NotRunning) => Ok(()),
+        Ok(how) => {
+            *closed = true;
+            log::line(&format!(
+                "ovladač: KeyPad zavřen před aktualizací ({how:?})"
+            ));
+            Ok(())
+        }
+        Err(e) => Err(failed(Fail::AppRunning, e)),
+    }
+}
+
+fn run(rep: &mut dyn Report, step: usize, closed_app: &mut bool) -> Outcome {
+    rep.step(step, "kontroluji ovladač…");
     rep.progress(None);
     // Jen jedna instalace ovladače naráz (dvakrát kliknuté tlačítko
     // v aplikaci, dvě okna). Druhá by jinak prošla pojistkou dřív, než
     // první něco zapsala, a skončila by až u Windows (1618) nebo
     // u složky rozbalování, kterou mezitím založila ta první.
     let Some(_single) = SingleRun::acquire(SINGLE_RUN_MUTEX) else {
-        return Outcome::Failed {
-            reason: "ovladač už instaluje jiné okno KeyPadSetupu — počkej, až doběhne".into(),
-            retry: true,
-        };
+        return failed(
+            Fail::OtherWindow,
+            format!("mutex {SINGLE_RUN_MUTEX} drží jiný proces"),
+        );
     };
     remove_leftovers();
 
     // ── 1. Pojistka ── (už tady, ať se zbytečně nestahuje)
-    if let Some(o) = precheck(vigembus::state()) {
+    let (state, outdated) = current();
+    log::line(&format!(
+        "ovladač: stav {state:?}, verze {:?}, poslední {:?}",
+        vigembus::driver_version(),
+        vigembus::DRIVER_VERSION
+    ));
+    let work = match decide(state, outdated) {
+        Ok(w) => w,
+        Err(o) => return o,
+    };
+    if let Err(o) = check_extraction_dir() {
         return o;
-    }
-    if let Err(reason) = check_extraction_dir() {
-        return extraction_refused(reason);
     }
 
     // ── 2. Stažení ──
-    rep.status(&format!(
-        "stahuji oficiální instalátor ViGEmBus {} z GitHubu…",
-        vigembus::VERSION
-    ));
+    rep.status(match work {
+        Work::Install => "stahuji instalátor ViGEmBus…",
+        Work::Update => "stahuji aktualizaci ViGEmBus…",
+    });
     let mut last = 0usize;
-    let data = match vigembus::download_verified(|n| {
+    let mut from = Source::Official;
+    let fetched = vigembus::fetch_setup(|src, n| {
+        if src != from {
+            from = src;
+            last = 0;
+            rep.status("oficiální adresa nejde — stahuji ze zálohy…");
+        }
         if n >= last + 256 * 1024 {
             last = n;
             rep.download("ViGEmBus", n);
         }
-    }) {
-        Ok(d) => d,
-        Err(e @ DownloadError::Network(_)) => {
-            return Outcome::Failed {
-                reason: e.to_string(),
-                retry: true,
-            }
+    });
+    let data = match fetched {
+        Ok((d, src)) => {
+            log::line(&format!("ovladač: instalátor stažen z {}", src.url()));
+            d
         }
-        Err(e) => {
-            return Outcome::Failed {
-                reason: e.to_string(),
-                retry: false,
-            }
-        }
+        Err(e @ DownloadError::Network(_)) => return failed(Fail::Download, e.to_string()),
+        Err(e) => return failed(Fail::NotOfficial, e.to_string()),
     };
 
-    // ── 3. Zápis a zámek ──
-    rep.status("ukládám a zamykám instalátor, ověřuji jeho otisk…");
+    // ── 3. Zápis a zámek, 4. podpis ──
+    rep.status("ověřuji instalátor…");
     let staged = match Staged::create(&data) {
         Ok(s) => s,
-        Err(e) => return e,
+        Err(o) => return o,
     };
-
-    // ── 4. Podpis ──
-    rep.status("ověřuji podpis vydavatele…");
-    if let Err(reason) = staged.verify_signature() {
-        return Outcome::Failed {
-            reason,
-            retry: false,
-        };
+    drop(data);
+    if let Err(e) = staged.verify_signature() {
+        return failed(Fail::NotOfficial, e);
     }
 
-    // ── 5. Pojistka znovu ──
+    // ── 5.–9. Běžící KeyPad pryč, pojistka znovu, spuštění, čekání,
+    // ověření ──
+    let ran = match run_setup(rep, &staged, closed_app) {
+        Ok(r) => r,
+        Err(o) => return o,
+    };
+    let (now, outdated) = verify_after(rep, ran);
+    settle(ran.0, ran.1, now, outdated)
+}
+
+/// Pojistka znovu, zavření KeyPadu (jen aktualizace), výzva UAC
+/// a čekání na instalátor. Vrací, co se dělalo, a kód návratu.
+fn run_setup(
+    rep: &mut dyn Report,
+    staged: &Staged,
+    closed_app: &mut bool,
+) -> Result<(Work, u32), Outcome> {
     // Mezi první kontrolou a tímhle místem je stažení (sekundy až
     // minuty) — dost času na to, aby složku rozbalování založil běžný
-    // uživatel nebo ovladač nainstaloval jiný program. Zbývající okno
-    // (výzva UAC čeká na uživatele) viz „Zbytkové riziko" v hlavičce.
-    rep.status("naposledy kontroluji systém před spuštěním…");
-    if let Some(o) = precheck(vigembus::state()) {
-        return o;
+    // uživatel nebo ovladač změnil jiný program. Zbývající okno (výzva
+    // UAC čeká na uživatele) viz „Zbytkové riziko" v hlavičce.
+    rep.status("kontroluji systém…");
+    let (state, outdated) = current();
+    let work = decide(state, outdated)?;
+    // Až tady — po stažení a ověření (když selžou, KeyPad běží dál)
+    // a podle stavu přečteného těsně předtím, co se opravdu spustí.
+    if closes_app(work) {
+        rep.status("zavírám KeyPad (drží ovladač)…");
+        close_app_for_update(rep, closed_app)?;
     }
-    if let Err(reason) = check_extraction_dir() {
-        return extraction_refused(reason);
-    }
+    check_extraction_dir()?;
 
-    // ── 6. Spuštění ──
-    rep.status("čekám na povolení správce — potvrď výzvu Windows…");
+    rep.status("potvrď výzvu Windows…");
     let child = match run_elevated(rep.owner(), &staged.path, &staged.dir) {
         Ok(c) => c,
-        Err(Run::Cancelled) => return Outcome::Cancelled,
-        Err(Run::Failed(reason)) => {
-            return Outcome::Failed {
-                reason,
-                retry: true,
-            }
+        Err(Run::Cancelled) => {
+            log::line("ovladač: výzva UAC nebyla potvrzena");
+            return Err(Outcome::Cancelled {
+                update: work == Work::Update,
+            });
         }
+        Err(Run::Failed(reason)) => return Err(failed(Fail::Launch, reason)),
     };
 
-    // ── 7. Čekání ──
-    rep.status("instaluji ovladač (trvá kolem 15 s)…");
+    rep.status(match work {
+        Work::Install => "instaluji ovladač…",
+        Work::Update => "aktualizuji ovladač…",
+    });
     let Some(code) = child.wait(SETUP_TIMEOUT) else {
         // Instalátor pořád běží — nechat ho doběhnout (zabít proces
         // s právy správce ani nejde a přerušené MSI je horší než pomalé).
         // Zámek se pustí, soubor zůstane, dokud instalátor nedoběhne.
-        return Outcome::TimedOut;
+        return Err(Outcome::TimedOut);
     };
-    drop(child);
-    drop(staged);
-
-    // ── 8. Ověření ──
-    // U „úspěšných" kódů se ovladači dá chvíle na rozběhnutí; u ostatních
-    // stačí jedno čtení (MSI skončilo chybou, ovladač se nerozbíhá).
-    if matches!(map_exit(code), Exit::Ok | Exit::Reboot) {
-        rep.status("ověřuji, že ovladač běží…");
-        wait_ready(READY_TIMEOUT);
-    }
-    settle(code, vigembus::state())
+    log::line(&format!(
+        "ovladač: instalátor ViGEmBus ({work:?}) skončil kódem {code}"
+    ));
+    Ok((work, code))
 }
 
-/// Složka rozbalování nevyhověla pojistce. „Zkusit znovu" má smysl (po
-/// smazání složky projde) a ruční instalace NE — oficiální instalátor
-/// spuštěný ručně by rozbaloval do téže složky.
-fn extraction_refused(reason: String) -> Outcome {
-    Outcome::Failed {
-        reason,
-        retry: true,
+/// Po instalátoru: u „úspěšných" kódů se ovladači dá chvíle na
+/// rozběhnutí (u aktualizace i na novou verzi); u ostatních stačí jedno
+/// čtení (MSI skončilo chybou, ovladač se nerozbíhá). Vrací znovu
+/// přečtený stav.
+fn verify_after(rep: &mut dyn Report, (work, code): (Work, u32)) -> (BusState, bool) {
+    if matches!(map_exit(code), Exit::Ok | Exit::Reboot) {
+        rep.status("ověřuji ovladač…");
+        let deadline = Instant::now() + READY_TIMEOUT;
+        while !(vigembus::interface_present()
+            && (work == Work::Install || !vigembus::needs_update()))
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(READY_POLL);
+        }
     }
+    let now = current();
+    log::line(&format!(
+        "ovladač: po instalátoru stav {:?}, verze {:?}",
+        now.0,
+        vigembus::driver_version()
+    ));
+    now
 }
 
 /// Pojmenovaný mutex „instalace ovladače běží" (v relaci uživatele).
@@ -455,20 +733,6 @@ fn map_exit(code: u32) -> Exit {
     }
 }
 
-/// Čeká, až se objeví rozhraní sběrnice.
-fn wait_ready(timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if vigembus::interface_present() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(READY_POLL);
-    }
-}
-
 // ── Pojistka: složka rozbalování ───────────────────────────────────
 
 /// `%ProgramData%` tak, jak ho vidí systém (ne proměnná prostředí,
@@ -517,8 +781,10 @@ fn owner_sid(path: &Path) -> Option<String> {
 }
 
 /// Smí se instalátor ViGEmBus spustit vzhledem ke složce, kam rozbaluje?
-fn check_extraction_dir() -> Result<(), String> {
-    let pd = program_data().ok_or("nejde zjistit složku ProgramData")?;
+fn check_extraction_dir() -> Result<(), Outcome> {
+    let Some(pd) = program_data() else {
+        return Err(failed(Fail::Launch, "nejde zjistit složku ProgramData"));
+    };
     let vendor = pd.join(vigembus::VENDOR_DIR);
     let version = pd.join(vigembus::EXTRACTION_DIR);
     let meta = std::fs::symlink_metadata(&vendor).ok();
@@ -534,9 +800,10 @@ fn check_extraction_dir() -> Result<(), String> {
         &version,
         std::fs::symlink_metadata(&version).is_ok(),
     )
+    .map_err(|(path, why)| failed(Fail::Folder(path), why))
 }
 
-/// Čisté rozhodnutí k [`check_extraction_dir`].
+/// Čisté rozhodnutí k [`check_extraction_dir`]: `Err((složka, proč))`.
 ///
 /// Proč vůbec (do okna se to nevejde, tak je to tady a v README):
 /// zavaděč Advanced Installer rozbaluje MSI do složky verze s právy
@@ -545,8 +812,8 @@ fn check_extraction_dir() -> Result<(), String> {
 /// může vyměnit nebo k nim podstrčit DLL, a ty pak běží s právy
 /// správce (klasické zvýšení práv). Složka výrobce patřící správci je
 /// v pořádku (jiný produkt Nefarius); patřící uživateli nebo vedoucí
-/// jinam (spojení, symbolický odkaz) ne. Zpráva proto říká jen co
-/// a co s tím — a vejde se do okna i s ostatními.
+/// jinam (spojení, symbolický odkaz) ne. Okno řekne jen kterou složku
+/// smazat; důvod jde do logu.
 fn extraction_verdict(
     vendor: &Path,
     vendor_exists: bool,
@@ -554,34 +821,33 @@ fn extraction_verdict(
     vendor_owner: Option<&str>,
     version: &Path,
     version_exists: bool,
-) -> Result<(), String> {
-    let refuse = "z bezpečnostních důvodů instalátor nespustím";
+) -> Result<(), (PathBuf, String)> {
     if version_exists {
-        return Err(format!(
-            "složka {} už existuje — {refuse}; smaž ji a zkus to znovu",
-            version.display()
+        return Err((
+            version.to_path_buf(),
+            "složka rozbalování už existuje (mohl ji předem založit kdokoli)".into(),
         ));
     }
     if !vendor_exists {
         return Ok(());
     }
     if vendor_reparse {
-        return Err(format!(
-            "složka {} je odkaz jinam — {refuse}; smaž ji a zkus to znovu",
-            vendor.display()
+        return Err((
+            vendor.to_path_buf(),
+            "složka výrobce je odkaz jinam (spojení / symbolický odkaz)".into(),
         ));
     }
     match vendor_owner {
         Some(o) if TRUSTED_OWNERS.contains(&o) => Ok(()),
-        _ => Err(format!(
-            "složku {} nezaložil správce — {refuse}; pokud ji neznáš, smaž ji a zkus to znovu",
-            vendor.display()
+        o => Err((
+            vendor.to_path_buf(),
+            format!("složku výrobce nezaložil správce (vlastník {o:?})"),
         )),
     }
 }
 
 /// Všechny výsledky, které instalace ovladače umí skutečně vrátit,
-/// s nejdelšími skutečnými důvody (cesty jako na běžném PC) — pro
+/// s nejdelšími skutečnými texty (cesty jako na běžném PC) — pro
 /// ladicí náhled nejdelší zprávy a test, že se vejde do okna. Texty
 /// jdou z týchž funkcí jako za běhu, takže delší hláška test shodí.
 #[cfg(any(test, debug_assertions))]
@@ -595,22 +861,34 @@ pub fn sample_outcomes() -> Vec<Outcome> {
     let user = Some("S-1-5-21-1111111111-2222222222-3333333333-1001");
     let mut out = vec![
         Outcome::Installed,
+        Outcome::Updated { restart: false },
+        Outcome::Updated { restart: true },
         Outcome::AlreadyReady,
         Outcome::RebootRequired,
-        Outcome::Cancelled,
+        Outcome::Cancelled { update: false },
+        Outcome::Cancelled { update: true },
         Outcome::Busy,
         Outcome::TimedOut,
-        Outcome::Failed {
-            reason: vigembus::verify(b"MZ").unwrap_err(),
-            retry: false,
-        },
+        failed(Fail::OtherWindow, ""),
     ];
+    for f in [
+        Fail::Download,
+        Fail::NotOfficial,
+        Fail::Disk,
+        Fail::Launch,
+        Fail::Setup,
+        Fail::Update,
+        Fail::Removed,
+        Fail::AppRunning,
+    ] {
+        out.push(failed(f, "podrobnosti jen do logu"));
+    }
     for refused in [
         extraction_verdict(&vendor, true, false, Some("S-1-5-18"), &version, true),
         extraction_verdict(&vendor, true, true, None, &version, false),
         extraction_verdict(&vendor, true, false, user, &version, false),
     ] {
-        out.extend(refused.err().map(extraction_refused));
+        out.extend(refused.err().map(|(p, why)| failed(Fail::Folder(p), why)));
     }
     let dev = |problem| {
         Some(DeviceStatus {
@@ -622,16 +900,47 @@ pub fn sample_outcomes() -> Vec<Outcome> {
     for in_apps in [true, false] {
         for device in [None, dev(Some(22)), dev(Some(48)), dev(Some(10)), dev(None)] {
             let s = BusState::InstalledNotRunning { device, in_apps };
-            out.extend(precheck(s));
-            for code in [0, 3010, 1602, 1603] {
-                out.push(settle(code, s));
+            for outdated in [false, true] {
+                out.extend(decide(s, outdated).err());
+                for work in [Work::Install, Work::Update] {
+                    for code in [0, 3010, 1602, 1603] {
+                        out.push(settle(work, code, s, outdated));
+                    }
+                }
             }
         }
     }
     for code in [0, 3010, 1602, 1618, 1603, u32::MAX] {
-        out.push(settle(code, BusState::NotInstalled));
+        for work in [Work::Install, Work::Update] {
+            for (now, outdated) in [(BusState::NotInstalled, false), (BusState::Ready, true)] {
+                out.push(settle(work, code, now, outdated));
+            }
+        }
     }
     out
+}
+
+/// Výsledek po instalátoru pro ladicí náhled obrazovek — přes skutečné
+/// [`settle`]. Ovladač má záznam v Aplikacích; `problem` = kód problému
+/// jeho zařízení (`None` = zařízení není).
+#[cfg(debug_assertions)]
+pub fn preview_settle(work: Work, code: u32, problem: Option<u32>, outdated: bool) -> Outcome {
+    let device = problem.map(|p| vigembus::DeviceStatus {
+        problem: Some(p),
+        need_restart: false,
+        started: false,
+    });
+    let now = BusState::InstalledNotRunning {
+        device,
+        in_apps: true,
+    };
+    settle(work, code, now, outdated)
+}
+
+/// Náhled: po aktualizaci po ovladači nezbylo nic.
+#[cfg(debug_assertions)]
+pub fn preview_removed() -> Outcome {
+    settle(Work::Update, 0, BusState::NotInstalled, false)
 }
 
 /// Ladicí sonda k testu podstrčených DLL (jen debug build, spouští ji
@@ -642,11 +951,12 @@ pub fn sample_outcomes() -> Vec<Outcome> {
 /// NIKDY nespouští; dočasná složka se po sobě uklidí.
 #[cfg(debug_assertions)]
 pub fn load_probe(setup: &Path) -> Result<String, String> {
+    let why = |o: Outcome| format!("{} ({})", o.message(), o.detail());
     let pd = program_data().ok_or("ProgramData nejde zjistit")?;
-    check_extraction_dir()?;
+    check_extraction_dir().map_err(why)?;
     let data = std::fs::read(setup).map_err(|e| format!("{}: {e}", setup.display()))?;
     vigembus::verify(&data)?;
-    let staged = Staged::create(&data).map_err(|o| o.message())?;
+    let staged = Staged::create(&data).map_err(why)?;
     staged.verify_signature()?;
     Ok(format!(
         "ProgramData {} v pořádku, podpis „{}“ ověřen",
@@ -667,9 +977,11 @@ struct Staged {
 
 impl Staged {
     fn create(data: &[u8]) -> Result<Staged, Outcome> {
-        let fail = |reason: String, retry: bool| Outcome::Failed { reason, retry };
+        // Disk a zámek = má smysl zkusit znovu; změněný soubor = není
+        // oficiální (opakování by nepomohlo).
+        let disk = |what: String| failed(Fail::Disk, what);
         let dir = fresh_dir(&std::env::temp_dir())
-            .map_err(|e| fail(format!("nejde založit dočasnou složku ({e})"), true))?;
+            .map_err(|e| disk(format!("nejde založit dočasnou složku ({e})")))?;
         let mut st = Staged {
             path: dir.join(vigembus::SETUP_FILE),
             dir,
@@ -683,10 +995,10 @@ impl Staged {
                 .create_new(true)
                 .share_mode(0)
                 .open(&st.path)
-                .map_err(|e| fail(format!("nejde uložit instalátor ({e})"), true))?;
+                .map_err(|e| disk(format!("nejde uložit instalátor ({e})")))?;
             f.write_all(data)
                 .and_then(|_| f.flush())
-                .map_err(|e| fail(format!("nejde uložit instalátor ({e})"), true))?;
+                .map_err(|e| disk(format!("nejde uložit instalátor ({e})")))?;
         }
         // Znovu jen pro čtení; ostatní smí jen číst (spuštění je čtení),
         // zapsat, přejmenovat ani smazat nemůže nikdo, dokud handle žije.
@@ -694,14 +1006,18 @@ impl Staged {
             .read(true)
             .share_mode(FILE_SHARE_READ)
             .open(&st.path)
-            .map_err(|e| fail(format!("nejde zamknout instalátor ({e})"), true))?;
-        let digest = updater::sha256::sha256_reader(&mut f).map_err(|e| fail(e, true))?;
+            .map_err(|e| disk(format!("nejde zamknout instalátor ({e})")))?;
+        let digest = updater::sha256::sha256_reader(&mut f).map_err(disk)?;
         // Mezi zavřením zápisu a zamčením je okamžik, kdy soubor mohl
         // někdo vyměnit — druhý otisk z uzamčeného handlu to pozná.
-        vigembus::verify_digest(&digest)
-            .map_err(|e| fail(format!("soubor se na disku po uložení změnil — {e}"), false))?;
+        vigembus::verify_digest(&digest).map_err(|e| {
+            failed(
+                Fail::NotOfficial,
+                format!("soubor se na disku po uložení změnil — {e}"),
+            )
+        })?;
         f.seek(SeekFrom::Start(0))
-            .map_err(|e| fail(format!("čtení instalátoru ({e})"), true))?;
+            .map_err(|e| disk(format!("čtení instalátoru ({e})")))?;
         st.lock = Some(f);
         Ok(st)
     }
@@ -940,38 +1256,66 @@ mod tests {
     #[test]
     fn zpravy_a_kody_vysledku() {
         assert_eq!(Outcome::Installed.exit_code(), 0);
+        for restart in [false, true] {
+            assert_eq!(Outcome::Updated { restart }.exit_code(), 0);
+        }
+        // Aktualizace, která chce restart: ovladač běží, ale uživatel to
+        // má vědět (okno se samo nezavře).
+        let r = Outcome::Updated { restart: true };
+        assert!(r.is_ready() && r.needs_attention());
+        assert!(r.message().contains("po restartu"));
+        assert!(!Outcome::Updated { restart: false }.needs_attention());
+        assert!(!Outcome::Installed.needs_attention());
+        assert!(Outcome::RebootRequired.needs_attention());
         assert_eq!(Outcome::AlreadyReady.exit_code(), 0);
         assert_eq!(Outcome::RebootRequired.exit_code(), 3010);
-        assert_eq!(Outcome::Cancelled.exit_code(), 1);
-        assert!(Outcome::Cancelled.retry_makes_sense());
-        assert!(Outcome::Busy.retry_makes_sense());
-        let net = Outcome::Failed {
-            reason: "síť".into(),
-            retry: true,
-        };
-        assert!(net.retry_makes_sense());
-        assert!(!net.message().contains(vigembus::RELEASES_URL));
-        let bad = Outcome::Failed {
-            reason: "otisk nesedí".into(),
-            retry: false,
-        };
-        assert!(!bad.retry_makes_sense());
-        assert!(bad.message().contains(vigembus::RELEASES_URL));
-        let nr = Outcome::NotRunning {
-            advice: vigembus::Advice::Blocked(48),
-            after_setup: true,
-        };
-        assert!(nr
+        assert!(Outcome::RebootRequired
             .message()
-            .starts_with("Instalátor skončil, ale ovladač neběží."));
-        assert!(nr.message().contains("kód 48"));
+            .contains("Restartuj počítač"));
+        let c = Outcome::Cancelled { update: false };
+        assert_eq!(c.exit_code(), 1);
+        assert!(c.retry_makes_sense());
+        assert!(Outcome::Cancelled { update: true }
+            .message()
+            .contains("neaktualizoval"));
+        assert!(Outcome::Busy.retry_makes_sense());
+        let net = failed(Fail::Download, "github.com: timeout");
+        assert!(net.retry_makes_sense() && !net.manual_install());
+        let bad = failed(Fail::NotOfficial, "otisk nesedí (89220A78…)");
+        assert!(!bad.retry_makes_sense() && bad.manual_install());
+        // Podrobnosti do logu, ne do okna.
+        assert!(!bad.message().contains("89220A78"));
+        assert_eq!(bad.detail(), "otisk nesedí (89220A78…)");
+        let nr = Outcome::NotRunning(Advice::Blocked(48));
+        assert_eq!(nr.message(), Advice::Blocked(48).text());
         assert_eq!(nr.exit_code(), 1);
-        // Instalátor pořád běží: restart a znovu, ne ruční instalace.
+        // Neprošlá aktualizace: starší ovladač zůstal — nic ručně, nic znovu.
+        let u = failed(Fail::Update, "kód 1603");
+        assert!(!u.retry_makes_sense() && !u.manual_install());
+        assert!(u.message().contains("starší verze"));
+        // Instalátor pořád běží: restart, ne ruční instalace ani znovu.
         let t = Outcome::TimedOut;
         assert_eq!(t.exit_code(), 1);
-        assert!(!t.retry_makes_sense());
+        assert!(!t.retry_makes_sense() && !t.manual_install());
         assert!(t.message().contains("restartuj počítač"));
-        assert!(!t.message().contains(vigembus::RELEASES_URL));
+    }
+
+    /// Žádná zpráva pro uživatele nenese kód ani otisk — ty jsou v logu.
+    /// Výjimky jsou jen tam, kde uživatel musí jednat: cesta ke složce,
+    /// kterou má smazat, a adresa ruční instalace v radě (tu sdílí
+    /// s aplikací; okno k ní dá i tlačítko).
+    #[test]
+    fn zpravy_bez_kodu() {
+        for o in sample_outcomes() {
+            let m = o.message();
+            for bad in ["kód", "0x", "3010", "1603", "SHA", "S-1-5", "podrobnosti"] {
+                assert!(!m.contains(bad), "{bad} v „{m}“");
+            }
+            if !matches!(o, Outcome::NotRunning(_)) {
+                assert!(!m.contains("http"), "{m}");
+            }
+            assert!(m.chars().count() < 170, "dlouhé: {m}");
+        }
     }
 
     fn dev(problem: Option<u32>, need_restart: bool) -> Option<vigembus::DeviceStatus> {
@@ -982,90 +1326,273 @@ mod tests {
         })
     }
 
-    /// Po instalátoru rozhoduje znovu přečtený stav, ne jeho kód: 0 jen
+    fn there(device: Option<vigembus::DeviceStatus>) -> BusState {
+        BusState::InstalledNotRunning {
+            device,
+            in_apps: true,
+        }
+    }
+
+    /// Kdy se instalátor ViGEmBus vůbec smí spustit.
+    #[test]
+    fn pojistka_co_se_smi() {
+        assert_eq!(decide(BusState::NotInstalled, false), Ok(Work::Install));
+        assert_eq!(decide(BusState::Ready, true), Ok(Work::Update));
+        // Běžící aktuální nebo neznámý ovladač se nikdy nepřeinstalovává.
+        assert_eq!(decide(BusState::Ready, false), Err(Outcome::AlreadyReady));
+        // Je, neběží, verze neznámá / aktuální → jen rada.
+        assert_eq!(
+            decide(there(dev(Some(22), false)), false),
+            Err(Outcome::NotRunning(Advice::EnableDevice))
+        );
+        assert_eq!(
+            decide(there(dev(None, true)), false),
+            Err(Outcome::RebootRequired)
+        );
+        // Je, neběží a je prokazatelně starší → aktualizace…
+        assert_eq!(decide(there(dev(Some(22), false)), true), Ok(Work::Update));
+        assert_eq!(decide(there(dev(Some(48), false)), true), Ok(Work::Update));
+        // …ale čeká-li na restart, nejdřív restart (žádný další běh nad
+        // nedokončenou změnou).
+        assert_eq!(
+            decide(there(dev(None, true)), true),
+            Err(Outcome::RebootRequired)
+        );
+        assert_eq!(
+            decide(there(dev(Some(14), false)), true),
+            Err(Outcome::RebootRequired)
+        );
+        assert_eq!(
+            decide(there(dev(None, true)), true)
+                .unwrap_err()
+                .exit_code(),
+            3010
+        );
+    }
+
+    /// Po čisté instalaci rozhoduje znovu přečtený stav, ne kód: 0 jen
     /// s běžícím ovladačem, 3010 jen s ovladačem, který v systému je,
     /// jinak selhání s ruční cestou (princip 8).
     #[test]
-    fn po_instalatoru_rozhoduje_stav_ne_kod() {
-        let none = BusState::NotInstalled;
-        let there = |device, in_apps| BusState::InstalledNotRunning { device, in_apps };
-        // Běží → nainstalováno, ať instalátor vrátil cokoli (i 3010).
+    fn po_instalaci_rozhoduje_stav_ne_kod() {
+        let fin = |code, now| settle(Work::Install, code, now, false);
         for code in [0, 3010, 1641, 1603, 1602] {
-            assert_eq!(settle(code, BusState::Ready), Outcome::Installed);
-            assert_eq!(settle(code, BusState::Ready).exit_code(), 0);
+            assert_eq!(fin(code, BusState::Ready), Outcome::Installed);
         }
-        // Kód 0 nebo 3010, ale ovladač v systému není → selhání
-        // s kódem a ruční instalací, žádné „nainstalováno".
         for code in [0, 3010, 1641, 1603] {
-            let o = settle(code, none);
-            assert_eq!(o.exit_code(), 1, "{code}");
-            assert!(!o.retry_makes_sense());
-            let m = o.message();
+            let o = fin(code, BusState::NotInstalled);
             assert!(
-                m.contains(&format!("skončil kódem {code}, ale ovladač v systému není")),
-                "{m}"
+                matches!(
+                    &o,
+                    Outcome::Failed {
+                        fail: Fail::Setup,
+                        ..
+                    }
+                ),
+                "{o:?}"
             );
-            assert!(m.contains(vigembus::RELEASES_URL));
+            assert!(o.detail().contains(&format!("kódem {code}")), "{o:?}");
+            assert!(!o.retry_makes_sense() && o.manual_install());
         }
-        // Zrušená výzva / zaneprázdněné Windows bez ovladače → zkusit znovu.
-        assert_eq!(settle(1602, none), Outcome::Cancelled);
-        assert_eq!(settle(1223, none), Outcome::Cancelled);
-        assert_eq!(settle(1618, none), Outcome::Busy);
-        // Je, neběží: 3010 = restart (kód 3010), jinak rada podle zařízení.
-        let blocked = there(dev(Some(48), false), true);
-        assert_eq!(settle(3010, blocked), Outcome::RebootRequired);
-        assert_eq!(settle(3010, blocked).exit_code(), 3010);
         assert_eq!(
-            settle(0, blocked),
-            Outcome::NotRunning {
-                advice: vigembus::Advice::Blocked(48),
-                after_setup: true
-            }
+            fin(1602, BusState::NotInstalled),
+            Outcome::Cancelled { update: false }
         );
-        // Zařízení samo chce restart → restart i po kódu 0.
         assert_eq!(
-            settle(0, there(dev(None, true), true)),
-            Outcome::RebootRequired
+            fin(1223, BusState::NotInstalled),
+            Outcome::Cancelled { update: false }
         );
-        // Bez zařízení a bez záznamu v Aplikacích: rada bez Aplikací.
-        let o = settle(0, there(None, false));
-        assert_eq!(o.exit_code(), 1);
-        assert!(!o.message().contains("Nastavení → Aplikace"));
+        assert_eq!(fin(1618, BusState::NotInstalled), Outcome::Busy);
+        // Je, neběží: 3010 = restart, jinak rada podle zařízení.
+        let blocked = there(dev(Some(48), false));
+        assert_eq!(fin(3010, blocked), Outcome::RebootRequired);
+        assert_eq!(fin(0, blocked), Outcome::NotRunning(Advice::Blocked(48)));
+        assert_eq!(fin(0, there(dev(None, true))), Outcome::RebootRequired);
+        let o = fin(
+            0,
+            BusState::InstalledNotRunning {
+                device: None,
+                in_apps: false,
+            },
+        );
+        assert!(o.manual_install() && o.exit_code() == 1, "{o:?}");
+        // Záznam v Aplikacích bez zařízení: ani s 3010 ne „pak naběhne" —
+        // kořenové zařízení sběrnice restart nevytvoří.
+        for code in [0, 3010] {
+            let o = fin(
+                code,
+                BusState::InstalledNotRunning {
+                    device: None,
+                    in_apps: true,
+                },
+            );
+            assert_eq!(o, Outcome::NotRunning(Advice::Reinstall { in_apps: true }));
+            assert_eq!(o.exit_code(), 1);
+        }
     }
 
+    /// Aktualizace: aktuální a běžící = hotovo; pořád starší a instalátor
+    /// doběhl = restart; MSI chyba = starší zůstal; odmítnutá výzva =
+    /// starší zůstal. Instalátor se nikdy nespouští podruhé sám.
     #[test]
-    fn pojistka_pred_instalaci() {
-        assert_eq!(precheck(BusState::NotInstalled), None);
-        assert_eq!(precheck(BusState::Ready), Some(Outcome::AlreadyReady));
-        let o = precheck(BusState::InstalledNotRunning {
-            device: dev(Some(22), false),
-            in_apps: true,
-        })
-        .unwrap();
-        assert_eq!(
-            o,
-            Outcome::NotRunning {
-                advice: vigembus::Advice::EnableDevice,
-                after_setup: false
+    fn po_aktualizaci() {
+        let up = |code, now, outdated| settle(Work::Update, code, now, outdated);
+        // Běží aktuální: hotovo; s 3010 (ForceReboot u upgradu) „dokončí
+        // se po restartu".
+        for (code, restart) in [(0, false), (3010, true), (1641, true), (1603, false)] {
+            assert_eq!(
+                up(code, BusState::Ready, false),
+                Outcome::Updated { restart }
+            );
+        }
+        // Pořád běží starší a instalátor doběhl → restartuj počítač.
+        assert_eq!(up(0, BusState::Ready, true), Outcome::RebootRequired);
+        assert_eq!(up(3010, BusState::Ready, true), Outcome::RebootRequired);
+        // Zařízení je a neběží, instalátor doběhl → nová verze po restartu.
+        for outdated in [false, true] {
+            for code in [0, 3010] {
+                assert_eq!(
+                    up(code, there(dev(Some(48), false)), outdated),
+                    Outcome::RebootRequired
+                );
             }
+        }
+        // MSI chyba a starší ovladač běží dál.
+        match up(1603, BusState::Ready, true) {
+            o @ Outcome::Failed {
+                fail: Fail::Update, ..
+            } => assert!(o.detail().contains("1603")),
+            o => panic!("{o:?}"),
+        }
+        // Odmítnutá výzva: starší zůstal. Kdyby ovladač mezitím zmizel,
+        // zpráva nesmí tvrdit, že zůstal.
+        assert_eq!(
+            up(1602, BusState::Ready, true),
+            Outcome::Cancelled { update: true }
         );
-        assert_eq!(o.message(), vigembus::Advice::EnableDevice.text());
-        // Nainstalovaný dřív, čeká na restart → 3010 i bez instalátoru.
-        let o = precheck(BusState::InstalledNotRunning {
-            device: dev(None, true),
+        assert_eq!(
+            up(1602, BusState::NotInstalled, false),
+            Outcome::Cancelled { update: false }
+        );
+        assert_eq!(up(1618, BusState::Ready, true), Outcome::Busy);
+        // Po ovladači nezbylo nic (sem se po MSI nejspíš nedojde — viz
+        // `settle`): žádný druhý běh sám od sebe; „Zkusit znovu" na povel
+        // uživatele pak projde pojistkou jako čistá instalace.
+        for code in [0, 3010, 1603] {
+            let o = up(code, BusState::NotInstalled, false);
+            assert!(
+                matches!(
+                    o,
+                    Outcome::Failed {
+                        fail: Fail::Removed,
+                        ..
+                    }
+                ),
+                "{o:?}"
+            );
+            assert!(o.retry_makes_sense() && !o.manual_install());
+            assert_eq!(o.exit_code(), 1);
+            assert!(o.detail().contains(&format!("kódem {code}")));
+        }
+        assert_eq!(decide(BusState::NotInstalled, false), Ok(Work::Install));
+    }
+
+    /// Skutečný stav po upgradu, který starou verzi odebral a novou
+    /// nepřidal (nález review): záznam nové verze (ProductCode 1.22.0)
+    /// v Aplikacích zůstal, zařízení sběrnice ne, verze se bez zařízení
+    /// nedá přečíst. Rada = odebrat v Aplikacích a spustit KeyPadSetup
+    /// znovu, kód 1 — nikdy „restartuj, pak naběhne" (3010) a nikdy druhý
+    /// běh instalátoru nad už zapsaným ProductCode (neověřené chování MSI).
+    #[test]
+    fn aktualizace_bez_zarizeni_radi_odebrat_a_spustit_znovu() {
+        let after = BusState::InstalledNotRunning {
+            device: None,
             in_apps: true,
-        })
-        .unwrap();
-        assert_eq!(o.exit_code(), 3010);
+        };
+        for code in [0, 3010, 1641, 1603, u32::MAX] {
+            for outdated in [false, true] {
+                let o = settle(Work::Update, code, after, outdated);
+                assert_eq!(
+                    o,
+                    Outcome::NotRunning(Advice::Reinstall { in_apps: true }),
+                    "kód {code}"
+                );
+                assert_eq!(o.exit_code(), 1);
+                assert!(o.needs_attention() && !o.retry_makes_sense() && !o.manual_install());
+                let m = o.message();
+                assert!(
+                    !m.contains("pak naběhne") && !m.contains("Restartuj"),
+                    "{m}"
+                );
+                assert!(m.contains("„ViGEm Bus Driver“"), "{m}");
+                assert!(m.contains("spusť KeyPadSetup znovu"), "{m}");
+            }
+        }
+        // Po restartu pojistka nic nespustí a řekne totéž.
+        assert_eq!(
+            decide(after, false),
+            Err(Outcome::NotRunning(Advice::Reinstall { in_apps: true }))
+        );
+        // Bez záznamu v Aplikacích tam neposílat — ruční instalace.
+        let o = settle(
+            Work::Update,
+            0,
+            BusState::InstalledNotRunning {
+                device: None,
+                in_apps: false,
+            },
+            false,
+        );
+        assert!(o.manual_install() && o.exit_code() == 1, "{o:?}");
+    }
+
+    /// Neprošlá aktualizace (1603…) vypnutého nebo zablokovaného staršího
+    /// ovladače: MSI vrátilo zpátky a zařízení je, jak bylo. Rada podle
+    /// zařízení a kód 1 — ne „restartuj" s 3010 (restart by nepomohl
+    /// a aplikace by na něj čekala). „Restartuj" jen tam, kde to chce
+    /// zařízení samo, nebo kde instalátor doběhl.
+    #[test]
+    fn neprosla_aktualizace_radi_podle_zarizeni() {
+        let up = |code, d| settle(Work::Update, code, there(d), true);
+        for code in [1603, u32::MAX] {
+            let off = up(code, dev(Some(22), false));
+            assert_eq!(off, Outcome::NotRunning(Advice::EnableDevice));
+            let blocked = up(code, dev(Some(48), false));
+            assert_eq!(blocked, Outcome::NotRunning(Advice::Blocked(48)));
+            for o in [off, blocked] {
+                assert_eq!(o.exit_code(), 1);
+                assert!(!o.message().contains("Restartuj"), "{}", o.message());
+            }
+            assert_eq!(up(code, dev(None, true)), Outcome::RebootRequired);
+            assert_eq!(up(code, dev(Some(14), false)), Outcome::RebootRequired);
+        }
+        for code in [0, 3010] {
+            for problem in [22, 48] {
+                assert_eq!(up(code, dev(Some(problem), false)), Outcome::RebootRequired);
+            }
+        }
+    }
+
+    /// Běžící KeyPad drží sběrnici — zavírá se jen před aktualizací;
+    /// u čisté instalace sběrnice není.
+    #[test]
+    fn keypad_se_zavira_jen_pred_aktualizaci() {
+        assert!(closes_app(Work::Update));
+        assert!(!closes_app(Work::Install));
+        let o = failed(Fail::AppRunning, "KeyPad běží jako správce");
+        assert!(o.retry_makes_sense() && !o.manual_install());
+        assert!(o.message().contains("Zavři ho"));
+        assert_eq!(o.exit_code(), 1);
     }
 
     /// Odmítnutá složka rozbalování: po jejím smazání má smysl zkusit
     /// znovu, a ruční instalaci nenabízet — rozbalovala by do téže složky.
     #[test]
     fn odmitnuta_slozka_nabidne_opakovani_ne_rucni_instalaci() {
-        let o = extraction_refused("složka x už existuje".into());
-        assert!(o.retry_makes_sense());
-        assert!(!o.message().contains(vigembus::RELEASES_URL));
+        let o = failed(Fail::Folder(PathBuf::from(r"C:\x")), "už existuje");
+        assert!(o.retry_makes_sense() && !o.manual_install());
+        assert!(o.message().contains(r"C:\x") && o.message().contains("smaž ji"));
+        assert!(!o.message().contains("už existuje"));
         assert_eq!(o.exit_code(), 1);
     }
 
@@ -1074,24 +1601,18 @@ mod tests {
         let all = sample_outcomes();
         let has = |f: fn(&Outcome) -> bool| all.iter().any(f);
         assert!(has(|o| matches!(o, Outcome::Installed)));
+        assert!(has(|o| matches!(o, Outcome::Updated { restart: true })));
         assert!(has(|o| matches!(o, Outcome::RebootRequired)));
+        assert!(has(|o| matches!(o, Outcome::NotRunning(_))));
+        assert!(has(|o| o.retry_makes_sense()));
+        assert!(has(|o| o.manual_install()));
         assert!(has(|o| matches!(
             o,
-            Outcome::NotRunning {
-                after_setup: true,
+            Outcome::Failed {
+                fail: Fail::Folder(_),
                 ..
             }
         )));
-        assert!(has(|o| matches!(
-            o,
-            Outcome::NotRunning {
-                after_setup: false,
-                ..
-            }
-        )));
-        assert!(has(|o| matches!(o, Outcome::Failed { retry: true, .. })));
-        assert!(has(|o| matches!(o, Outcome::Failed { retry: false, .. })));
-        assert!(has(|o| o.message().contains("nezaložil správce")));
     }
 
     #[test]
@@ -1100,20 +1621,28 @@ mod tests {
         let x = Path::new(r"C:\ProgramData\Nefarius Software Solutions\ViGEm Bus Driver 1.22.0");
         // Nic tam není — v pořádku.
         assert!(extraction_verdict(v, false, false, None, x, false).is_ok());
-        // Složka verze už je — nikdy.
-        let e = extraction_verdict(v, true, false, Some("S-1-5-18"), x, true).unwrap_err();
-        assert!(e.contains("už existuje") && e.contains("smaž ji"), "{e}");
-        assert!(e.contains(&x.display().to_string()));
+        // Složka verze už je — nikdy; smazat se má ona.
+        let (p, why) = extraction_verdict(v, true, false, Some("S-1-5-18"), x, true).unwrap_err();
+        assert_eq!(p, x);
+        assert!(why.contains("už existuje"), "{why}");
         // Složka výrobce od správce (jiný produkt Nefarius) — v pořádku.
         for o in TRUSTED_OWNERS {
             assert!(extraction_verdict(v, true, false, Some(o), x, false).is_ok());
         }
-        // Od běžného uživatele, nečitelná, nebo odkaz jinam — ne.
-        assert!(extraction_verdict(v, true, false, Some("S-1-5-21-1-2-3-1001"), x, false).is_err());
-        assert!(extraction_verdict(v, true, false, None, x, false).is_err());
+        // Od běžného uživatele, nečitelná, nebo odkaz jinam — ne, a smazat
+        // se má složka výrobce.
+        for (reparse, owner) in [
+            (false, Some("S-1-5-21-1-2-3-1001")),
+            (false, None),
+            (true, Some("S-1-5-18")),
+        ] {
+            let (p, _) = extraction_verdict(v, true, reparse, owner, x, false).unwrap_err();
+            assert_eq!(p, v);
+        }
         assert!(
             extraction_verdict(v, true, true, Some("S-1-5-18"), x, false)
                 .unwrap_err()
+                .1
                 .contains("odkaz")
         );
     }
@@ -1172,6 +1701,26 @@ mod tests {
             .starts_with(TEMP_PREFIX));
         assert_eq!(std::fs::read_dir(&a).unwrap().count(), 0);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Špatný soubor se na disk nedostane dál než do zámku: druhý otisk
+    /// z uzamčeného handlu ho odmítne jako neoficiální a složka se uklidí.
+    #[test]
+    fn neoficialni_soubor_neprojde_zamkem() {
+        let o = match Staged::create(b"MZ tohle neni instalator") {
+            Err(o) => o,
+            Ok(_) => panic!("neoficiální soubor prošel"),
+        };
+        assert!(
+            matches!(
+                o,
+                Outcome::Failed {
+                    fail: Fail::NotOfficial,
+                    ..
+                }
+            ),
+            "{o:?}"
+        );
     }
 
     /// Soubor ze staženého podpisu: zápis, zámek, druhý otisk a podpis

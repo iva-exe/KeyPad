@@ -1,58 +1,69 @@
-// Stav virtuálního gamepadu pro celé okno (titulek i karta padu).
+// Stav virtuálního gamepadu pro celé okno.
 //
 // Zdroj pravdy je backend (pad vlákno, src-tauri/src/platform/windows/
 // pad.rs). Sem teče událostí `pad-stav` při každé změně a příkazem
 // `pad_status` při startu a po návratu okna z oznamovací oblasti.
 // Odpovědi a události se můžou předběhnout — pořadí drží `seq`.
+//
+// Ovladač se připojuje JEN přepínačem (`pad_on`) — po startu, po
+// probuzení i po aktualizaci je vypnutý (Fáze 2b).
 import { poslouchej, textChyby, vAplikaci, zavolej } from './tauri';
 
 export type PadStav =
+	/** ViGEmBus je, ovladač vypnutý — zapne ho přepínač. */
+	| 'off'
 	| 'connecting'
-	| 'connected'
+	| 'on'
 	/** ViGEmBus v systému vůbec není — jen tady se nabízí instalace. */
 	| 'bus_missing'
 	/** ViGEmBus je nainstalovaný, ale neběží — `detail` je rada, co s tím. */
 	| 'bus_not_running'
-	| 'error'
-	| 'suspended';
+	| 'error';
 
 /** Odpověď `pad_status` i obsah události `pad-stav`. */
 interface PadInfo {
 	state: PadStav;
+	/** Číslo hráče podle ViGEmBus — okno ho neukazuje (s víc pady lže). */
 	player: number | null;
 	detail: string;
+	needs_update: boolean;
+	/** Běží instalátor ViGEmBus — ovladač vypnutý, přepínač zablokovaný. */
+	installer: boolean;
 	seq: number;
 }
 
-/**
- * První adresa https v textu z backendu (chyba, rada), nebo `null`.
- *
- * Adresu ruční instalace ViGEmBus drží jen backend (`updater::vigembus`)
- * a posílá ji v textu — vlastní kopie tady by se s ní časem rozešla.
- * Koncová interpunkce věty k adrese nepatří.
- */
-export function odkazV(text: string): string | null {
-	const m = /https:\/\/[^\s)]+/.exec(text);
-	return m ? m[0].replace(/[.,;:]+$/, '') : null;
-}
+/** Stránky, které smí okno otevřít (backend drží adresy). */
+export type Odkaz = 'vigembus' | 'vigembus_releases';
 
 export const pad = $state({
-	state: 'connecting' as PadStav,
-	/** Číslo hráče (slot XInput + 1), jen u připojeného padu. */
-	player: null as number | null,
-	/** Podrobnost od backendu (proč chyba, co se právě děje). */
+	state: 'off' as PadStav,
+	/** Podrobnost od backendu (proč chyba, rada) — do bubliny. */
 	detail: '',
+	/** ViGEmBus je starší než z posledního vydání. */
+	stary: false,
 	/** Pořadí poslední převzaté změny; −1 = zatím nic. */
 	seq: -1,
+	/** Přepínač čeká na odpověď backendu — ukazuje, co uživatel chce. */
+	prepina: false,
+	/** Kam uživatel přepínač přepnul (platí jen s `prepina`). */
+	chce: false,
 	/** Páčka zrovna opisuje kruh — tlačítko je chvíli zablokované. */
 	testuje: false,
-	/** Spouští se instalátor ViGEmBus. */
+	/** Spouští se instalátor ViGEmBus (příkaz ještě neodpověděl). */
 	spoustiInstalator: false,
-	/** Instalátor běží; po jeho konci se backend zkusí připojit sám. */
+	/** Instalátor běží — hlásí backend (pad vlákno), dokud instalátor
+	    neskončí; po jeho konci backend ovladač sám ověří. */
 	instalatorBezi: false,
-	/** Chyba posledního kliknutí — ukáže se u tlačítek. */
+	/** Chyba posledního kliknutí — krátká věta u tlačítek. */
 	chybaAkce: ''
 });
+
+/** Je ovladač zapnutý (nebo se právě zapíná)? */
+export function zapnuto(): boolean {
+	return pad.state === 'on' || pad.state === 'connecting';
+}
+
+let casovacPrepnuti: ReturnType<typeof setTimeout> | undefined;
 
 function prevezmi(i: PadInfo): void {
 	// Starší změnu zahodit. Stejný `seq` projde: backend zapisuje
@@ -60,21 +71,27 @@ function prevezmi(i: PadInfo): void {
 	// obsah (odpověď `pad_status` po události se stejným číslem nic
 	// nerozbije).
 	if (i.seq < pad.seq) return;
+	const nova = i.seq > pad.seq;
 	pad.state = i.state;
-	pad.player = i.player ?? null;
 	pad.detail = i.detail ?? '';
+	pad.stary = !!i.needs_update;
+	// Z backendu, ne odhadem okna: vypnutí padu před instalátorem se
+	// může ohlásit dřív i později než odpověď `install_vigembus`.
+	pad.instalatorBezi = !!i.installer;
 	pad.seq = i.seq;
-	// Backend po konci instalátoru připojuje znovu — přes „připojuji…".
-	// Tím instalátor skončil, ať už to dopadlo jakkoli.
-	if (i.state !== 'bus_missing') pad.instalatorBezi = false;
-	if (i.state !== 'connected') pad.testuje = false;
+	if (nova) {
+		// Backend odpověděl — přepínač zase ukazuje skutečnost.
+		pad.prepina = false;
+		clearTimeout(casovacPrepnuti);
+	}
+	if (i.state !== 'on') pad.testuje = false;
 }
 
 async function nacti(): Promise<void> {
 	try {
 		prevezmi(await zavolej<PadInfo>('pad_status'));
 	} catch {
-		// Mimo aplikaci backend není — zůstane „připojuji…".
+		// Mimo aplikaci backend není — zůstane „vypnuto".
 	}
 }
 
@@ -93,10 +110,35 @@ export function startPad(): void {
 	});
 }
 
-/** Jak dlouho blokovat „Vyzkoušet páčku" — kruh trvá 1,2 s. */
+/**
+ * Jak dlouho přepínač ukazuje přání uživatele, když backend mlčí.
+ * Normálně odpoví do milisekund („zapínám…"); kdyby příkaz nic
+ * nezměnil, přepínač se po chvíli vrátí ke skutečnosti.
+ */
+const PREPNUTI_MS = 2000;
+
+/** Přepínač: zapnout / vypnout virtuální ovladač. */
+export async function prepni(): Promise<void> {
+	// Podle toho, co přepínač UKAZUJE (dvojklik před odpovědí backendu
+	// je „zapnout a zase vypnout", ne dvakrát „zapnout").
+	const chce = !(pad.prepina ? pad.chce : zapnuto());
+	pad.chybaAkce = '';
+	pad.prepina = true;
+	pad.chce = chce;
+	clearTimeout(casovacPrepnuti);
+	casovacPrepnuti = setTimeout(() => (pad.prepina = false), PREPNUTI_MS);
+	try {
+		await zavolej(chce ? 'pad_on' : 'pad_off');
+	} catch (e) {
+		pad.chybaAkce = textChyby(e);
+		pad.prepina = false;
+	}
+}
+
+/** Jak dlouho blokovat „Vyzkoušet" — kruh trvá 1,2 s. */
 const TEST_MS = 1300;
 
-export async function vyzkousejPacku(): Promise<void> {
+export async function vyzkousej(): Promise<void> {
 	if (pad.testuje) return;
 	pad.chybaAkce = '';
 	pad.testuje = true;
@@ -118,15 +160,32 @@ export async function zkusZnovu(): Promise<void> {
 	}
 }
 
-export async function nainstalujVigem(): Promise<void> {
+/**
+ * Instalace chybějícího nebo aktualizace staršího ViGEmBus. Zapnutý
+ * ovladač backend před spuštěním vypne; „instalátor běží" pak hlásí
+ * událostí `pad-stav` (`installer`), až do konce instalátoru.
+ */
+export async function instalujOvladac(): Promise<void> {
 	if (pad.spoustiInstalator || pad.instalatorBezi) return;
 	pad.chybaAkce = '';
 	pad.spoustiInstalator = true;
 	try {
 		await zavolej('install_vigembus');
-		pad.instalatorBezi = true;
 	} catch (e) {
 		pad.chybaAkce = textChyby(e);
 	}
 	pad.spoustiInstalator = false;
+}
+
+/**
+ * Otevře pevnou stránku v prohlížeči (adresy drží backend). Vrací
+ * text chyby, nebo prázdný řetězec — kam ji ukázat, rozhodne volající.
+ */
+export async function otevri(link: Odkaz): Promise<string> {
+	try {
+		await zavolej('open_link', { link });
+		return '';
+	} catch (e) {
+		return textChyby(e);
+	}
 }

@@ -6,6 +6,10 @@ instalátoru ovladače ViGEmBus 1.22.0 z
 
 - Autor: Nefarius Software Solutions e.U., licence BSD-3-Clause
   (<https://github.com/nefarius/ViGEmBus/blob/master/LICENSE>).
+- [`LICENSE.txt`](LICENSE.txt) je **nezměněný text** té licence
+  (shodný v `master` i ve značce `v1.22.0`). Leží tu proto, že zrcadlo je
+  redistribuce binárky a BSD-3-Clause k ní žádá copyright, podmínky
+  i zřeknutí se odpovědnosti — odkaz nestačí.
 - SHA-256: `89220A7865076B342892F98865F3499FB7C4CFD673159E89D352C360FD014C6A`
   (stejný otisk uvádí i winget), podpis: Nefarius Software Solutions e.U.
 

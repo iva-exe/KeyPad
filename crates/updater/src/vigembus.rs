@@ -1,13 +1,14 @@
 //! Ovladač ViGEmBus — jediný zdroj pravdy pro instalátor i aplikaci.
 //!
 //! KeyPad bez něj nevytvoří virtuální gamepad. Tady je:
-//! - **napevno zapsané vydání** (adresa, velikost, SHA-256, vydavatel,
-//!   parametry) — instalátor nikdy nespustí nic jiného než přesně tenhle
-//!   soubor (princip 8: cizí binárky jen v ověřené podobě),
-//! - **zjištění stavu** jen čtením (registr, správce zařízení) — sdílí ho
-//!   instalátor (nabídnout instalaci jen tam, kde ovladač úplně chybí)
-//!   i aplikace (stavový řádek, rada, co dělat),
-//! - **stažení s ověřením** do paměti.
+//! - **napevno zapsané vydání** (adresa, zrcadlo, velikost, SHA-256,
+//!   vydavatel, parametry) — instalátor nikdy nespustí nic jiného než
+//!   přesně tenhle soubor (princip 8: cizí binárky jen v ověřené podobě),
+//! - **zjištění stavu a verze** jen čtením (registr, správce zařízení) —
+//!   sdílí ho instalátor (instalovat, když ovladač chybí, aktualizovat,
+//!   když je starší) i aplikace (stavový řádek, rada, co dělat),
+//! - **stažení s ověřením** do paměti: nejdřív oficiální adresa, pak
+//!   zrcadlo v repu KeyPadu — obojí proti témuž otisku.
 //!
 //! Instalaci samotnou (zápis na disk, zámek, podpis, výzva UAC) dělá jen
 //! `KeyPadSetup.exe` — aplikace o práva správce nikdy nežádá a má jedinou
@@ -17,13 +18,14 @@
 //! 2. 11. 2023), takže se pin nikdy nebude muset měnit. Otisk sedí se
 //! třemi nezávislými zdroji (vlastní stažení, manifest winget-pkgs z roku
 //! 2023, MD5 z Azure blobu z doby nahrání). Jakákoli změna na GitHubu,
-//! v CDN nebo proxy s inspekcí TLS vede k odmítnutí, nikdy ke spuštění.
+//! v CDN, v zrcadle nebo proxy s inspekcí TLS vede k odmítnutí, nikdy ke
+//! spuštění.
 
 use windows::core::{GUID, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_DevNode_Registry_PropertyW, CM_Get_DevNode_Status, CM_Get_Device_ID_ListW,
     CM_Get_Device_ID_List_SizeW, CM_Get_Device_Interface_List_SizeW, CM_Locate_DevNodeW,
-    CM_DEVNODE_STATUS_FLAGS, CM_DRP_HARDWAREID, CM_GETIDLIST_FILTER_ENUMERATOR,
+    CM_DEVNODE_STATUS_FLAGS, CM_DRP_DRIVER, CM_DRP_HARDWAREID, CM_GETIDLIST_FILTER_ENUMERATOR,
     CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CM_LOCATE_DEVNODE_NORMAL, CM_PROB, CR_BUFFER_SMALL,
     CR_SUCCESS, DN_HAS_PROBLEM, DN_NEED_RESTART, DN_STARTED,
 };
@@ -45,6 +47,13 @@ pub const VERSION: &str = "1.22.0";
 pub const DOWNLOAD_HOST: &str = "github.com";
 pub const DOWNLOAD_PATH: &str =
     "/nefarius/ViGEmBus/releases/download/v1.22.0/ViGEmBus_1.22.0_x64_x86_arm64.exe";
+/// Zrcadlo v repu KeyPadu (`mirror/`, schválené vlastníkem 29. 9. 2026):
+/// repo ViGEmBus je archivované a kdyby zmizelo, instalace ovladače by
+/// jinak skončila na „nepodařilo se stáhnout". Zrcadlo se ověřuje týmž
+/// otiskem jako originál, takže podstrčit nic jiného neumí — horší, než
+/// že nedodá nic, být nemůže. Přes `raw` (bez API, bez limitu dotazů).
+pub const MIRROR_HOST: &str = crate::RAW_HOST;
+pub const MIRROR_PATH: &str = "/iva-exe/KeyPad/main/mirror/ViGEmBus_1.22.0_x64_x86_arm64.exe";
 /// Jméno souboru, pod kterým se instalátor uloží (a ukáže se ve výzvě UAC).
 pub const SETUP_FILE: &str = "ViGEmBus_1.22.0_x64_x86_arm64.exe";
 /// Přesná velikost v bajtech.
@@ -93,10 +102,46 @@ pub const VENDOR_DIR: &str = "Nefarius Software Solutions";
 pub const RELEASES_URL: &str = "https://github.com/nefarius/ViGEmBus/releases";
 /// Licence ovladače (text pro okno instalátoru a README).
 pub const LICENSE: &str = "BSD-3-Clause";
+/// Repozitář autora — cíl odkazu u creditu.
+pub const REPO_URL: &str = "https://github.com/nefarius/ViGEmBus";
+/// Credit, jak ho ukazuje instalátor i detaily aplikace (vždy s odkazem
+/// na [`REPO_URL`]). Jedno místo, ať se texty nerozejdou.
+pub const CREDIT: &str = "ViGEmBus — Nefarius Software Solutions e.U.";
 
 /// Celá adresa ke stažení (pro výpis; stahuje se přes host + cestu).
 pub fn download_url() -> String {
-    format!("https://{DOWNLOAD_HOST}{DOWNLOAD_PATH}")
+    Source::Official.url()
+}
+
+/// Odkud se instalátor stahuje — v tomhle pořadí.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// Vydání v repu autora (github.com → CDN GitHubu).
+    Official,
+    /// Zrcadlo v repu KeyPadu ([`MIRROR_PATH`]).
+    Mirror,
+}
+
+impl Source {
+    pub const ALL: [Source; 2] = [Source::Official, Source::Mirror];
+
+    pub fn host(self) -> &'static str {
+        match self {
+            Source::Official => DOWNLOAD_HOST,
+            Source::Mirror => MIRROR_HOST,
+        }
+    }
+
+    pub fn path(self) -> &'static str {
+        match self {
+            Source::Official => DOWNLOAD_PATH,
+            Source::Mirror => MIRROR_PATH,
+        }
+    }
+
+    pub fn url(self) -> String {
+        format!("https://{}{}", self.host(), self.path())
+    }
 }
 
 // ── Stav ───────────────────────────────────────────────────────────
@@ -107,17 +152,19 @@ pub enum BusState {
     /// Rozhraní sběrnice existuje — gamepad jde vytvořit.
     Ready,
     /// Po ovladači není ani stopa: žádné rozhraní, žádná služba, žádný
-    /// záznam v Aplikacích. JEN v tomhle stavu smí instalátor spustit
-    /// instalaci — jinak by MSI při „první instalaci" odebralo cizí
-    /// zařízení sběrnice nebo při upgradu vynutilo restart.
+    /// záznam v Aplikacích. Instalátor pak ovladač nainstaluje. Jinak
+    /// instalátor ViGEmBus spouští jen nad ovladačem, o kterém ví, že je
+    /// starší ([`needs_update`]) — MSI při „první instalaci" odebere
+    /// stávající zařízení sběrnice a při upgradu chce restart, takže nad
+    /// běžícím aktuálním nebo neznámým ovladačem nemá co dělat.
     NotInstalled,
     /// Ovladač v systému je (služba nebo záznam v Aplikacích), ale
     /// rozhraní ne. `device` = stav zařízení ve správci zařízení
     /// (`None` = zařízení se nenašlo). `in_apps` = má záznam
     /// v Aplikacích. Bez něj ho do systému dal jiný program (devcon,
     /// nefcon, přibalený instalátor) nebo po něm zbyla jen služba —
-    /// rada pak nesmí posílat do Aplikací, kde nic není, a KeyPadSetup
-    /// ho kvůli pojistce taky nepřeinstaluje.
+    /// rada pak nesmí posílat do Aplikací, kde nic není. KeyPadSetup ho
+    /// přeinstaluje jen tehdy, když je prokazatelně starší.
     InstalledNotRunning {
         device: Option<DeviceStatus>,
         in_apps: bool,
@@ -194,54 +241,49 @@ impl Advice {
         )
     }
 
-    /// Česká rada pro uživatele (instalátor i aplikace).
+    /// Česká rada pro uživatele (instalátor i aplikace) — krátká a jen
+    /// s tím, podle čeho se dá jednat. Kód problému v ní není (uživateli
+    /// nic neřekne); do logu ho dává ten, kdo radu ukazuje (`{:?}` stavu).
     ///
     /// Aplikace se zmiňují jen tam, kde záznam opravdu je. Bez něj
-    /// zbývá restart, Správce zařízení a ruční instalace: KeyPadSetup
-    /// ovladač, po kterém v systému něco zbylo, nepřeinstaluje (pojistka
-    /// „jen když úplně chybí").
+    /// zbývá restart, Správce zařízení a ruční instalace.
     pub fn text(&self) -> String {
         match self {
-            Advice::Restart => "Ovladač ViGEmBus je nainstalovaný, ale ještě neběží — Windows \
-                                ho spustí po restartu počítače."
+            Advice::Restart => "Restartuj počítač — ovladač ViGEmBus pak naběhne.".into(),
+            Advice::EnableDevice => "Ovladač ViGEmBus je vypnutý. Zapni ho ve Správci zařízení: \
+                                     Systémová zařízení → Nefarius Virtual Gamepad Emulation Bus \
+                                     → Povolit zařízení."
                 .into(),
-            Advice::EnableDevice => "Ovladač ViGEmBus je nainstalovaný, ale vypnutý. Zapni ho ve \
-                                     Správci zařízení: Systémová zařízení → Nefarius Virtual \
-                                     Gamepad Emulation Bus → Povolit zařízení."
+            // KeyPad do Izolace jádra nesahá — jen řekne, kde hledat.
+            Advice::Blocked(_) => "Windows ovladač ViGEmBus zablokovaly. Zkontroluj Integritu \
+                                   paměti (Zabezpečení Windows → Zabezpečení zařízení → Izolace \
+                                   jádra)."
                 .into(),
-            Advice::Blocked(c) => format!(
-                "Windows ovladač ViGEmBus nenechaly spustit (kód {c}). Podívej se, jestli ho \
-                 neblokuje Integrita paměti (Zabezpečení Windows → Zabezpečení zařízení → \
-                 Izolace jádra) — KeyPad do tohoto nastavení nesahá."
-            ),
-            Advice::Reinstall { in_apps: true } => "Ovladač ViGEmBus je v systému jen zčásti \
-                                                   (chybí jeho zařízení). Restartuj počítač; \
-                                                   když to nepomůže, odeber „ViGEm Bus Driver“ \
-                                                   v Nastavení → Aplikace a spusť KeyPadSetup \
-                                                   znovu."
-                .into(),
-            // Ve Správci zařízení tu není co hledat — zařízení chybí.
-            Advice::Reinstall { in_apps: false } => format!(
-                "Po ovladači ViGEmBus zbyla v systému jen část (bez zařízení a bez záznamu \
-                 v Aplikacích). Restartuj počítač; když to nepomůže, nainstaluj ho ručně \
-                 z {RELEASES_URL}."
-            ),
-            Advice::Problem {
-                code,
-                in_apps: true,
-            } => format!(
-                "Správce zařízení hlásí u ovladače ViGEmBus problém (kód {code}). Zkus \
-                 restartovat počítač; když to nepomůže, odeber „ViGEm Bus Driver“ v Nastavení → \
-                 Aplikace a spusť KeyPadSetup znovu."
-            ),
-            Advice::Problem {
-                code,
-                in_apps: false,
-            } => format!(
-                "Ovladač ViGEmBus hlásí problém (kód {code}). Restartuj počítač; když to \
-                 nepomůže, zkontroluj ho ve Správci zařízení nebo ho nainstaluj ručně \
-                 z {RELEASES_URL}."
-            ),
+            // Záznam v Aplikacích je, zařízení sběrnice ne (typicky
+            // upgrade, který starou verzi odebral a novou nepřidal).
+            // Kořenové zařízení zakládá instalátor ViGEmBus — restart ho
+            // nevytvoří, proto tu restart není.
+            Advice::Reinstall { in_apps: true } => {
+                "Ovladač ViGEmBus nefunguje. Odeber „ViGEm Bus Driver“ v Nastavení → Aplikace \
+                 a spusť KeyPadSetup znovu."
+                    .into()
+            }
+            Advice::Problem { in_apps: true, .. } => {
+                "Ovladač ViGEmBus nefunguje. Restartuj počítač; když to nepomůže, odeber \
+                 „ViGEm Bus Driver“ v Nastavení → Aplikace a spusť KeyPadSetup znovu."
+                    .into()
+            }
+            // Bez záznamu v Aplikacích: ruční instalace (adresu okno
+            // nabídne i tlačítkem — viz `suggests_manual_install`).
+            // Restart tu smysl má: služba odebraného ovladače může
+            // v registru zůstat až do restartu — a bez ní KeyPadSetup
+            // nainstaluje ovladač sám.
+            Advice::Reinstall { in_apps: false } | Advice::Problem { in_apps: false, .. } => {
+                format!(
+                    "Ovladač ViGEmBus nefunguje. Restartuj počítač; když to nepomůže, \
+                     nainstaluj ho ručně z {RELEASES_URL}."
+                )
+            }
         }
     }
 }
@@ -407,6 +449,11 @@ fn split_multi_sz(buf: &[u16]) -> Vec<String> {
 /// poznat. Proto záloha: kořenová zařízení třídy System (`ROOT\SYSTEM\…`,
 /// tam je zakládá instalátor ViGEmBus) podle hardware ID.
 fn device_status() -> Option<DeviceStatus> {
+    bus_devnode().and_then(devnode_status)
+}
+
+/// Zařízení sběrnice (devnode), ať běží, nebo ne.
+fn bus_devnode() -> Option<u32> {
     let from_service = open_key(
         HKEY_LOCAL_MACHINE,
         &format!(r"{}\Enum", service_path()),
@@ -419,8 +466,64 @@ fn device_status() -> Option<DeviceStatus> {
             .map(|dn| hardware_ids(dn).iter().any(|h| is_bus_hwid(h)))
             .unwrap_or(false)
     }));
-    ids.iter()
-        .find_map(|id| locate(id).and_then(devnode_status))
+    ids.iter().find_map(|id| locate(id))
+}
+
+/// Verze ovladače v posledním vydání ViGEmBus ([`VERSION`] ho obsahuje;
+/// novější už nikdy nebude — projekt je archivovaný).
+pub const DRIVER_VERSION: [u16; 4] = [1, 21, 442, 0];
+
+/// Verze ovladače ViGEmBus, který je v systému (`DriverVersion` jeho
+/// zařízení ve třídě zařízení). `None`, když zařízení není nebo verzi
+/// nejde přečíst. Jen čte.
+pub fn driver_version() -> Option<[u16; 4]> {
+    let dn = bus_devnode()?;
+    // Klíč ovladače zařízení, např. „{4d36e97d-…}\0012".
+    let mut buf = [0u16; 256];
+    let mut len = std::mem::size_of_val(&buf) as u32;
+    // SAFETY: délka v bajtech odpovídá bufferu.
+    let cr = unsafe {
+        CM_Get_DevNode_Registry_PropertyW(
+            dn,
+            CM_DRP_DRIVER,
+            None,
+            Some(buf.as_mut_ptr() as *mut _),
+            &mut len,
+            0,
+        )
+    };
+    if cr != CR_SUCCESS {
+        return None;
+    }
+    let driver_key = split_multi_sz(&buf[..(len as usize / 2).min(buf.len())])
+        .into_iter()
+        .next()?;
+    let class = open_key(
+        HKEY_LOCAL_MACHINE,
+        &format!(r"SYSTEM\CurrentControlSet\Control\Class\{driver_key}"),
+        KEY_WOW64_64KEY,
+    )?;
+    parse_version(&read_sz(class.0, "", "DriverVersion")?)
+}
+
+/// „1.21.442.0" → [1, 21, 442, 0]. Chybějící části jsou 0.
+fn parse_version(s: &str) -> Option<[u16; 4]> {
+    let mut out = [0u16; 4];
+    let mut parts = s.trim().split('.');
+    for slot in out.iter_mut() {
+        match parts.next() {
+            Some(p) => *slot = p.trim().parse().ok()?,
+            None => break,
+        }
+    }
+    parts.next().is_none().then_some(out)
+}
+
+/// Je v systému ovladač starší než ten z posledního vydání? Pak ho
+/// instalátor aktualizuje. Neznámou verzi nikdy nepovažuje za starou —
+/// na cizí ovladač, o kterém nic nevíme, se nesahá.
+pub fn needs_update() -> bool {
+    matches!(driver_version(), Some(v) if v < DRIVER_VERSION)
 }
 
 fn is_bus_hwid(id: &str) -> bool {
@@ -520,15 +623,68 @@ impl std::fmt::Display for DownloadError {
 
 impl std::error::Error for DownloadError {}
 
-/// Stáhne instalátor do paměti a ověří přesnou velikost a SHA-256.
+/// Stáhne instalátor do paměti a ověří přesnou velikost a SHA-256
+/// (oficiální adresa, pak zrcadlo — viz [`fetch_setup`]).
 ///
 /// Vrací jen bajty, které prošly — nic jiného se nedá dál použít.
 /// Na disk nic nepíše (to dělá instalátor, i s druhou kontrolou).
-pub fn download_verified(progress: impl FnMut(usize)) -> Result<Vec<u8>, DownloadError> {
-    let data = http::get_limited(DOWNLOAD_HOST, DOWNLOAD_PATH, SETUP_SIZE, progress)
-        .map_err(|e| DownloadError::Network(e.to_string()))?;
-    verify(&data).map_err(DownloadError::NotOfficial)?;
-    Ok(data)
+pub fn download_verified(mut progress: impl FnMut(usize)) -> Result<Vec<u8>, DownloadError> {
+    fetch_setup(|_, n| progress(n)).map(|(data, _)| data)
+}
+
+/// Jako [`download_verified`], jen navíc řekne, odkud soubor přišel,
+/// a `progress` dostává i zdroj (při přechodu na zrcadlo počítá znovu
+/// od nuly).
+pub fn fetch_setup(
+    progress: impl FnMut(Source, usize),
+) -> Result<(Vec<u8>, Source), DownloadError> {
+    fetch_from(
+        &Source::ALL,
+        |src, p| {
+            http::get_limited(src.host(), src.path(), SETUP_SIZE, p).map_err(|e| e.to_string())
+        },
+        verify,
+        progress,
+    )
+}
+
+/// Zdroje po řadě, dokud jeden nedodá soubor, který projde `verify`.
+///
+/// Špatný soubor ze zdroje se zahodí a zkusí se další (proxy s inspekcí
+/// TLS nebo změna na GitHubu nemusí zasáhnout oba), spustit se ale nedá
+/// nikdy — ven jdou jen ověřené bajty. Když neprojde nic, vyhrává
+/// [`DownloadError::NotOfficial`] nad síťovou chybou: aspoň jeden zdroj
+/// něco dodal a opakování by dopadlo stejně (instalátor pak radí ruční
+/// cestu, ne „zkus znovu"). `fetch` a `verify` jsou parametry kvůli
+/// testům — síť ani skutečný soubor v nich nejsou potřeba.
+fn fetch_from<F, V>(
+    sources: &[Source],
+    mut fetch: F,
+    verify: V,
+    mut progress: impl FnMut(Source, usize),
+) -> Result<(Vec<u8>, Source), DownloadError>
+where
+    F: FnMut(Source, &mut dyn FnMut(usize)) -> Result<Vec<u8>, String>,
+    V: Fn(&[u8]) -> Result<(), String>,
+{
+    let mut network = Vec::new();
+    let mut bad = Vec::new();
+    for &src in sources {
+        let mut report = |n: usize| progress(src, n);
+        match fetch(src, &mut report) {
+            Ok(data) => match verify(&data) {
+                Ok(()) => return Ok((data, src)),
+                Err(e) => bad.push(format!("{}: {e}", src.host())),
+            },
+            Err(e) => network.push(format!("{}: {e}", src.host())),
+        }
+    }
+    if bad.is_empty() {
+        Err(DownloadError::Network(network.join("; ")))
+    } else {
+        bad.extend(network);
+        Err(DownloadError::NotOfficial(bad.join("; ")))
+    }
 }
 
 /// Je to bajt po bajtu oficiální instalátor [`VERSION`]?
@@ -577,8 +733,175 @@ mod tests {
              ViGEmBus_1.22.0_x64_x86_arm64.exe"
         );
         assert!(RELEASES_URL.starts_with("https://github.com/nefarius/ViGEmBus/"));
+        assert!(RELEASES_URL.starts_with(REPO_URL));
+        assert!(CREDIT.starts_with("ViGEmBus — ") && CREDIT.ends_with(SIGNER));
         // Přepínače zavaděče musí být před přepínači msiexec.
         assert!(SETUP_ARGS.find("/exenoui") < SETUP_ARGS.find("/qn"));
+    }
+
+    /// Zrcadlo leží v repu KeyPadu (větev main, složka mirror/) pod
+    /// stejným jménem jako originál; zdroje jdou v pořadí originál → zrcadlo.
+    #[test]
+    fn zrcadlo_je_v_repu_keypadu() {
+        assert_eq!(
+            Source::Mirror.url(),
+            "https://raw.githubusercontent.com/iva-exe/KeyPad/main/mirror/\
+             ViGEmBus_1.22.0_x64_x86_arm64.exe"
+        );
+        assert_eq!(
+            MIRROR_PATH,
+            format!("/{}/main/mirror/{SETUP_FILE}", crate::REPO)
+        );
+        assert_eq!(Source::ALL, [Source::Official, Source::Mirror]);
+        assert_eq!(Source::Official.url(), download_url());
+    }
+
+    /// Soubor zrcadla v repu je bajt po bajtu oficiální instalátor
+    /// a README zrcadla uvádí tentýž otisk — kdyby se někdo pokusil
+    /// zrcadlo „aktualizovat", test to chytí dřív než uživatelé
+    /// (instalátor by ho stejně odmítl).
+    ///
+    /// Zrcadlo je redistribuce binárky: BSD-3-Clause k ní chce přiložený
+    /// copyright, podmínky a zřeknutí se odpovědnosti — samotný odkaz
+    /// nestačí. Proto vedle leží nezměněný `LICENSE.txt` z repa autora.
+    #[test]
+    fn soubor_zrcadla_sedi_s_pinem() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../mirror");
+        let data = std::fs::read(dir.join(SETUP_FILE)).expect("mirror/ v repu");
+        verify(&data).expect("zrcadlo = oficiální instalátor");
+        let readme = std::fs::read_to_string(dir.join("README.md")).expect("mirror/README.md");
+        assert!(readme.contains(SETUP_SHA256_HEX), "README zrcadla: otisk");
+        assert!(readme.contains(REPO_URL), "README zrcadla: odkaz na autora");
+        assert!(readme.contains(LICENSE), "README zrcadla: licence");
+        assert!(
+            readme.contains("LICENSE.txt"),
+            "README zrcadla: text licence"
+        );
+        let license =
+            std::fs::read_to_string(dir.join("LICENSE.txt")).expect("mirror/LICENSE.txt v repu");
+        for line in [
+            "BSD 3-Clause License",
+            "Copyright (c) 2016-2020, Nefarius Software Solutions e.U.",
+            "2. Redistributions in binary form must reproduce the above copyright notice,",
+            "THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS \"AS IS\"",
+        ] {
+            assert!(
+                license.lines().any(|l| l.trim_end() == line),
+                "LICENSE.txt zrcadla: chybí „{line}“"
+            );
+        }
+    }
+
+    /// Záloha naostro bez sítě: originál „404", zrcadlo vrátí skutečný
+    /// soubor z `mirror/` → projde skutečným ověřením. Tentýž soubor
+    /// s jediným změněným bajtem neprojde z žádného zdroje.
+    #[test]
+    fn zaloha_se_skutecnym_souborem_a_skutecnym_overenim() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../mirror")
+            .join(SETUP_FILE);
+        let good = std::fs::read(path).expect("mirror/ v repu");
+        let mut bad = good.clone();
+        bad[SETUP_SIZE / 2] ^= 1;
+        let serve = |data: Vec<u8>| {
+            move |src: Source, p: &mut dyn FnMut(usize)| match src {
+                Source::Official => Err("soubor na serveru není".to_string()),
+                Source::Mirror => {
+                    p(data.len());
+                    Ok(data.clone())
+                }
+            }
+        };
+        let (data, src) = fetch_from(&Source::ALL, serve(good.clone()), verify, |_, _| {})
+            .expect("zrcadlo projde");
+        assert_eq!((src, data.len()), (Source::Mirror, SETUP_SIZE));
+        let e = fetch_from(&Source::ALL, serve(bad), verify, |_, _| {}).unwrap_err();
+        match e {
+            DownloadError::NotOfficial(d) => {
+                assert!(
+                    d.contains("raw.githubusercontent.com: otisk SHA-256 nesedí"),
+                    "{d}"
+                );
+                assert!(d.contains("github.com: soubor na serveru není"), "{d}");
+            }
+            e => panic!("{e:?}"),
+        }
+    }
+
+    /// Falešné „ověření" pro testy záložního zdroje: projde jen `OK`.
+    fn fake_verify(d: &[u8]) -> Result<(), String> {
+        (d == b"OK")
+            .then_some(())
+            .ok_or_else(|| "otisk nesedí".into())
+    }
+
+    /// Připravená odpověď zdroje: bajty, nebo síťová chyba.
+    type Answer = Result<&'static [u8], &'static str>;
+    type Fetched = Result<(Vec<u8>, Source), DownloadError>;
+
+    /// Fetcher, který pro každý zdroj vrátí připravenou odpověď a zapíše,
+    /// na co se ptal.
+    fn run(official: Answer, mirror: Answer) -> (Fetched, Vec<Source>) {
+        let mut asked = Vec::new();
+        let mut seen = Vec::new();
+        let r = fetch_from(
+            &Source::ALL,
+            |src, p| {
+                asked.push(src);
+                let r = match src {
+                    Source::Official => official,
+                    Source::Mirror => mirror,
+                };
+                r.map(|d| {
+                    p(d.len());
+                    d.to_vec()
+                })
+                .map_err(str::to_string)
+            },
+            fake_verify,
+            |src, n| seen.push((src, n)),
+        );
+        // Průběh hlásí vždy zdroj, ze kterého se právě stahuje.
+        assert!(seen.iter().all(|(s, _)| asked.contains(s)));
+        (r, asked)
+    }
+
+    #[test]
+    fn zrcadlo_je_jen_zaloha() {
+        // Originál v pořádku → na zrcadlo se vůbec nesahá.
+        let (r, asked) = run(Ok(b"OK"), Ok(b"OK"));
+        assert_eq!(r.unwrap(), (b"OK".to_vec(), Source::Official));
+        assert_eq!(asked, [Source::Official]);
+        // Originál nedostupný → zrcadlo.
+        let (r, asked) = run(Err("404"), Ok(b"OK"));
+        assert_eq!(r.unwrap().1, Source::Mirror);
+        assert_eq!(asked, Source::ALL);
+        // Originál dodal něco jiného → zahodí se, zrcadlo ověřené projde.
+        let (r, _) = run(Ok(b"jiny soubor"), Ok(b"OK"));
+        assert_eq!(r.unwrap(), (b"OK".to_vec(), Source::Mirror));
+    }
+
+    #[test]
+    fn spatny_soubor_z_kterehokoli_zdroje_neprojde() {
+        // Oba nedostupné → síť (má smysl zkusit znovu).
+        let (r, _) = run(Err("timeout"), Err("404"));
+        match r.unwrap_err() {
+            DownloadError::Network(e) => {
+                assert!(e.contains("github.com: timeout"), "{e}");
+                assert!(e.contains("raw.githubusercontent.com: 404"), "{e}");
+            }
+            e => panic!("{e:?}"),
+        }
+        // Aspoň jeden dodal jiný soubor → není oficiální (žádné bajty ven).
+        for (o, m) in [
+            (Ok(&b"x"[..]), Err("404")),
+            (Err("timeout"), Ok(&b"x"[..])),
+            (Ok(&b"x"[..]), Ok(&b"y"[..])),
+        ] {
+            let (r, asked) = run(o, m);
+            assert!(matches!(r, Err(DownloadError::NotOfficial(_))), "{r:?}");
+            assert_eq!(asked, Source::ALL);
+        }
     }
 
     fn well_formed_guid(s: &str) -> bool {
@@ -673,8 +996,26 @@ mod tests {
             .advice(),
             Some(Advice::Reinstall { in_apps: false })
         );
-        assert!(Advice::Blocked(48).text().contains("kód 48"));
+        assert!(Advice::Blocked(48).text().contains("Integritu paměti"));
         assert!(Advice::EnableDevice.text().contains("Správci zařízení"));
+        // Kódy problémů uživateli nic neřeknou — do rady nepatří.
+        for a in [
+            Advice::Blocked(48),
+            Advice::Problem {
+                code: 10,
+                in_apps: true,
+            },
+            Advice::Problem {
+                code: 10,
+                in_apps: false,
+            },
+        ] {
+            assert!(!a.text().contains("kód"), "{a:?}");
+            assert!(
+                !a.text().contains("10") && !a.text().contains("48"),
+                "{a:?}"
+            );
+        }
     }
 
     /// Do Aplikací rada posílá jen tam, kde záznam je; jinak restart,
@@ -691,8 +1032,13 @@ mod tests {
         ];
         for a in with {
             assert!(a.text().contains("Aplikace"), "{a:?}");
+            assert!(a.text().contains("spusť KeyPadSetup znovu"), "{a:?}");
             assert!(!a.suggests_manual_install());
         }
+        // Zařízení sběrnice chybí: restart ho nevytvoří (zakládá ho
+        // instalátor), takže rada restart ani „pak naběhne" nenabízí.
+        let t = Advice::Reinstall { in_apps: true }.text();
+        assert!(!t.contains("Restartuj") && !t.contains("naběhne"), "{t}");
         let without = [
             Advice::Reinstall { in_apps: false },
             Advice::Problem {
@@ -708,12 +1054,16 @@ mod tests {
             assert!(t.contains(RELEASES_URL), "{t}");
             assert!(a.suggests_manual_install());
         }
-        assert!(Advice::Problem {
-            code: 10,
-            in_apps: false
-        }
-        .text()
-        .contains("Správci zařízení"));
+    }
+
+    #[test]
+    fn verze_ovladace_se_cte_i_porovnava() {
+        assert_eq!(parse_version("1.21.442.0"), Some([1, 21, 442, 0]));
+        assert_eq!(parse_version("1.17"), Some([1, 17, 0, 0]));
+        assert_eq!(parse_version("1.2.3.4.5"), None);
+        assert_eq!(parse_version("x.1"), None);
+        assert!(parse_version("1.17.333.0").unwrap() < DRIVER_VERSION);
+        assert!(parse_version("1.21.442.0").unwrap() >= DRIVER_VERSION);
     }
 
     /// Na vývojovém PC je ViGEmBus nainstalovaný a běží — detekce to
@@ -723,6 +1073,9 @@ mod tests {
     #[ignore = "závisí na stroji: čeká nainstalovaný a běžící ViGEmBus"]
     fn stav_na_tomto_pc_je_ready() {
         assert_eq!(state(), BusState::Ready);
+        // Ovladač 1.21.442 z vydání 1.22.0 — aktualizace se nenabízí.
+        assert_eq!(driver_version(), Some(DRIVER_VERSION));
+        assert!(!needs_update());
         // Když běží, musí ho najít i záložní cesty (služba, Aplikace,
         // zařízení podle hardware ID) — ty se jinak ověřit nedají.
         assert!(service_key_exists());
@@ -744,9 +1097,25 @@ mod tests {
     #[ignore = "stahuje 6 MB z GitHubu"]
     fn stazeni_a_overeni_oficialniho_instalatoru() {
         let mut last = 0;
-        let data = download_verified(|n| last = n).expect("stažení");
+        let (data, src) = fetch_setup(|_, n| last = n).expect("stažení");
+        assert_eq!(src, Source::Official);
         assert_eq!(data.len(), SETUP_SIZE);
         assert_eq!(last, SETUP_SIZE);
         assert!(data.starts_with(b"MZ"));
+    }
+
+    /// Skutečné stažení ze zrcadla (až bude `mirror/` na GitHubu):
+    /// `cargo test -p updater -- --ignored stazeni_ze_zrcadla`.
+    #[test]
+    #[ignore = "stahuje 6 MB z GitHubu; zrcadlo musí být pushnuté"]
+    fn stazeni_ze_zrcadla() {
+        let (data, src) = fetch_from(
+            &[Source::Mirror],
+            |s, p| http::get_limited(s.host(), s.path(), SETUP_SIZE, p).map_err(|e| e.to_string()),
+            verify,
+            |_, _| {},
+        )
+        .expect("zrcadlo");
+        assert_eq!((data.len(), src), (SETUP_SIZE, Source::Mirror));
     }
 }

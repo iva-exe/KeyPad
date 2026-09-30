@@ -64,16 +64,16 @@ const fn rgb(r: u8, g: u8, b: u8) -> u32 {
 
 /// Logická velikost okna (při 100 % DPI).
 ///
-/// O kus vyšší než ve WinSentu: závěrečná zpráva tu umí mít tři
-/// odstavce (chybějící WebView2, výsledek instalace ovladače ViGEmBus
-/// s adresou, plus případné varování) a musí se vejít mezi kroky a pruh,
-/// aniž by se ořízla — a kroků je s ovladačem šest. Nejdelší skutečná
-/// kombinace se vejde běžným písmem (test `nejdelsi_zprava_se_vejde_do_okna`
-/// a ladicí náhled `KEYPAD_SETUP_TEST_NAHLED=nejdelsi`); na delší, než se
-/// čekalo (dlouhá chybová hláška Windows, víc poznámek), má okno menší
-/// písmo — viz [`Fit`].
+/// O kus vyšší než ve WinSentu: kroků je s ovladačem šest (+ credit)
+/// a závěrečná zpráva umí mít tři krátké odstavce (chybějící WebView2,
+/// výsledek ovladače, poznámka „Pozor:") — musí se vejít mezi kroky
+/// a pruh, aniž by se ořízla. Nejdelší skutečná kombinace se vejde
+/// běžným písmem (test `nejdelsi_zprava_se_vejde_do_okna` a ladicí
+/// náhled `KEYPAD_SETUP_TEST_NAHLED=nejdelsi`); na delší, než se čekalo
+/// (dlouhá chybová hláška Windows, víc poznámek), má okno menší písmo —
+/// viz [`Fit`]. (Fáze 2b zkrátila texty, proto 500 místo dřívějších 540.)
 const W: i32 = 560;
-const H: i32 = 540;
+const H: i32 = 500;
 
 /// Písma okna, v pořadí přednosti (viz `pick_face`).
 const UI_FACES: &[&str] = &["Segoe UI Variable Text", "Segoe UI"];
@@ -84,6 +84,13 @@ const PT_SMALL: i32 = 9;
 
 /// Výška hlavičky — zároveň plocha, za kterou jde okno táhnout.
 const HEAD_H: i32 = 62;
+
+/// Tlačítka dole vpravo (logické px): výška, šířky, mezera. Sdílí je
+/// kreslení i test, že se vedle nich vejde patička.
+const BTN_H: i32 = 34;
+const BTN_PRIMARY_W: i32 = 150;
+const BTN_SECONDARY_W: i32 = 110;
+const BTN_GAP: i32 = 10;
 
 /// Zpráva „stav se změnil, překresli".
 const WM_TICK: u32 = WM_APP + 1;
@@ -106,8 +113,6 @@ pub enum StepState {
     Active,
     Done,
     Failed,
-    /// Uživatel krok vypnul (ovladač ViGEmBus) — neprovede se.
-    Skipped,
 }
 
 /// Odkaz, který po dokončení otevře hlavní tlačítko (stažení WebView2
@@ -148,19 +153,13 @@ impl Next {
     }
 }
 
-/// Přepínač na úvodní obrazovce (instalace ovladače ViGEmBus).
-///
-/// Viditelný a vysvětlený předem (princip 8): co se stáhne, odkud,
-/// a že Windows budou chtít povolení správce. Ovládá se myší i
-/// klávesnicí (Tab na něj přesune fokus, mezerník ho přepne).
+/// Credit cizí součásti (ViGEmBus) — malý tlumený řádek s odkazem pod
+/// kroky, kdykoli je krok ovladače vidět. Ovládá se myší i klávesnicí
+/// (Tab na něj přesune fokus, Enter nebo mezerník otevře odkaz).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Toggle {
-    pub label: String,
-    /// Menší text pod popiskem.
-    pub note: String,
-    pub on: bool,
-    /// Krok, který přepínač zapíná a vypíná.
-    pub step: usize,
+pub struct Credit {
+    pub text: String,
+    pub url: String,
 }
 
 /// Co okno kreslí. Sdílené s pracovním vláknem.
@@ -186,8 +185,8 @@ pub struct State {
     pub attention: bool,
     /// Co nabídne hlavní tlačítko po dokončení.
     pub next: Option<Next>,
-    /// Přepínač na úvodní obrazovce (kreslí se jen ve fázi `Ready`).
-    pub option: Option<Toggle>,
+    /// Credit pod kroky (ve všech fázích).
+    pub credit: Option<Credit>,
     /// Naposledy spuštěná práce — „Zkusit znovu" po chybě spustí tutéž.
     pub job: Job,
     /// Popisek hlavního tlačítka; prázdný = tlačítko není.
@@ -211,50 +210,22 @@ impl State {
             message: String::new(),
             attention: false,
             next: None,
-            option: None,
+            credit: None,
             job: Job::Main,
             primary: primary.into(),
             secondary: "Zavřít".into(),
         }
     }
 
-    /// Přidá přepínač pro krok `step` (zapnutý podle `on`).
-    pub fn with_option(mut self, toggle: Toggle) -> Self {
-        let (step, on) = (toggle.step, toggle.on);
-        self.option = Some(toggle);
-        self.set_option(on);
-        debug_assert!(step < self.steps.len());
+    /// Přidá credit pod kroky.
+    pub fn with_credit(mut self, credit: Credit) -> Self {
+        self.credit = Some(credit);
         self
     }
 
-    /// Zapne/vypne krok přepínače. Vypnutý krok zůstává v seznamu
-    /// (s poznámkou „vynechá se") — jinak by se seznam při kliknutí na přepínač
-    /// zkracoval a přepínač by uživateli ujel zpod myši.
-    pub fn set_option(&mut self, on: bool) {
-        if let Some(t) = self.option.as_mut() {
-            t.on = on;
-            if let Some(s) = self.steps.get_mut(t.step) {
-                s.1 = if on {
-                    StepState::Waiting
-                } else {
-                    StepState::Skipped
-                };
-            }
-        }
-    }
-
-    /// Chce uživatel i krok přepínače (ovladač)?
-    pub fn option_on(&self) -> bool {
-        self.option.as_ref().is_some_and(|t| t.on)
-    }
-
     /// Označí krok jako běžící a všechny předchozí jako hotové.
-    /// Vypnuté kroky zůstávají vypnuté.
     pub fn step(&mut self, idx: usize, status: &str) {
         for (i, s) in self.steps.iter_mut().enumerate() {
-            if s.1 == StepState::Skipped && i != idx {
-                continue;
-            }
             s.1 = match i.cmp(&idx) {
                 std::cmp::Ordering::Less => StepState::Done,
                 std::cmp::Ordering::Equal => StepState::Active,
@@ -266,9 +237,7 @@ impl State {
 
     pub fn finish(&mut self, message: &str, attention: bool, next: Option<Next>) {
         for s in self.steps.iter_mut() {
-            if s.1 != StepState::Skipped {
-                s.1 = StepState::Done;
-            }
+            s.1 = StepState::Done;
         }
         self.phase = Phase::Done;
         self.progress = Some(1.0);
@@ -308,10 +277,8 @@ impl State {
         self.primary.clear();
         self.secondary.clear();
         let last = self.steps.len().saturating_sub(1);
-        let skipped = self.option.as_ref().filter(|t| !t.on).map(|t| t.step);
         for (i, s) in self.steps.iter_mut().enumerate() {
             s.1 = match job {
-                Job::Main if Some(i) == skipped => StepState::Skipped,
                 Job::Main => StepState::Waiting,
                 // Ovladač je vždy poslední krok; předchozí (KeyPad) už
                 // hotové jsou — znovu se neprovádějí.
@@ -366,13 +333,15 @@ struct Win {
     font_title: HFONT,
     font_body: HFONT,
     font_small: HFONT,
+    /// Malé podtržené — odkaz creditu (podtržení = „dá se kliknout").
+    font_link: HFONT,
     font_mono: HFONT,
     icon: HICON,
     /// Obdélníky tlačítek (počítají se při kreslení, používají při kliku).
     btn_primary: RECT,
     btn_secondary: RECT,
     btn_close: RECT,
-    btn_toggle: RECT,
+    btn_link: RECT,
     hot: u8,
     /// Ovládací prvek s fokusem klávesnice (`HOT_*`). Výchozí je hlavní
     /// tlačítko — Enter tak dělá totéž co dřív.
@@ -393,7 +362,7 @@ const HOT_NONE: u8 = 0;
 const HOT_PRIMARY: u8 = 1;
 const HOT_SECONDARY: u8 = 2;
 const HOT_CLOSE: u8 = 3;
-const HOT_TOGGLE: u8 = 4;
+const HOT_LINK: u8 = 4;
 
 /// Otevře okno a nechá ho běžet, dokud ho uživatel nezavře.
 ///
@@ -432,12 +401,13 @@ pub fn run(window_title: &str, state: Shared, action: Action, autostart: bool, a
             font_title: HFONT::default(),
             font_body: HFONT::default(),
             font_small: HFONT::default(),
+            font_link: HFONT::default(),
             font_mono: HFONT::default(),
             icon,
             btn_primary: RECT::default(),
             btn_secondary: RECT::default(),
             btn_close: RECT::default(),
-            btn_toggle: RECT::default(),
+            btn_link: RECT::default(),
             hot: HOT_NONE,
             focus: HOT_PRIMARY,
             focus_visible: false,
@@ -446,7 +416,7 @@ pub fn run(window_title: &str, state: Shared, action: Action, autostart: bool, a
             anim: 0,
         });
         // Ladicí build: rámeček fokusu hned od startu (`KEYPAD_SETUP_TEST_FOKUS`
-        // = `prepinac` | `hlavni` | `zavrit`) — kvůli snímku obrazovky bez
+        // = `odkaz` | `hlavni` | `zavrit`) — kvůli snímku obrazovky bez
         // posílání kláves do okna.
         #[cfg(debug_assertions)]
         let win = {
@@ -454,7 +424,7 @@ pub fn run(window_title: &str, state: Shared, action: Action, autostart: bool, a
             if let Ok(f) = std::env::var("KEYPAD_SETUP_TEST_FOKUS") {
                 win.focus_visible = true;
                 win.focus = match f.as_str() {
-                    "prepinac" => HOT_TOGGLE,
+                    "odkaz" => HOT_LINK,
                     "zavrit" => HOT_SECONDARY,
                     _ => HOT_PRIMARY,
                 };
@@ -592,7 +562,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 // Animace neurčitého pruhu — 30 snímků za sekundu.
                 use windows::Win32::UI::WindowsAndMessaging::SetTimer;
                 SetTimer(Some(hwnd), 1, 33, None);
-                if win.autostart {
+                // Jen z úvodní obrazovky: okno, které rovnou ukazuje
+                // výsledek (ovladač v pořádku, rada), nemá co spouštět.
+                let ready = matches!(win.state.lock().map(|s| s.phase), Ok(Phase::Ready));
+                if win.autostart && ready {
                     start(hwnd, win, Job::Main);
                 }
             }
@@ -685,41 +658,32 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                     HOT_SECONDARY | HOT_CLOSE => {
                         let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
                     }
-                    HOT_TOGGLE => {
-                        win.focus = HOT_TOGGLE;
-                        flip_option(hwnd, win);
-                    }
+                    HOT_LINK => open_credit(win),
                     _ => {}
                 }
                 LRESULT(0)
             }
             WM_KEYDOWN => {
                 // Celé okno jde projít bez myši: Tab přesouvá fokus mezi
-                // přepínačem a tlačítky, mezerník aktivuje prvek s fokusem
-                // (při puštění, viz WM_KEYUP), Enter tlačítko s fokusem
-                // (u přepínače hlavní tlačítko — jako výchozí tlačítko
-                // dialogu), Esc zavírá.
+                // odkazem a tlačítky, mezerník aktivuje prvek s fokusem
+                // (při puštění, viz WM_KEYUP), Enter prvek s fokusem, Esc
+                // zavírá.
                 //
                 // Opakování podržené klávesy (bit 30 = klávesa už dole
-                // byla) se ignoruje. Podržený mezerník by jinak přepínač
-                // cvakal sem a tam podle rychlosti opakování a podržený
-                // Enter — třeba ten, kterým uživatel instalátor spustil
-                // v Průzkumníku nebo v seznamu stažených souborů — by
-                // v čerstvě otevřeném okně rovnou spustil instalaci
-                // i s ovladačem, dřív než by si kdo přečetl, co udělá.
+                // byla) se ignoruje. Podržený Enter — třeba ten, kterým
+                // uživatel instalátor spustil v Průzkumníku nebo v seznamu
+                // stažených souborů — by jinak v čerstvě otevřeném okně
+                // rovnou spustil instalaci i s ovladačem, dřív než by si
+                // kdo přečetl, co udělá.
                 if is_repeat(lp) {
                     return LRESULT(0);
                 }
                 let controls = focusable(win);
-                if !controls.contains(&win.focus) {
-                    win.focus = controls.first().copied().unwrap_or(HOT_NONE);
-                }
+                win.focus = settle_focus(win.focus, &controls);
                 match key_down(wp.0 as u16, win.focus, &mut win.space_armed) {
                     KeyAct::Tab if !controls.is_empty() => {
                         let back = GetKeyState(VK_SHIFT.0 as i32) < 0;
-                        let i = controls.iter().position(|&c| c == win.focus).unwrap_or(0);
-                        let n = controls.len();
-                        win.focus = controls[if back { (i + n - 1) % n } else { (i + 1) % n }];
+                        win.focus = tab_next(win.focus, &controls, back);
                         win.focus_visible = true;
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
@@ -845,10 +809,10 @@ fn key_down(vk: u16, focus: u8, armed: &mut u8) -> KeyAct {
             *armed = focus;
             KeyAct::None
         }
-        // Enter hned při prvním stisku: tlačítko s fokusem, u přepínače
+        // Enter hned při prvním stisku: prvek s fokusem, bez fokusu
         // hlavní tlačítko (jako výchozí tlačítko dialogu).
         v if v == VK_RETURN.0 => KeyAct::Activate(match focus {
-            HOT_SECONDARY => HOT_SECONDARY,
+            HOT_SECONDARY | HOT_LINK => focus,
             _ => HOT_PRIMARY,
         }),
         v if v == VK_ESCAPE.0 => KeyAct::Close,
@@ -872,10 +836,38 @@ fn key_up(vk: u16, focus: u8, armed: &mut u8) -> KeyAct {
     }
 }
 
-/// Aktivuje ovládací prvek z klávesnice (mezerník).
+/// Fokus po změně obrazovky: zůstane, kde byl, jinak na hlavním
+/// tlačítku, pak na Zavřít. Na odkaz se sám NIKDY nepřesune (jen Tabem)
+/// — Enter by jinak na obrazovce bez tlačítek (během práce) otevíral
+/// prohlížeč.
+fn settle_focus(focus: u8, controls: &[u8]) -> u8 {
+    if controls.contains(&focus) {
+        return focus;
+    }
+    [HOT_PRIMARY, HOT_SECONDARY]
+        .into_iter()
+        .find(|c| controls.contains(c))
+        .unwrap_or(HOT_NONE)
+}
+
+/// Další prvek pro Tab (Shift+Tab `back`). Bez fokusu první (poslední).
+fn tab_next(focus: u8, controls: &[u8], back: bool) -> u8 {
+    let n = controls.len();
+    if n == 0 {
+        return HOT_NONE;
+    }
+    match controls.iter().position(|&c| c == focus) {
+        Some(i) if back => controls[(i + n - 1) % n],
+        Some(i) => controls[(i + 1) % n],
+        None if back => controls[n - 1],
+        None => controls[0],
+    }
+}
+
+/// Aktivuje ovládací prvek z klávesnice (mezerník, Enter).
 fn activate(hwnd: HWND, win: &mut Win, control: u8) {
     match control {
-        HOT_TOGGLE => flip_option(hwnd, win),
+        HOT_LINK => open_credit(win),
         HOT_SECONDARY => {
             // SAFETY: PostMessageW jen zařadí zprávu do fronty okna.
             unsafe {
@@ -893,8 +885,8 @@ fn focusable(win: &Win) -> Vec<u8> {
         return Vec::new();
     };
     let mut out = Vec::new();
-    if st.phase == Phase::Ready && st.option.is_some() {
-        out.push(HOT_TOGGLE);
+    if st.credit.is_some() {
+        out.push(HOT_LINK);
     }
     if !st.primary.is_empty() {
         out.push(HOT_PRIMARY);
@@ -905,17 +897,15 @@ fn focusable(win: &Win) -> Vec<u8> {
     out
 }
 
-/// Přepne přepínač (jen dokud se nezačalo — pak už o ničem nerozhoduje).
-fn flip_option(hwnd: HWND, win: &mut Win) {
-    if let Ok(mut st) = win.state.lock() {
-        if st.phase == Phase::Ready {
-            let on = !st.option_on();
-            st.set_option(on);
-        }
-    }
-    // SAFETY: překreslení vlastního okna.
-    unsafe {
-        let _ = InvalidateRect(Some(hwnd), None, false);
+/// Otevře odkaz creditu (repo autora).
+fn open_credit(win: &Win) {
+    let url = win
+        .state
+        .lock()
+        .ok()
+        .and_then(|s| s.credit.as_ref().map(|c| c.url.clone()));
+    if let Some(url) = url {
+        open_url(&url);
     }
 }
 
@@ -968,8 +958,8 @@ fn hit(win: &Win, x: i32, y: i32) -> u8 {
         HOT_PRIMARY
     } else if win.btn_secondary.right != 0 && inside(&win.btn_secondary) {
         HOT_SECONDARY
-    } else if win.btn_toggle.right != 0 && inside(&win.btn_toggle) {
-        HOT_TOGGLE
+    } else if win.btn_link.right != 0 && inside(&win.btn_link) {
+        HOT_LINK
     } else {
         HOT_NONE
     }
@@ -1023,6 +1013,10 @@ fn pick_face(candidates: &[&str]) -> HSTRING {
 
 /// Písmo `pt` bodů při `dpi`; uvolňuje volající (`DeleteObject`).
 fn create_font(dpi: i32, pt: i32, weight: i32, face: &HSTRING) -> HFONT {
+    create_font_ex(dpi, pt, weight, false, face)
+}
+
+fn create_font_ex(dpi: i32, pt: i32, weight: i32, underline: bool, face: &HSTRING) -> HFONT {
     // SAFETY: jen vytvoření fontu; uklidí ho volající.
     unsafe {
         CreateFontW(
@@ -1032,7 +1026,7 @@ fn create_font(dpi: i32, pt: i32, weight: i32, face: &HSTRING) -> HFONT {
             0,
             weight,
             0,
-            0,
+            underline as u32,
             0,
             DEFAULT_CHARSET,
             OUT_TT_PRECIS,
@@ -1049,6 +1043,7 @@ fn make_fonts(win: &mut Win) {
     win.font_title = create_font(win.dpi, 15, FW_BOLD.0 as i32, &win.face_ui);
     win.font_body = create_font(win.dpi, PT_BODY, normal, &win.face_ui);
     win.font_small = create_font(win.dpi, PT_SMALL, normal, &win.face_ui);
+    win.font_link = create_font_ex(win.dpi, PT_SMALL, normal, true, &win.face_ui);
     // Mono stack aplikace: Fira Mono → Cascadia Mono → Consolas
     // (Fira je v aplikaci jen jako webfont).
     win.font_mono = create_font(win.dpi, 8, normal, &win.face_mono);
@@ -1059,6 +1054,7 @@ fn delete_fonts(win: &mut Win) {
         &mut win.font_title,
         &mut win.font_body,
         &mut win.font_small,
+        &mut win.font_link,
         &mut win.font_mono,
     ] {
         if !f.is_invalid() {
@@ -1165,6 +1161,27 @@ fn text_height(hdc: HDC, r: RECT, s: &str, font: HFONT) -> i32 {
     }
 }
 
+/// Šířka jednořádkového textu (px) — klikací plocha odkazu.
+fn text_width(hdc: HDC, s: &str, font: HFONT) -> i32 {
+    use windows::Win32::Graphics::Gdi::DT_CALCRECT;
+    // SAFETY: DT_CALCRECT jen měří, nic nekreslí.
+    unsafe {
+        let old = SelectObject(hdc, font.into());
+        let mut wide: Vec<u16> = s.encode_utf16().collect();
+        let mut rr = RECT::default();
+        if !wide.is_empty() {
+            DrawTextW(
+                hdc,
+                &mut wide,
+                &mut rr,
+                DT_LEFT | DT_SINGLELINE | DT_CALCRECT,
+            );
+        }
+        SelectObject(hdc, old);
+        rr.right - rr.left
+    }
+}
+
 /// Jak se zpráva vejde do okna — od nejlepšího. DrawText ořezává
 /// potichu a u závěrečné zprávy bývá nejdůležitější právě konec
 /// (adresa ruční instalace, „Pozor:"), proto se měří, ne odhaduje.
@@ -1182,19 +1199,23 @@ pub enum Fit {
     Clipped,
 }
 
-/// Obdélníky zprávy při `dpi`: pod kroky a nad pruhem průběhu, a totéž
-/// až k tlačítkům. Stejná čísla jako v `draw` (pruh `bottom - 108`,
-/// tlačítka 34 vysoká s okrajem 24).
-fn message_rects(dpi: i32, rc: &RECT, steps: usize) -> (RECT, RECT) {
+/// Výška řádku creditu pod kroky (logické px).
+const CREDIT_H: i32 = 18;
+
+/// Obdélníky zprávy při `dpi`: pod kroky (a creditem) a nad pruhem
+/// průběhu, a totéž až k tlačítkům. Stejná čísla jako v `draw` (pruh
+/// `bottom - 108`, tlačítka 34 vysoká s okrajem 24).
+fn message_rects(dpi: i32, rc: &RECT, steps: usize, credit: bool) -> (RECT, RECT) {
     let s = |v: i32| v * dpi / 96;
+    let credit_h = if credit { s(CREDIT_H) } else { 0 };
     let normal = RECT {
         left: s(24),
-        top: s(HEAD_H) + s(22) + s(26) * steps as i32 + s(8),
+        top: s(HEAD_H) + s(22) + s(26) * steps as i32 + credit_h + s(8),
         right: rc.right - s(24),
         bottom: rc.bottom - s(108) - s(6),
     };
     let over_bar = RECT {
-        bottom: rc.bottom - s(24) - s(34) - s(10),
+        bottom: rc.bottom - s(24) - s(BTN_H) - s(10),
         ..normal
     };
     (normal, over_bar)
@@ -1226,14 +1247,14 @@ fn fit_message(
 /// Změří zprávu přesně tak, jak by ji kreslilo okno při 100 % DPI
 /// (paměťové DC, žádné okno) — pro test délky a výběr nejdelší zprávy
 /// v ladicím náhledu. Vrací výšku běžným písmem a jak se vejde (mimo
-/// práci, kdy smí ustoupit pruh).
+/// práci, kdy smí ustoupit pruh). `credit` = pod kroky je řádek creditu.
 #[cfg(any(test, debug_assertions))]
-fn measure_96(text: &str, steps: usize) -> (i32, Fit) {
-    measure_96_with(text, steps, true)
+fn measure_96(text: &str, steps: usize, credit: bool) -> (i32, Fit) {
+    measure_96_with(text, steps, credit, true)
 }
 
 #[cfg(any(test, debug_assertions))]
-fn measure_96_with(text: &str, steps: usize, may_cover_bar: bool) -> (i32, Fit) {
+fn measure_96_with(text: &str, steps: usize, credit: bool, may_cover_bar: bool) -> (i32, Fit) {
     let face = pick_face(UI_FACES);
     let body = create_font(96, PT_BODY, FW_NORMAL.0 as i32, &face);
     let small = create_font(96, PT_SMALL, FW_NORMAL.0 as i32, &face);
@@ -1243,7 +1264,7 @@ fn measure_96_with(text: &str, steps: usize, may_cover_bar: bool) -> (i32, Fit) 
         right: W,
         bottom: H,
     };
-    let (normal, over_bar) = message_rects(96, &rc, steps);
+    let (normal, over_bar) = message_rects(96, &rc, steps, credit);
     // SAFETY: paměťové DC i obě písma se v této funkci uvolní.
     unsafe {
         let hdc = CreateCompatibleDC(None);
@@ -1258,14 +1279,36 @@ fn measure_96_with(text: &str, steps: usize, may_cover_bar: bool) -> (i32, Fit) 
 
 /// Výška zprávy běžným písmem při 100 % DPI (px).
 #[cfg(any(test, debug_assertions))]
-pub fn message_height_96(text: &str, steps: usize) -> i32 {
-    measure_96(text, steps).0
+pub fn message_height_96(text: &str, steps: usize, credit: bool) -> i32 {
+    measure_96(text, steps, credit).0
 }
 
 /// Jak se zpráva vejde do okna s `steps` kroky při 100 % DPI.
 #[cfg(test)]
-pub fn message_fit_96(text: &str, steps: usize) -> Fit {
-    measure_96(text, steps).1
+pub fn message_fit_96(text: &str, steps: usize, credit: bool) -> Fit {
+    measure_96(text, steps, credit).1
+}
+
+/// Vejde se patička při 100 % DPI vedle obou tlačítek do jejich výšky
+/// (tak ji kreslí `draw` na úvodní obrazovce)?
+#[cfg(test)]
+pub fn footer_fits_96(text: &str) -> bool {
+    let face = pick_face(UI_FACES);
+    let small = create_font(96, PT_SMALL, FW_NORMAL.0 as i32, &face);
+    let r = RECT {
+        left: 24,
+        top: 0,
+        right: W - 24 - BTN_PRIMARY_W - BTN_GAP - BTN_SECONDARY_W - 12,
+        bottom: BTN_H,
+    };
+    // SAFETY: paměťové DC i písmo se v této funkci uvolní.
+    unsafe {
+        let hdc = CreateCompatibleDC(None);
+        let h = text_height(hdc, r, text, small);
+        let _ = DeleteDC(hdc);
+        let _ = DeleteObject(small.into());
+        h <= BTN_H
+    }
 }
 
 /// Rámeček fokusu klávesnice kolem `r`.
@@ -1407,27 +1450,8 @@ fn draw(hdc: HDC, rc: &RECT, win: &mut Win) {
             StepState::Active => (ACCENT, TEXT),
             StepState::Done => (OK, TEXT_DIM),
             StepState::Failed => (DANGER, DANGER),
-            StepState::Skipped => (BORDER, TEXT_FAINT),
         };
-        // Vypnutý krok: prázdný kroužek a poznámka — aby bylo vidět, že
-        // se na něj nezapomnělo, ale vědomě vynechá.
-        let skipped = *state == StepState::Skipped;
-        if skipped {
-            round_box(hdc, dot, s(8), None, Some(dot_c));
-        } else {
-            round_box(hdc, dot, s(8), Some(dot_c), None);
-        }
-        let shown;
-        let label = if skipped {
-            shown = if st.phase == Phase::Done {
-                format!("{label} — vynechán")
-            } else {
-                format!("{label} — vynechá se")
-            };
-            &shown
-        } else {
-            label
-        };
+        round_box(hdc, dot, s(8), Some(dot_c), None);
         text(
             hdc,
             RECT {
@@ -1444,92 +1468,40 @@ fn draw(hdc: HDC, rc: &RECT, win: &mut Win) {
         y += s(26);
     }
 
+    // ── Credit (ViGEmBus) ──
+    // Pod posledním krokem (ovladačem) jako jeho podpis: malé, tlumené,
+    // podtržené = odkaz. Klikací plocha je jen text, ne celý řádek.
+    win.btn_link = RECT::default();
+    if let Some(c) = st.credit.as_ref() {
+        let r = RECT {
+            left: s(44),
+            top: y - s(4),
+            right: rc.right - s(24),
+            bottom: y - s(4) + s(CREDIT_H),
+        };
+        let hot = win.hot == HOT_LINK;
+        text(
+            hdc,
+            r,
+            &c.text,
+            win.font_link,
+            if hot { TEXT_DIM } else { TEXT_FAINT },
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+        );
+        let area = RECT {
+            right: (r.left + text_width(hdc, &c.text, win.font_link)).min(r.right),
+            ..r
+        };
+        win.btn_link = area;
+        if win.focus_visible && win.focus == HOT_LINK {
+            focus_ring(hdc, area, s(3), s(6));
+        }
+    }
+
     // ── Stavový řádek / zpráva ──
     // Zpráva sedí NAD pruhem: dole jsou tlačítka a poznámka, takže
     // delší hláška by se s nimi přetlačovala.
-    let (mut msg_rect, mut over_bar) = message_rects(win.dpi, rc, st.steps.len());
-
-    // ── Přepínač (jen před začátkem) ──
-    win.btn_toggle = RECT::default();
-    if let (Phase::Ready, Some(t)) = (st.phase, st.option.as_ref()) {
-        let top = msg_rect.top + s(4);
-        let sw = RECT {
-            left: s(24),
-            top: top + s(1),
-            right: s(24) + s(36),
-            bottom: top + s(1) + s(20),
-        };
-        let lab = RECT {
-            left: sw.right + s(12),
-            top,
-            right: rc.right - s(24),
-            bottom: msg_rect.bottom,
-        };
-        let lab_h = text_height(hdc, lab, &t.label, win.font_body).max(s(22));
-        // Vypínač ve stylu aplikace: zapnutý = bílá dráha a tmavý
-        // knoflík vpravo, vypnutý = tmavá dráha s rámečkem, knoflík vlevo.
-        let knob = s(14);
-        let kt = sw.top + (s(20) - knob) / 2;
-        if t.on {
-            round_box(hdc, sw, s(20), Some(ACCENT), None);
-            let kr = RECT {
-                left: sw.right - s(3) - knob,
-                top: kt,
-                right: sw.right - s(3),
-                bottom: kt + knob,
-            };
-            round_box(hdc, kr, knob, Some(BG), None);
-        } else {
-            round_box(hdc, sw, s(20), Some(SURFACE), Some(BORDER));
-            let kr = RECT {
-                left: sw.left + s(3),
-                top: kt,
-                right: sw.left + s(3) + knob,
-                bottom: kt + knob,
-            };
-            round_box(hdc, kr, knob, Some(TEXT_DIM), None);
-        }
-        let hot = win.hot == HOT_TOGGLE;
-        text(
-            hdc,
-            lab,
-            &t.label,
-            win.font_body,
-            if t.on || hot { TEXT } else { TEXT_DIM },
-            DT_LEFT | DT_WORDBREAK,
-        );
-        let area = RECT {
-            left: sw.left,
-            top,
-            right: lab.right,
-            bottom: top + lab_h,
-        };
-        win.btn_toggle = area;
-        if win.focus_visible && win.focus == HOT_TOGGLE {
-            focus_ring(hdc, area, s(4), s(8));
-        }
-        let note_top = top + lab_h + s(6);
-        if !t.note.is_empty() {
-            let note = RECT {
-                top: note_top,
-                ..lab
-            };
-            text(
-                hdc,
-                note,
-                &t.note,
-                win.font_small,
-                // Ne TEXT_FAINT: poznámka je vysvětlení k výzvě správce
-                // a cizímu ovladači (souhlas) — musí se dát přečíst.
-                TEXT_DIM,
-                DT_LEFT | DT_WORDBREAK,
-            );
-            msg_rect.top = note_top + text_height(hdc, note, &t.note, win.font_small) + s(10);
-        } else {
-            msg_rect.top = note_top + s(4);
-        }
-    }
-    over_bar.top = msg_rect.top;
+    let (msg_rect, over_bar) = message_rects(win.dpi, rc, st.steps.len(), st.credit.is_some());
 
     // Vejde se zpráva? Když ne, menší písmo, a když ani to ne, místo
     // pruhu (jen mimo práci — neurčitý pruh je jediný důkaz, že se
@@ -1635,13 +1607,13 @@ fn draw(hdc: HDC, rc: &RECT, win: &mut Win) {
     }
 
     // ── Tlačítka ──
-    let bh = s(34);
+    let bh = s(BTN_H);
     let by = rc.bottom - s(24) - bh;
     let mut right = rc.right - s(24);
     win.btn_primary = RECT::default();
     win.btn_secondary = RECT::default();
     if !st.primary.is_empty() {
-        let bw = s(150);
+        let bw = s(BTN_PRIMARY_W);
         let r = RECT {
             left: right - bw,
             top: by,
@@ -1666,10 +1638,10 @@ fn draw(hdc: HDC, rc: &RECT, win: &mut Win) {
             focus_ring(hdc, r, s(3), s(9));
         }
         win.btn_primary = r;
-        right -= bw + s(10);
+        right -= bw + s(BTN_GAP);
     }
     if !st.secondary.is_empty() {
-        let bw = s(110);
+        let bw = s(BTN_SECONDARY_W);
         let r = RECT {
             left: right - bw,
             top: by,
@@ -1706,15 +1678,28 @@ fn draw(hdc: HDC, rc: &RECT, win: &mut Win) {
     }
 
     // Patička s poznámkou o tom, co se stane — jen dokud se nezačalo.
+    // Končí před nejlevějším tlačítkem (dřív pevné `right - 290` sahalo
+    // 4 px pod „Zavřít"); jeden řádek svisle na střed tlačítek.
     if st.phase == Phase::Ready && !st.footer.is_empty() {
+        let buttons_left = [win.btn_secondary, win.btn_primary]
+            .iter()
+            .filter(|r| r.right != 0)
+            .map(|r| r.left)
+            .min()
+            .unwrap_or(rc.right);
+        let mut r = RECT {
+            left: s(24),
+            top: by,
+            right: buttons_left - s(12),
+            bottom: by + bh,
+        };
+        let h = text_height(hdc, r, &st.footer, win.font_small);
+        if h < bh {
+            r.top += (bh - h) / 2;
+        }
         text(
             hdc,
-            RECT {
-                left: s(24),
-                top: by,
-                right: rc.right - s(290),
-                bottom: by + bh,
-            },
+            r,
             &st.footer,
             win.font_small,
             TEXT_FAINT,
@@ -1797,41 +1782,55 @@ mod tests {
         assert!(s.steps.iter().all(|x| x.1 == StepState::Waiting));
     }
 
-    fn with_driver(on: bool) -> State {
-        State::new("KeyPad", "", "", &["a", "b", "Ovladač"], "Nainstalovat").with_option(Toggle {
-            label: "Nainstalovat i ovladač".into(),
-            note: String::new(),
-            on,
-            step: 2,
+    fn with_driver() -> State {
+        State::new("KeyPad", "", "", &["a", "b", "Ovladač"], "Nainstalovat").with_credit(Credit {
+            text: "ViGEmBus — Nefarius".into(),
+            url: "https://example.invalid".into(),
         })
     }
 
+    /// Credit zůstává vidět ve všech fázích (i ve výsledku) a jde na
+    /// něj Tabem — ale Enter ho nikdy neotevře, dokud na něj uživatel
+    /// Tabem sám nepřešel.
     #[test]
-    fn vypnuty_prepinac_krok_vynecha_a_zapnuty_vrati() {
-        let mut s = with_driver(true);
-        assert!(s.option_on());
-        assert_eq!(s.steps[2].1, StepState::Waiting);
-        s.set_option(false);
-        assert!(!s.option_on());
-        assert_eq!(s.steps[2].1, StepState::Skipped);
-        // Seznam kroků se nezkracuje — přepínač neujede zpod myši.
-        assert_eq!(s.steps.len(), 3);
-        s.set_option(true);
-        assert_eq!(s.steps[2].1, StepState::Waiting);
+    fn credit_je_videt_a_fokus_na_nej_jen_tabem() {
+        let mut s = with_driver();
+        s.begin(Job::Main);
+        s.finish("hotovo", false, None);
+        assert!(s.credit.is_some());
+        // Obrazovka bez tlačítek (během práce): fokus nikam, Enter nic.
+        assert_eq!(settle_focus(HOT_PRIMARY, &[HOT_LINK]), HOT_NONE);
+        assert_eq!(settle_focus(HOT_LINK, &[HOT_LINK]), HOT_LINK);
+        // Po změně obrazovky: hlavní tlačítko, pak Zavřít.
+        let all = [HOT_LINK, HOT_PRIMARY, HOT_SECONDARY];
+        assert_eq!(settle_focus(HOT_NONE, &all), HOT_PRIMARY);
+        assert_eq!(
+            settle_focus(HOT_PRIMARY, &[HOT_LINK, HOT_SECONDARY]),
+            HOT_SECONDARY
+        );
+        // Tab dokola, Shift+Tab pozpátku, bez fokusu od kraje.
+        assert_eq!(tab_next(HOT_PRIMARY, &all, false), HOT_SECONDARY);
+        assert_eq!(tab_next(HOT_SECONDARY, &all, false), HOT_LINK);
+        assert_eq!(tab_next(HOT_LINK, &all, true), HOT_SECONDARY);
+        assert_eq!(tab_next(HOT_NONE, &all, false), HOT_LINK);
+        assert_eq!(tab_next(HOT_NONE, &all, true), HOT_SECONDARY);
+        assert_eq!(tab_next(HOT_NONE, &[], false), HOT_NONE);
     }
 
+    /// Credit posune zprávu níž o svůj řádek — měření i kreslení počítají
+    /// se stejným místem.
     #[test]
-    fn vynechany_krok_zustane_vynechany_az_do_konce() {
-        let mut s = with_driver(false);
-        s.begin(Job::Main);
-        assert_eq!(s.steps[2].1, StepState::Skipped);
-        s.step(1, "b");
-        assert_eq!(s.steps[2].1, StepState::Skipped);
-        s.finish("hotovo", false, None);
-        assert_eq!(
-            s.steps.iter().map(|x| x.1).collect::<Vec<_>>(),
-            [StepState::Done, StepState::Done, StepState::Skipped]
-        );
+    fn credit_posune_zpravu() {
+        let rc = RECT {
+            left: 0,
+            top: 0,
+            right: W,
+            bottom: H,
+        };
+        let (a, _) = message_rects(96, &rc, 6, false);
+        let (b, _) = message_rects(96, &rc, 6, true);
+        assert_eq!(b.top - a.top, CREDIT_H);
+        assert_eq!(a.bottom, b.bottom);
     }
 
     /// Čím delší zpráva, tím úspornější kreslení — a nikdy potichu
@@ -1841,7 +1840,7 @@ mod tests {
     fn dlouha_zprava_prejde_na_mensi_pismo() {
         let line = "Pozor: zástupce v nabídce Start se nepodařilo vytvořit — přístup odepřen.";
         let text = |n: usize| vec![line; n].join("\n");
-        let fits: Vec<Fit> = (1..=16).map(|n| measure_96(&text(n), 6).1).collect();
+        let fits: Vec<Fit> = (1..=16).map(|n| measure_96(&text(n), 6, true).1).collect();
         assert_eq!(fits[0], Fit::Body);
         assert_eq!(*fits.last().unwrap(), Fit::Clipped);
         // Pořadí se nikdy nevrací (Body → Small → SmallOverBar → Clipped)
@@ -1857,7 +1856,7 @@ mod tests {
         // Během práce pruh neustoupí: co by se vešlo jen místo pruhu, je
         // tam rovnou Clipped (neurčitý pruh je důkaz, že se pracuje).
         let n = fits.iter().position(|f| *f == Fit::SmallOverBar).unwrap() + 1;
-        assert_eq!(measure_96_with(&text(n), 6, false).1, Fit::Clipped);
+        assert_eq!(measure_96_with(&text(n), 6, true, false).1, Fit::Clipped);
     }
 
     /// Opakování podržené klávesy (bit 30) se pozná; první stisk ne.
@@ -1869,26 +1868,24 @@ mod tests {
     }
 
     /// Mezerník působí při puštění a jen na prvku, na kterém byl
-    /// stisknutý; Enter hned (u přepínače hlavní tlačítko); Esc zavírá.
+    /// stisknutý; Enter hned (na odkazu odkaz, bez fokusu hlavní
+    /// tlačítko); Esc zavírá.
     #[test]
     fn klavesnice() {
         let (sp, en) = (VK_SPACE.0, VK_RETURN.0);
         let mut armed = HOT_NONE;
-        // Stisk + puštění mezerníku na přepínači = jedno přepnutí.
-        assert_eq!(key_down(sp, HOT_TOGGLE, &mut armed), KeyAct::None);
-        assert_eq!(
-            key_up(sp, HOT_TOGGLE, &mut armed),
-            KeyAct::Activate(HOT_TOGGLE)
-        );
+        // Stisk + puštění mezerníku na odkazu = jedno otevření.
+        assert_eq!(key_down(sp, HOT_LINK, &mut armed), KeyAct::None);
+        assert_eq!(key_up(sp, HOT_LINK, &mut armed), KeyAct::Activate(HOT_LINK));
         // Puštění bez stisku v tomhle okně (držel ho, když se okno
         // otevíralo) nic nedělá.
         assert_eq!(key_up(sp, HOT_PRIMARY, &mut armed), KeyAct::None);
         // Tab mezi stiskem a puštěním mezerník zruší.
-        key_down(sp, HOT_TOGGLE, &mut armed);
-        assert_eq!(key_down(VK_TAB.0, HOT_TOGGLE, &mut armed), KeyAct::Tab);
+        key_down(sp, HOT_LINK, &mut armed);
+        assert_eq!(key_down(VK_TAB.0, HOT_LINK, &mut armed), KeyAct::Tab);
         assert_eq!(key_up(sp, HOT_PRIMARY, &mut armed), KeyAct::None);
         // Fokus se mezitím změnil jinak (myš) — taky nic.
-        key_down(sp, HOT_TOGGLE, &mut armed);
+        key_down(sp, HOT_LINK, &mut armed);
         assert_eq!(key_up(sp, HOT_PRIMARY, &mut armed), KeyAct::None);
         // Mezerník na tlačítkách.
         key_down(sp, HOT_SECONDARY, &mut armed);
@@ -1896,9 +1893,13 @@ mod tests {
             key_up(sp, HOT_SECONDARY, &mut armed),
             KeyAct::Activate(HOT_SECONDARY)
         );
-        // Enter hned: tlačítko s fokusem, u přepínače hlavní.
+        // Enter hned: prvek s fokusem, bez fokusu hlavní tlačítko.
         assert_eq!(
-            key_down(en, HOT_TOGGLE, &mut armed),
+            key_down(en, HOT_LINK, &mut armed),
+            KeyAct::Activate(HOT_LINK)
+        );
+        assert_eq!(
+            key_down(en, HOT_NONE, &mut armed),
             KeyAct::Activate(HOT_PRIMARY)
         );
         assert_eq!(
@@ -1918,15 +1919,15 @@ mod tests {
     }
 
     #[test]
-    fn dodatecny_ovladac_nezacina_instalaci_znovu() {
-        let mut s = with_driver(false);
+    fn opakovany_ovladac_nezacina_instalaci_znovu() {
+        let mut s = with_driver();
         s.begin(Job::Main);
         s.finish(
-            "KeyPad hotový, ovladač vynechán",
-            false,
-            Some(Next::Driver("Nainstalovat ovladač".into())),
+            "KeyPad hotový, výzva Windows nepotvrzená",
+            true,
+            Some(Next::Driver("Zkusit znovu ovladač".into())),
         );
-        assert_eq!(s.primary, "Nainstalovat ovladač");
+        assert_eq!(s.primary, "Zkusit znovu ovladač");
         s.begin(Job::Driver);
         assert_eq!(s.job, Job::Driver);
         assert_eq!(

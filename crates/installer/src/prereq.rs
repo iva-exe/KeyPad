@@ -4,9 +4,9 @@
 //! Jen se **čte** z registru. WebView2 Runtime je komponenta Microsoftu
 //! s vlastním instalátorem; úkolem KeyPadSetupu je jasně říct, že chybí
 //! a kde ho vzít — ne mlčky dokončit instalaci aplikace, která se pak
-//! nespustí. (Ovladač ViGEmBus instalátor umí doinstalovat sám, po
-//! kliknutí — stav i ověřené vydání má `updater::vigembus`, postup
-//! `driver.rs`.)
+//! nespustí. (Ovladač ViGEmBus instalátor umí nainstalovat i aktualizovat
+//! sám, přes výzvu UAC — stav i ověřené vydání má `updater::vigembus`,
+//! postup `driver.rs`.)
 
 use windows::core::HSTRING;
 use windows::Win32::System::Registry::{

@@ -5,7 +5,7 @@
 //! 1. Tam každé volání čeká na ovladač bez limitu
 //!    (`GetOverlappedResult(bWait=TRUE)`) — pad vlákno by se mohlo
 //!    zaseknout navždy. Tady má každé IOCTL časový limit.
-//! 2. Chyby potřebujeme od sebe odlišit: 170 = ovladač report ZAHODIL
+//! 2. Chyby potřebujeme od sebe odlišit: 170/259 = ovladač report ZAHODIL
 //!    (poslat znovu, jinak páčka zůstane vychýlená), 55 = target zmizel,
 //!    483 = první instalace zařízení nestihla 1 s, 650 = bez slotu XInput.
 //!    Crate je slévá, oficiální klient v C chybu 170 dokonce spolkne.
@@ -181,8 +181,9 @@ pub enum VigemError {
     NoFreeSerial,
     /// 55 ERROR_DEV_NOT_EXIST — target (ještě / už) neexistuje.
     Gone,
-    /// 170 ERROR_BUSY — xusb22 zrovna nečeká na data a ovladač report
-    /// ZAHODIL (neuloží si ho). Musí se poslat znovu.
+    /// 170 ERROR_BUSY nebo 259 ERROR_NO_MORE_ITEMS — xusb22 zrovna
+    /// nečeká na data a ovladač report ZAHODIL (neuloží si ho). Musí se
+    /// poslat znovu.
     Busy,
     /// 483 — ovladač nedostal do 1 s „LED" od xusb22; typicky první
     /// připojení na novém PC, kdy Windows teprve instalují zařízení.
@@ -231,7 +232,12 @@ fn win32(e: &windows::core::Error) -> u32 {
 fn chyba_z_kodu(c: u32) -> VigemError {
     match c {
         55 => VigemError::Gone,
-        170 => VigemError::Busy,
+        // 259 = STATUS_NO_MORE_ENTRIES z WdfIoQueueRetrieveNextRequest
+        // (XusbPdo.cpp, SubmitReportImpl): xusb22 nemá ve frontě žádný
+        // požadavek na data, report se zahodil — totéž co 170. Naměřeno
+        // 29. 9. 2026 hned po připojení, když v systému byl druhý
+        // virtuální pad (sériové číslo 2); dřív končilo chybou padu.
+        170 | 259 => VigemError::Busy,
         483 => VigemError::NotReadyYet,
         650 => VigemError::NoUserIndex,
         _ if c == WAIT_TIMEOUT.0 => VigemError::TimedOut,
@@ -655,6 +661,7 @@ mod tests {
     fn kody_chyb() {
         assert_eq!(chyba_z_kodu(55), VigemError::Gone);
         assert_eq!(chyba_z_kodu(170), VigemError::Busy);
+        assert_eq!(chyba_z_kodu(259), VigemError::Busy, "report zahozen");
         assert_eq!(chyba_z_kodu(483), VigemError::NotReadyYet);
         assert_eq!(chyba_z_kodu(650), VigemError::NoUserIndex);
         assert_eq!(chyba_z_kodu(258), VigemError::TimedOut);
