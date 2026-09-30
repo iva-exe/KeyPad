@@ -9,16 +9,17 @@ hráče s gamepadem, i když hraješ na klávesnici.
 tvoje klávesnice → KeyPad → virtuální Xbox ovladač → Steam → Remote Play → hra u hostitele
 ```
 
-Mezi režimy **Klávesnice** a **Gamepad** se přepíná klávesou
-**Scroll Lock** nebo tlačítkem v okně. V režimu Gamepad jdou do
-ovladače jen namapované klávesy (WASD, šipky…), všechno ostatní funguje
-dál normálně — Alt+Tab, Win, Alt+F4.
+Ovladač zapneš **přepínačem v okně** — od té chvíle jdou namapované
+klávesy (WASD, šipky…) do ovladače, všechno ostatní funguje dál
+normálně: Alt+Tab, Win, Alt+F4. Klávesou **Scroll Lock** převádění
+**pozastavíš** (třeba kvůli psaní do chatu) — ovladač zůstane
+připojený, jen stojí; dalším Scroll Lockem ho zase pustíš.
 
-> **Poctivě: tahle verze ještě klávesy nepřevádí.** Instalace, okno,
-> aktualizace a virtuální ovladač fungují (zapneš ho přepínačem, tlačítkem
-> **Vyzkoušet** s ním krátce zakroužíš), samotné převádění kláves na
-> gamepad přibude v dalších verzích. Nic nemusíš stahovat znovu — nové
-> verze ti KeyPad nabídne sám (viz [Aktualizace](#aktualizace)).
+> **Poctivě: tahle verze je první, která klávesy převádí.** Rozložení
+> kláves je zatím pevné (tabulka v [ROADMAP.md](ROADMAP.md#výchozí-mapování-podle-pozice-kláves));
+> vlastní klávesy a víc ovladačů z jedné klávesnice přibudou v dalších
+> verzích. Nic nemusíš stahovat znovu — nové verze ti KeyPad nabídne sám
+> (viz [Aktualizace](#aktualizace)).
 
 ## Co budeš potřebovat
 
@@ -116,7 +117,8 @@ vypne a KeyPad skončí.
 | **Vypnutý** | ovladač v systému není; zapneš ho přepínačem |
 | **Nezapnul se** | zapnutí se nepovedlo — důvod v bublině, zkus to znovu |
 | **Zapínám…** | Windows ovladač nastavují (napoprvé na novém PC chvíli trvá) |
-| **Zapnutý** | ovladač běží — **Vyzkoušet** s ním krátce zakrouží (Win+R → `joy.cpl`) |
+| **Zapnutý** | ovladač běží a klávesy ho ovládají — **Vyzkoušet** s ním krátce zakrouží (Win+R → `joy.cpl`) |
+| **Pozastaveno** | ovladač běží, ale klávesy jdou do Windows (Scroll Lock) — tečka jen obrysem |
 | **Chybí ViGEmBus** | tlačítko **Nainstalovat ovladač** |
 | **ViGEmBus neběží** | nainstalovaný, ale nespustil se — rada v bublině (restart, Správce zařízení…) |
 
@@ -179,7 +181,9 @@ je nová verze. Zdrojový kód je veřejný:
 ## Bezpečnost: klávesnice se nikdy neztratí
 
 - Při jakékoli chybě se KeyPad sám přepne zpátky do režimu
-  **Klávesnice**. Nikdy naopak.
+  **Klávesnice** (klávesy jdou do Windows). Nikdy naopak.
+- Sledovat klávesnici KeyPad začne, až když zapneš ovladač, a s vypnutím
+  posledního ovladače přestane. Stisky kláves nikam neukládá — ani do logu.
 - V režimu Gamepad fungují všechny klávesy, které nejsou namapované —
   Alt+Tab, Win, Alt+F4.
 - **Poslední záchrana:** **Ctrl+Alt+Del** → **Správce úloh** → KeyPad →

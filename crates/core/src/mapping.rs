@@ -1,4 +1,4 @@
-//! Mapování kláves na akce + zkratka přepnutí, včetně validace.
+//! Mapování kláves na akce ovladačů + zkratka přepnutí, včetně validace.
 //!
 //! Invarianta: hodnota [`Mapping`] je VŽDY platná. Jinak se nedá
 //! vyrobit — [`Mapping::new`] vrací chyby a upravující metody změnu
@@ -7,34 +7,53 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::action::{Action, PadButton, StickDir};
+use crate::action::{Action, PadAction, PadButton, PadId, StickDir};
 use crate::key::{KeyId, KEY_TABLE_SIZE};
 
 /// Proč mapování není platné. GUI je ukazuje přímo u řádku (Fáze 6),
 /// načtení konfigurace podle nich zálohuje nevalidní soubor (Fáze 7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MappingError {
-    /// Žádná klávesa není namapovaná — v režimu Gamepad by nešlo nic.
+    /// Žádná klávesa není namapovaná (na žádném ovladači) — v režimu
+    /// Gamepad by nešlo nic.
     Empty,
     /// Úprava by odebrala poslední vazbu (viz [`MappingError::Empty`]).
     WouldBeEmpty,
-    /// Jedna klávesa u dvou různých akcí. Stisk by nešel rozhodnout.
+    /// Jedna klávesa u dvou různých akcí (nebo u téže akce dvou
+    /// ovladačů). Stisk by nešel rozhodnout.
     DuplicateKey {
         key: KeyId,
-        first: Action,
-        second: Action,
+        first: PadAction,
+        second: PadAction,
     },
     /// Zkratka přepnutí je zároveň namapovaná na akci. Stisk zkratky
     /// vždy přepíná režim, akce by se nikdy nespustila.
-    ToggleKeyMapped { key: KeyId, action: Action },
+    ToggleKeyMapped { key: KeyId, action: PadAction },
     /// Zkratkou přepnutí nesmí být Esc — Esc ruší přiřazování kláves
     /// a se zkratkou by se z přiřazování nedalo vycouvat.
     ToggleIsEscape,
     /// Klávesa se mapovat nedá ([`KeyId::is_mappable`]). `action` je
     /// `None`, jde-li o zkratku přepnutí.
-    Unmappable { key: KeyId, action: Option<Action> },
+    Unmappable {
+        key: KeyId,
+        action: Option<PadAction>,
+    },
     /// Odebíraná klávesa nemá vazbu.
     NotMapped { key: KeyId },
+}
+
+/// Akce s ovladačem pro hlášky v logu (hráči počítají od jedničky).
+struct Cil(PadAction);
+
+impl std::fmt::Display for Cil {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:?} na ovladači {}",
+            self.0.action,
+            self.0.pad.index() + 1
+        )
+    }
 }
 
 impl std::fmt::Display for MappingError {
@@ -44,11 +63,14 @@ impl std::fmt::Display for MappingError {
             MappingError::WouldBeEmpty => write!(f, "poslední vazbu nelze odebrat"),
             MappingError::DuplicateKey { key, first, second } => write!(
                 f,
-                "klávesa {key} je přiřazena dvěma akcím ({first:?} a {second:?})"
+                "klávesa {key} je přiřazena dvěma akcím ({} a {})",
+                Cil(*first),
+                Cil(*second)
             ),
             MappingError::ToggleKeyMapped { key, action } => write!(
                 f,
-                "klávesa {key} je zkratka přepnutí a nemůže zároveň ovládat {action:?}"
+                "klávesa {key} je zkratka přepnutí a nemůže zároveň ovládat {}",
+                Cil(*action)
             ),
             MappingError::ToggleIsEscape => write!(f, "Esc nemůže být zkratka přepnutí"),
             MappingError::Unmappable { key, .. } => write!(f, "klávesu {key} nelze mapovat"),
@@ -59,10 +81,14 @@ impl std::fmt::Display for MappingError {
 
 impl std::error::Error for MappingError {}
 
-/// Kompletní rozvržení kláves: vazby klávesa → akce a zkratka přepnutí.
+/// Kompletní rozvržení kláves: vazby klávesa → akce na ovladači
+/// a zkratka přepnutí.
 ///
-/// Víc kláves na jednu akci je povoleno; jedna klávesa na dvě akce ne.
-/// Proto je to tabulka podle klávesy.
+/// Víc kláves na jednu akci je povoleno; jedna klávesa na dvě akce ne —
+/// ani na dvou ovladačích (jeden stisk by hýbal dvěma hráči). Proto je
+/// to tabulka podle klávesy a ovladač je součástí cíle. Ovladač bez
+/// jediné klávesy je v pořádku (nově přidaný začíná prázdný); prázdné
+/// nesmí být jen mapování jako celek.
 ///
 /// Pevná tabulka ([`KeyId::index`]), ne `BTreeMap`: přiřazení klávesy
 /// probíhá v hook callbacku a strom by při vkládání alokoval (revize
@@ -75,7 +101,7 @@ impl std::error::Error for MappingError {}
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Mapping {
     toggle: KeyId,
-    keys: [Option<Action>; KEY_TABLE_SIZE],
+    keys: [Option<PadAction>; KEY_TABLE_SIZE],
 }
 
 impl std::fmt::Debug for Mapping {
@@ -92,11 +118,11 @@ impl Mapping {
     /// Postaví a zvaliduje mapování. Vrací VŠECHNY nalezené chyby, ať je
     /// GUI může ukázat najednou, ne jednu po druhé.
     ///
-    /// Stejná klávesa uvedená dvakrát u téže akce chybou není — nic
-    /// nerozbíjí, jen se sloučí.
+    /// Stejná klávesa uvedená dvakrát u téže akce téhož ovladače chybou
+    /// není — nic nerozbíjí, jen se sloučí.
     pub fn new(
         toggle: KeyId,
-        bindings: impl IntoIterator<Item = (KeyId, Action)>,
+        bindings: impl IntoIterator<Item = (KeyId, PadAction)>,
     ) -> Result<Mapping, Vec<MappingError>> {
         let mut errors = Vec::new();
         if !toggle.is_mappable() {
@@ -111,28 +137,31 @@ impl Mapping {
 
         let mut keys = [None; KEY_TABLE_SIZE];
         let mut rejected_binding = false;
-        for (key, action) in bindings {
+        for (key, target) in bindings {
             let Some(slot) = key.index().and_then(|i| keys.get_mut(i)) else {
                 errors.push(MappingError::Unmappable {
                     key,
-                    action: Some(action),
+                    action: Some(target),
                 });
                 rejected_binding = true;
                 continue;
             };
             if key == toggle {
-                errors.push(MappingError::ToggleKeyMapped { key, action });
+                errors.push(MappingError::ToggleKeyMapped {
+                    key,
+                    action: target,
+                });
                 rejected_binding = true;
                 continue;
             }
             match *slot {
-                Some(first) if first != action => errors.push(MappingError::DuplicateKey {
+                Some(first) if first != target => errors.push(MappingError::DuplicateKey {
                     key,
                     first,
-                    second: action,
+                    second: target,
                 }),
                 Some(_) => {}
-                None => *slot = Some(action),
+                None => *slot = Some(target),
             }
         }
         // Prázdné se hlásí, jen když žádná vazba nevypadla kvůli jiné
@@ -151,36 +180,44 @@ impl Mapping {
         }
     }
 
-    /// Zkratka přepnutí Klávesnice ↔ Gamepad.
+    /// Zkratka přepnutí (pozastavení zachytávání).
     pub fn toggle_key(&self) -> KeyId {
         self.toggle
     }
 
-    /// Akce namapovaná na klávesu.
-    pub fn action_for(&self, key: KeyId) -> Option<Action> {
+    /// Akce a ovladač, na které je klávesa namapovaná.
+    pub fn target(&self, key: KeyId) -> Option<PadAction> {
         key.index()
             .and_then(|i| self.keys.get(i).copied())
             .flatten()
     }
 
-    /// Klávesy dané akce (může jich být víc).
-    pub fn keys_for(&self, action: Action) -> impl Iterator<Item = KeyId> + '_ {
+    /// Klávesy dané akce daného ovladače (může jich být víc).
+    pub fn keys_for(&self, t: PadAction) -> impl Iterator<Item = KeyId> + '_ {
         self.bindings()
-            .filter(move |&(_, a)| a == action)
+            .filter(move |&(_, b)| b == t)
             .map(|(k, _)| k)
     }
 
     /// Všechny vazby — nejdřív běžné klávesy podle scan kódu, pak
     /// rozšířené (E0).
-    pub fn bindings(&self) -> impl Iterator<Item = (KeyId, Action)> + '_ {
+    pub fn bindings(&self) -> impl Iterator<Item = (KeyId, PadAction)> + '_ {
         self.keys
             .iter()
             .enumerate()
-            .filter_map(|(i, a)| a.map(|a| (KeyId::from_index(i), a)))
+            .filter_map(|(i, t)| t.map(|t| (KeyId::from_index(i), t)))
     }
 
+    /// Vazby jednoho ovladače (ve stejném pořadí jako [`Mapping::bindings`]).
+    pub fn pad_bindings(&self, pad: PadId) -> impl Iterator<Item = (KeyId, Action)> + '_ {
+        self.bindings()
+            .filter(move |(_, t)| t.pad == pad)
+            .map(|(k, t)| (k, t.action))
+    }
+
+    /// Počet vazeb všech ovladačů.
     pub fn len(&self) -> usize {
-        self.keys.iter().filter(|a| a.is_some()).count()
+        self.keys.iter().filter(|t| t.is_some()).count()
     }
 
     /// Vždy `false` — prázdné mapování nejde vyrobit. Metoda je tu kvůli
@@ -189,28 +226,30 @@ impl Mapping {
         self.len() == 0
     }
 
-    /// Přiřadí klávesu akci (přidá ji k případným dalším klávesám té
-    /// akce). Patřila-li klávesa dosud JINÉ akci, vazba se přesune
-    /// a vrátí se původní akce — dvě akce na jedné klávese být nesmí.
+    /// Přiřadí klávesu akci ovladače (přidá ji k případným dalším
+    /// klávesám té akce). Patřila-li klávesa dosud JINÉ akci nebo jinému
+    /// ovladači, vazba se přesune a vrátí se původní cíl — klávesa patří
+    /// vždy jen jednomu ovladači a jedné akci.
     ///
     /// Nealokuje — volá se z hook callbacku.
-    pub fn bind(&mut self, key: KeyId, action: Action) -> Result<Option<Action>, MappingError> {
+    pub fn bind(&mut self, key: KeyId, t: PadAction) -> Result<Option<PadAction>, MappingError> {
         if key == self.toggle {
-            return Err(MappingError::ToggleKeyMapped { key, action });
+            return Err(MappingError::ToggleKeyMapped { key, action: t });
         }
         let Some(slot) = key.index().and_then(|i| self.keys.get_mut(i)) else {
             return Err(MappingError::Unmappable {
                 key,
-                action: Some(action),
+                action: Some(t),
             });
         };
-        let previous = slot.replace(action);
-        Ok(previous.filter(|&p| p != action))
+        let previous = slot.replace(t);
+        Ok(previous.filter(|&p| p != t))
     }
 
-    /// Odebere vazbu klávesy. Poslední vazbu odebrat nelze.
-    pub fn unbind(&mut self, key: KeyId) -> Result<Action, MappingError> {
-        let Some(action) = self.action_for(key) else {
+    /// Odebere vazbu klávesy. Poslední vazbu (celého mapování) odebrat
+    /// nelze.
+    pub fn unbind(&mut self, key: KeyId) -> Result<PadAction, MappingError> {
+        let Some(t) = self.target(key) else {
             return Err(MappingError::NotMapped { key });
         };
         if self.len() == 1 {
@@ -219,7 +258,24 @@ impl Mapping {
         if let Some(slot) = key.index().and_then(|i| self.keys.get_mut(i)) {
             *slot = None;
         }
-        Ok(action)
+        Ok(t)
+    }
+
+    /// Odebere všechny vazby ovladače (ovladač zmizel z okna) a vrátí,
+    /// kolik jich bylo. Všechno, nebo nic: patří-li ovladači všechny
+    /// vazby, mapování by zůstalo prázdné → [`MappingError::WouldBeEmpty`]
+    /// a nic se neodebere.
+    pub fn clear_pad(&mut self, pad: PadId) -> Result<usize, MappingError> {
+        let n = self.pad_bindings(pad).count();
+        if n > 0 && n == self.len() {
+            return Err(MappingError::WouldBeEmpty);
+        }
+        for slot in &mut self.keys {
+            if slot.is_some_and(|t| t.pad == pad) {
+                *slot = None;
+            }
+        }
+        Ok(n)
     }
 
     /// Změní zkratku přepnutí. Nesmí být namapovaná ani Esc.
@@ -230,7 +286,7 @@ impl Mapping {
         if key == KeyId::ESC {
             return Err(MappingError::ToggleIsEscape);
         }
-        if let Some(action) = self.action_for(key) {
+        if let Some(action) = self.target(key) {
             return Err(MappingError::ToggleKeyMapped { key, action });
         }
         self.toggle = key;
@@ -240,9 +296,10 @@ impl Mapping {
 
 impl Default for Mapping {
     /// Výchozí rozvržení podle POZICE kláves (ROADMAP.md, „Výchozí
-    /// mapování"): levá páčka WASD, pravá šipky, D-pad IJKL, A/B/X/Y
-    /// mezerník/C/F/R, LB/RB Q/E, LT/RT 1/3, L3/R3 levý Shift/V,
-    /// Start/Back Enter/Backspace, přepnutí Scroll Lock.
+    /// mapování"), celé na prvním ovladači: levá páčka WASD, pravá
+    /// šipky, D-pad IJKL, A/B/X/Y mezerník/C/F/R, LB/RB Q/E, LT/RT 1/3,
+    /// L3/R3 levý Shift/V, Start/Back Enter/Backspace, přepnutí Scroll
+    /// Lock. Další ovladače začínají bez kláves.
     fn default() -> Self {
         use Action::{Button, LeftStick, LeftTrigger, RightStick, RightTrigger};
         use PadButton as B;
@@ -275,8 +332,11 @@ impl Default for Mapping {
             (KeyId::BACKSPACE, Button(B::Back)),
         ];
         // Pevná data, platnost hlídá test `vychozi_mapovani_je_platne`.
-        Mapping::new(KeyId::SCROLL_LOCK, bindings)
-            .unwrap_or_else(|e| unreachable!("výchozí mapování je neplatné: {e:?}"))
+        Mapping::new(
+            KeyId::SCROLL_LOCK,
+            bindings.map(|(k, a)| (k, PadAction::first(a))),
+        )
+        .unwrap_or_else(|e| unreachable!("výchozí mapování je neplatné: {e:?}"))
     }
 }
 
@@ -284,8 +344,13 @@ impl Default for Mapping {
 mod tests {
     use super::*;
 
-    const UP: Action = Action::LeftStick(StickDir::Up);
-    const A_BTN: Action = Action::Button(PadButton::A);
+    const UP: PadAction = PadAction::first(Action::LeftStick(StickDir::Up));
+    const A_BTN: PadAction = PadAction::first(Action::Button(PadButton::A));
+    const P1: PadId = PadId::ALL[1];
+
+    fn na(pad: PadId, t: PadAction) -> PadAction {
+        PadAction::new(pad, t.action)
+    }
 
     #[test]
     fn vychozi_mapovani_je_platne() {
@@ -294,15 +359,20 @@ mod tests {
         assert_eq!(znovu, d);
         assert_eq!(d.len(), 24);
         assert_eq!(d.toggle_key(), KeyId::SCROLL_LOCK);
-        assert_eq!(d.action_for(KeyId::W), Some(UP));
-        assert_eq!(d.action_for(KeyId::NUMPAD_8), None);
+        assert_eq!(d.target(KeyId::W), Some(UP));
+        assert_eq!(d.target(KeyId::NUMPAD_8), None);
         assert_eq!(
-            d.action_for(KeyId::ARROW_UP),
-            Some(Action::RightStick(StickDir::Up))
+            d.target(KeyId::ARROW_UP),
+            Some(PadAction::first(Action::RightStick(StickDir::Up)))
         );
-        // Každá akce má ve výchozím mapování právě jednu klávesu.
+        // Každá akce má ve výchozím mapování právě jednu klávesu, vše na
+        // prvním ovladači; ostatní ovladače začínají prázdné.
         for a in Action::all() {
-            assert_eq!(d.keys_for(a).count(), 1, "{a:?}");
+            assert_eq!(d.keys_for(PadAction::first(a)).count(), 1, "{a:?}");
+        }
+        assert_eq!(d.pad_bindings(PadId::FIRST).count(), 24);
+        for p in &PadId::ALL[1..] {
+            assert_eq!(d.pad_bindings(*p).count(), 0, "{p:?}");
         }
     }
 
@@ -320,23 +390,49 @@ mod tests {
     }
 
     #[test]
+    fn klavesa_nesmi_patrit_dvema_ovladacum() {
+        // Tatáž akce, jiný ovladač: jeden stisk by hýbal dvěma hráči.
+        let e =
+            Mapping::new(KeyId::SCROLL_LOCK, [(KeyId::W, UP), (KeyId::W, na(P1, UP))]).unwrap_err();
+        assert_eq!(
+            e,
+            vec![MappingError::DuplicateKey {
+                key: KeyId::W,
+                first: UP,
+                second: na(P1, UP)
+            }]
+        );
+    }
+
+    #[test]
     fn stejna_vazba_dvakrat_neni_chyba() {
         let m = Mapping::new(KeyId::SCROLL_LOCK, [(KeyId::W, UP), (KeyId::W, UP)]).unwrap();
         assert_eq!(m.len(), 1);
     }
 
     #[test]
+    fn prazdny_ovladac_neni_chyba() {
+        // Jen druhý ovladač má klávesy — první je prázdný, a to je v pořádku.
+        let m = Mapping::new(KeyId::SCROLL_LOCK, [(KeyId::W, na(P1, UP))]).unwrap();
+        assert_eq!(m.pad_bindings(PadId::FIRST).count(), 0);
+        assert_eq!(
+            m.pad_bindings(P1).collect::<Vec<_>>(),
+            vec![(KeyId::W, UP.action)]
+        );
+    }
+
+    #[test]
     fn zkratka_prepnuti_nesmi_byt_namapovana() {
         let e = Mapping::new(
             KeyId::SCROLL_LOCK,
-            [(KeyId::W, UP), (KeyId::SCROLL_LOCK, A_BTN)],
+            [(KeyId::W, UP), (KeyId::SCROLL_LOCK, na(P1, A_BTN))],
         )
         .unwrap_err();
         assert_eq!(
             e,
             vec![MappingError::ToggleKeyMapped {
                 key: KeyId::SCROLL_LOCK,
-                action: A_BTN
+                action: na(P1, A_BTN)
             }]
         );
     }
@@ -402,11 +498,28 @@ mod tests {
     fn bind_presune_klavesu_z_jine_akce() {
         let mut m = Mapping::default();
         assert_eq!(m.bind(KeyId::W, A_BTN), Ok(Some(UP)));
-        assert_eq!(m.action_for(KeyId::W), Some(A_BTN));
+        assert_eq!(m.target(KeyId::W), Some(A_BTN));
         // Mezerník zůstává u A — akce má teď dvě klávesy.
         assert_eq!(m.keys_for(A_BTN).count(), 2);
         // Znovu totéž = nic se nepřesouvá.
         assert_eq!(m.bind(KeyId::W, A_BTN), Ok(None));
+    }
+
+    #[test]
+    fn bind_presune_klavesu_na_jiny_ovladac() {
+        let mut m = Mapping::default();
+        // Tatáž akce na druhém ovladači: klávesa se přesune, ne zdvojí.
+        assert_eq!(m.bind(KeyId::W, na(P1, UP)), Ok(Some(UP)));
+        assert_eq!(m.target(KeyId::W), Some(na(P1, UP)));
+        assert_eq!(m.keys_for(UP).count(), 0, "první ovladač o W přišel");
+        assert_eq!(
+            m.pad_bindings(P1).collect::<Vec<_>>(),
+            vec![(KeyId::W, UP.action)]
+        );
+        assert_eq!(m.len(), 24, "přesun nic nepřidal");
+        // A zpátky na jinou akci prvního ovladače.
+        assert_eq!(m.bind(KeyId::W, A_BTN), Ok(Some(na(P1, UP))));
+        assert_eq!(m.pad_bindings(P1).count(), 0);
     }
 
     #[test]
@@ -422,7 +535,7 @@ mod tests {
             Err(MappingError::Unmappable { .. })
         ));
         assert!(matches!(
-            m.bind(KeyId::new(0), UP),
+            m.bind(KeyId::new(0), na(P1, UP)),
             Err(MappingError::Unmappable { .. })
         ));
         assert_eq!(m, pred, "neúspěch nic nezměnil");
@@ -430,8 +543,12 @@ mod tests {
 
     #[test]
     fn posledni_vazbu_nelze_odebrat() {
-        let mut m = Mapping::new(KeyId::SCROLL_LOCK, [(KeyId::W, UP), (KeyId::A, A_BTN)]).unwrap();
-        assert_eq!(m.unbind(KeyId::A), Ok(A_BTN));
+        let mut m = Mapping::new(
+            KeyId::SCROLL_LOCK,
+            [(KeyId::W, UP), (KeyId::A, na(P1, A_BTN))],
+        )
+        .unwrap();
+        assert_eq!(m.unbind(KeyId::A), Ok(na(P1, A_BTN)));
         assert_eq!(
             m.unbind(KeyId::A),
             Err(MappingError::NotMapped { key: KeyId::A })
@@ -441,18 +558,56 @@ mod tests {
     }
 
     #[test]
+    fn clear_pad_odebere_jen_jeho_vazby() {
+        let mut m = Mapping::default();
+        m.bind(KeyId::X, na(P1, A_BTN)).unwrap();
+        m.bind(KeyId::W, na(P1, UP)).unwrap();
+        assert_eq!(m.clear_pad(P1), Ok(2));
+        assert_eq!(m.pad_bindings(P1).count(), 0);
+        assert_eq!(m.target(KeyId::W), None, "přesunutá klávesa je pryč");
+        assert_eq!(m.len(), 23, "první ovladač beze změny");
+        // Ovladač bez kláves: nic k odebrání, žádná chyba.
+        assert_eq!(m.clear_pad(P1), Ok(0));
+        assert_eq!(m.clear_pad(PadId::ALL[3]), Ok(0));
+    }
+
+    #[test]
+    fn clear_pad_nevyprazdni_mapovani() {
+        let mut m = Mapping::default();
+        let pred = m.clone();
+        assert_eq!(m.clear_pad(PadId::FIRST), Err(MappingError::WouldBeEmpty));
+        assert_eq!(m, pred, "všechno, nebo nic");
+        // Když má klávesy i jiný ovladač, první jde vyprázdnit.
+        m.bind(KeyId::X, na(P1, A_BTN)).unwrap();
+        assert_eq!(m.clear_pad(PadId::FIRST), Ok(24));
+        assert_eq!(
+            m.bindings().collect::<Vec<_>>(),
+            vec![(KeyId::X, na(P1, A_BTN))]
+        );
+    }
+
+    #[test]
     fn zmena_zkratky_se_validuje() {
         let mut m = Mapping::default();
+        m.bind(KeyId::X, na(P1, A_BTN)).unwrap();
         assert!(matches!(
             m.set_toggle_key(KeyId::W),
             Err(MappingError::ToggleKeyMapped { .. })
         ));
         assert_eq!(
+            m.set_toggle_key(KeyId::X),
+            Err(MappingError::ToggleKeyMapped {
+                key: KeyId::X,
+                action: na(P1, A_BTN)
+            }),
+            "klávesa druhého ovladače taky nejde"
+        );
+        assert_eq!(
             m.set_toggle_key(KeyId::ESC),
             Err(MappingError::ToggleIsEscape)
         );
-        assert_eq!(m.set_toggle_key(KeyId::X), Ok(()));
-        assert_eq!(m.toggle_key(), KeyId::X);
+        assert_eq!(m.set_toggle_key(KeyId::NUMPAD_8), Ok(()));
+        assert_eq!(m.toggle_key(), KeyId::NUMPAD_8);
     }
 
     #[test]
@@ -461,5 +616,14 @@ mod tests {
         let s = format!("{m:?}");
         assert!(s.contains("LeftStick(Up)"), "{s}");
         assert!(!s.contains("None"), "{s}");
+    }
+
+    #[test]
+    fn hlaska_cisluje_ovladace_od_jednicky() {
+        let e = MappingError::ToggleKeyMapped {
+            key: KeyId::X,
+            action: na(P1, A_BTN),
+        };
+        assert!(e.to_string().contains("na ovladači 2"), "{e}");
     }
 }

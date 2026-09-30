@@ -108,15 +108,19 @@ Crate `core` se jmenuje jako balíček `core` (příkazy `cargo test -p core`), 
 ```rust
 struct KeyId { scan: u16, extended: bool }        // z KBDLLHOOKSTRUCT (LLKHF_EXTENDED)
 enum Action { Button(PadButton), LeftStick(StickDir), RightStick(StickDir), LeftTrigger, RightTrigger }
-enum Mode { Keyboard, Gamepad, Binding { action, started_at_ms: u64 }, Disabled { reason: DisabledReason } }
-enum Owner { Os, Pad(Action), Swallow }           // Pad nese akci určenou při key-down
+struct PadId(u8)                                  // 0..MAX_PADS (4 = strop XInputu)
+struct PadAction { pad: PadId, action: Action }   // na tohle se klávesa mapuje (Fáze 4)
+enum Mode { Keyboard, Gamepad, Binding { target: PadAction, started_at_ms: u64 }, Disabled { reason: DisabledReason } }
+enum Owner { Os, Pad(PadAction), Swallow }        // Pad nese ovladač a akci určené při key-down
 struct HeldKey { owner: Owner, seq: u64, last_ms: u64 }  // seq = pořadí stisku (SOCD), last_ms = ztracený key-up
 
 fn Engine::on_key(&mut self, key: KeyId, down: bool, now_ms: u64) -> Decision
-struct Decision { suppress: bool, pad: Option<PadState>, ui: Option<UiEvent> }
-// příkazy: toggle(now_ms), start_binding(action, now_ms), cancel_binding(now_ms), tick(now_ms),
-//          force_keyboard(reason), reset_held(reason), disable(reason), enable(), set_mapping(m)
+struct Decision { suppress: bool, pads: PadUpdates, ui: Option<UiEvent> }   // PadUpdates = změněné stavy ovladačů
+// příkazy: toggle(now_ms), capture(now_ms), start_binding(target, now_ms), cancel_binding(now_ms), tick(now_ms),
+//          force_keyboard(reason), reset_held(reason), enable(pad), disable(pad, reason), set_mapping(m)
 ```
+
+**Víc ovladačů (Fáze 4):** `Keyboard` = zachytávání pozastavené, `Gamepad` = zachytává, `Disabled` = žádný ovladač není připravený. Klávesa jde ovladači jen tehdy, když je jeho ovladač připravený (`enable(pad)`); jinak patří OS. `disable(pad)` spolkne key-upy jeho držených kláves a pošle mu neutrál, ostatní ovladače hrají dál; poslední → `Disabled`. `capture()` = povel přepínače „hrát“. Přiřazování jde i během hry (zachytávání pozastaví a po uložení/zrušení vrátí) i bez ovladače (vrátí se do `Disabled`).
 
 Čas je parametr (`now_ms` = monotónní ms; v hooku čas události rozšířený na 64 bitů nebo `GetTickCount64()`), engine nemá časovače ani I/O. `Mapping` je vždy platné — nevalidní hodnotu nejde vyrobit. Držené klávesy i mapování jsou pevné tabulky o 256 položkách (index = scan kód + bit E0): v hook callbacku se nic nehashuje a nic nealokuje. Všechny typy mají `Serialize`/`Deserialize` (pro Tauri events a konfiguraci; mapování se ukládá jako **seznam** `{klávesa, akce}`, ne jako mapa podle `KeyId`).
 
@@ -260,17 +264,17 @@ Zpětná vazba po vyzkoušení Fáze 2. Jde první, dřív než hook — mění 
 
 ### Fáze 4 – Propojení a přepínání
 
-- [ ] **Hook → Pad bez zámku:** hook NESMÍ posílat stav přes dnešní crossbeam kanál pad vlákna (bere std Mutex sdílený s odesílateli z GUI a alokuje — princip 3). Rozhodnuto: atomický slot „poslední stav“ + auto-reset událost, na kterou pad vlákno čeká spolu s kanálem příkazů; GUI a uspání zůstávají na kanálu.
-- [ ] Hook → Pad kanál, GUI → Hook příkazy (`Toggle`, `SetMapping`, `StartBinding`, `CancelBinding`, `ForceKeyboard`) přes Tauri commands; stav do GUI přes Tauri events.
-- [ ] **Přepínač „ovladač zapnutý / vypnutý“** (z Fáze 2b) napojený na engine: zapnutí = připojit ovladač a začít zachytávat jeho klávesy; vypnutí = neutrál, odpojit. **Zkratka (Scroll Lock) jen pozastaví** zachytávání (ovladače zůstanou připojené a neutrální), aby šlo psát do chatu, aniž by hra ztratila hráče.
-- [ ] **Víc ovladačů z jedné klávesnice** (až 4 — strop XInputu): každý vlastní klávesy, každý **barevně odlišený** (barva v okně i u kláves). Jádro: `Binding { pad, action }`, vlastník `Pad(pad, akce)`, `PadState` a stav „připraven“ pro každý ovladač zvlášť; klávesa smí patřit jen jednomu ovladači. Nový ovladač začíná bez kláves. Property test rozšířit na víc ovladačů.
-- [ ] Hook se instaluje jen tehdy, když je potřeba: zapnutý ovladač nebo otevřené okno (živá detekce stisků). Jinak KeyPad na klávesnici vůbec nesahá (princip 10).
-- [ ] Zkratka přepnutí (výchozí **Scroll Lock**, nastavitelná), reaguje jen na první key-down, nikdy na autorepeat.
-- [ ] Zachytávání jde zapnout jen pro připojené ovladače.
-- [ ] (Bez dlouhých pokynů v GUI — minimum textu; zkratka je vidět v nastavení.)
+- [x] **Hook → Pad bez zámku:** hook NESMÍ posílat stav přes dnešní crossbeam kanál pad vlákna (bere std Mutex sdílený s odesílateli z GUI a alokuje — princip 3). Rozhodnuto: atomický slot „poslední stav“ + auto-reset událost, na kterou pad vlákno čeká spolu s kanálem příkazů; GUI a uspání zůstávají na kanálu. _(`platform/windows/slot.rs`: dva atomiky se shodným číslem zápisu — roztržené čtení se pozná; `vystup.rs` do nich píše z callbacku; testem ověřeno bez alokace a bez smíchání dvou zápisů.)_
+- [x] Hook → Pad kanál, GUI → Hook příkazy (`Toggle`, `SetMapping`, `StartBinding`, `CancelBinding`, `ForceKeyboard`) přes Tauri commands; stav do GUI přes Tauri events. _(Teď: `pad_on`/`pad_off`/`pad_test`/`pad_status` s číslem ovladače, `rezim` + událost `rezim`. Příkazy přiřazování a mapování přinese editor ve Fázi 6.)_
+- [x] **Přepínač „ovladač zapnutý / vypnutý“** (z Fáze 2b) napojený na engine: zapnutí = připojit ovladač a začít zachytávat jeho klávesy; vypnutí = neutrál, odpojit. **Zkratka (Scroll Lock) jen pozastaví** zachytávání (ovladače zůstanou připojené a neutrální), aby šlo psát do chatu, aniž by hra ztratila hráče.
+- [ ] **Víc ovladačů z jedné klávesnice** (až 4 — strop XInputu): každý vlastní klávesy, každý **barevně odlišený** (barva v okně i u kláves). Jádro: `Binding { pad, action }`, vlastník `Pad(pad, akce)`, `PadState` a stav „připraven“ pro každý ovladač zvlášť; klávesa smí patřit jen jednomu ovladači. Nový ovladač začíná bez kláves. Property test rozšířit na víc ovladačů. _(Hotové jádro — nezávislý referenční model s víc ovladači, 12 mutací enginu odhaleno — a backend: každý ovladač vlastní pad vlákno (`Pady`), sloty, příkazy s číslem ovladače. Karty dalších ovladačů, barvy a přidání/odebrání v okně přijdou s editorem kláves ve Fázi 6 — bez něj by nový ovladač neměl žádné klávesy.)_
+- [x] Hook se instaluje jen tehdy, když je potřeba: zapnutý ovladač nebo otevřené okno (živá detekce stisků). Jinak KeyPad na klávesnici vůbec nesahá (princip 10). _(Zapnutý ovladač a přiřazování hotové; otevřené okno přidá živá detekce ve Fázi 6.)_
+- [x] Zkratka přepnutí (výchozí **Scroll Lock**, nastavitelná), reaguje jen na první key-down, nikdy na autorepeat. _(Nastavení zkratky v okně: Fáze 7.)_
+- [x] Zachytávání jde zapnout jen pro připojené ovladače.
+- [x] (Bez dlouhých pokynů v GUI — minimum textu; zkratka je vidět v nastavení.) _(Karta ukazuje „Pozastaveno“ a tečku jen obrysem; co dělá Scroll Lock, řekne bublina.)_
 - [ ] Volba „vždy navrchu“ (v nastavení, Fáze 7).
 
-**Hotovo, když:** v gamepad režimu WASD hýbe páčkou v `joy.cpl`, Notepad písmena WASD nedostává, ostatní klávesy fungují.
+**Hotovo, když:** v gamepad režimu WASD hýbe páčkou v `joy.cpl`, Notepad písmena WASD nedostává, ostatní klávesy fungují. _Stav: automaticky ověřeno po kouscích (callback bez alokací, slot, výstup do slotů, instalace hooku jen se zapnutým ovladačem na skryté ploše, pad vlákna se stavem ze slotu až do ovladače, víc ovladačů, spánek, instalátor, konec). Skutečné klávesy → páčka v `joy.cpl` ověří vlastník — testy nesmí simulovat vstup a vstříknuté klávesy hook stejně propouští._
 
 ### Fáze 5 – Pojistky proti softlocku
 
@@ -382,8 +386,8 @@ Nejasnosti ve specifikaci, na které se narazilo. U každé je, jak to **teď** 
 2. **Zkratka přepnutí během přiřazování.** První řádek tabulky („zkratka → přepnout režim“) nemá podmínku na režim. Teď: v `Binding` zkratka nepřepíná, odmítne se jako vazba a přiřazování čeká dál. Alternativa: přiřazování zrušit.
 3. **Přiřazení klávesy, která už patří jiné akci.** Teď se vazba **přesune** (stará akce o klávesu přijde, UI dostane `moved_from`). Alternativa: odmítnout a nechat uživatele nejdřív odebrat starou vazbu.
 4. **„Přiřadit“ = přidat, nebo nahradit?** Teď přidává (akce může mít víc kláves, odebírá se po jedné). Alternativa: nahradit všechny klávesy akce.
-5. **Přiřazování v režimu Disabled** (ViGEmBus chybí). Doslovně „jen z režimu Klávesnice“ → teď zakázané. Kamarád by si ale mohl chtít rozvržení připravit dřív, než nainstaluje ViGEmBus. _Návrh:_ povolit a po skončení vrátit do `Disabled`.
-6. **Prázdné mapování.** Teď je chybou validace a poslední vazbu nejde odebrat (hodnota `Mapping` je vždy platná). Alternativa: jen varování.
+5. ✅ _Rozhodnuto Fází 6 (úpravy kláves i za běhu) a zavedeno ve Fázi 4: přiřazování jde z Klávesnice, Gamepadu i Disabled a vrací se tam, odkud začalo (z Gamepadu zpět na Gamepad, jen když mezitím nepřišlo vynucení)._ **Přiřazování v režimu Disabled** (ViGEmBus chybí). Doslovně „jen z režimu Klávesnice“ → teď zakázané. Kamarád by si ale mohl chtít rozvržení připravit dřív, než nainstaluje ViGEmBus. _Návrh:_ povolit a po skončení vrátit do `Disabled`.
+6. **Prázdné mapování.** Teď je chybou validace a poslední vazbu nejde odebrat (hodnota `Mapping` je vždy platná). Alternativa: jen varování. _Fáze 4: pravidlo platí pro celé mapování; jednotlivý ovladač bez kláves chybou není (nový ovladač začíná prázdný). Důsledek: když má klávesy jen druhý ovladač, nejde ho odebrat (`clear_pad` → `WouldBeEmpty`)._
 7. **Esc jako zkratka přepnutí** — teď zakázané validací (jinak by se z přiřazování nedalo vycouvat Esc). Specifikace to neřeší.
 8. **Klávesa držená přes zamčení relace.** `reset_held` zapomene `held`; LL hook nerozliší autorepeat od nového stisku, takže autorepeat té klávesy po odemčení je pro engine nový stisk. Kdyby mezitím uživatel přepnul na Gamepad a klávesa byla namapovaná, OS by viděl key-down (před zámkem), ale key-up by se spolkl → klávesa „visí“ v OS do dalšího stisku. Velmi nepravděpodobné (držet klávesu přes zámek a mezitím přepnout); teď se to přijímá. Alternativa: po zámku nechat staré záznamy jako `Os` „na dožití“ (pak by se naopak první stisk po odemčení mohl ztratit padu).
 9. **Instalace per-user vs. Program Files.** WinSent instaluje do Program Files s právy správce; KeyPad kvůli principu 6 do `%LOCALAPPDATA%\Programs\KeyPad` bez UAC (jako VS Code, Discord). OK?
@@ -399,7 +403,7 @@ Nejasnosti ve specifikaci, na které se narazilo. U každé je, jak to **teď** 
 19. ✅ _Rozhodnuto 29. 9.: jako WinSent — blur na Windows 10, Mica na Windows 11 22H2+ (Fáze 2b)._ **Rozmazané pozadí okna (blur)** — vzhled jako WinSent, ale jde přes nedokumentované API, na Windows 10 před 1809 chybí a na Windows 11 22H2 podle autora knihovny zpomaluje tažení okna. Kvůli principu 10 zvážit neprůhledné pozadí.
 20. ✅ _Schváleno 29. 9.: zrcadlit do `iva-exe/KeyPad` (Fáze 2b)._ **Záloha instalátoru ViGEmBus** — repo ViGEmBus je archivované; kdyby zmizelo, instalace ovladače z KeyPadSetup přestane fungovat (bezpečně — jen „nepodařilo se stáhnout“). Zrcadlit ho jako asset vydání v `iva-exe/KeyPad` (stejný hash), nebo ne?
 21. **Schované okno v režimu Gamepad** — zavření okna ho jen schová do trayе a pad zůstává připojený; režim se nemění. Má schování v režimu Gamepad vynutit Klávesnici? _Návrh:_ ne — schovat okno a hrát je hlavní scénář (okno nepřekáží streamu).
-22. **„Vyzkoušet páčku“** jede plnou výchylkou (kruh ~1,2 s, pak neutrál). Ve Fázi 4 povolit jen v režimu Klávesnice; stav z klávesnice test přeruší.
+22. **„Vyzkoušet páčku“** jede plnou výchylkou (kruh ~1,2 s, pak neutrál). ~~Ve Fázi 4 povolit jen v režimu Klávesnice~~ _Fáze 4: jde i při zachytávání — zapnutí ovladače zachytávání rovnou spouští, takže by tlačítko jinak skoro nikdy nešlo. Stisk klávesy ovladače kruh přeruší (vstup z klávesnice má přednost)._
 23. **Paměť WebView2 schovaného v trayi** — _rozhodnuto:_ při schování `MemoryUsageTargetLevel = LOW`. Fyzická paměť (co ukazuje Správce úloh) klesne z ~345 MB na ~50 MB (po 2 min ~120 MB), soukromá zůstává ~160 MB; CPU ~0. Víc bez zavření WebView nejde.
 24. ✅ _Rozhodnuto 29. 9.: ViGEmBus se instaluje i aktualizuje automaticky, bez zaškrtávátka, i při aktualizaci z aplikace (Fáze 2b); souhlas = výzva UAC od Windows._ **Zaškrtávátko „Nainstalovat i ovladač ViGEmBus“ je předvyplněné**, když ovladač chybí — na přání vlastníka, ať kamarád nepotřebuje nic dalšího. Souhlas = viditelné zaškrtávátko s vysvětlením + klik + výzva UAC od Windows. Nabízí se i při ručním spuštění KeyPadSetup nad už nainstalovaným KeyPadem, nikdy při aktualizaci z aplikace (`/quiet`). Nechat předvyplněné?
 25. **Zbytkové riziko instalace ViGEmBus:** oficiální instalátor (s právy správce) běží ze složky v %TEMP%, do které může psát i uživatel. Soubor sám je zamčený a ověřený, ale jestli si instalátor Advanced Installer bezpečně načítá své DLL, závisí na jeho vlastním zabezpečení (neověřeno spuštěním). Okno = výzva UAC + běh instalace. KeyPad je přesto bezpečnější než WinSent, jehož instalátor běží celý jako správce ze Stažených souborů.
@@ -411,6 +415,10 @@ Nejasnosti ve specifikaci, na které se narazilo. U každé je, jak to **teď** 
 31. **Aktualizace ViGEmBus, která starý ovladač odebere a nový nepřidá** (známá chyba dodavatele „spusť instalaci dvakrát“): co udělá instalátor MSI nad už zaregistrovaným produktem, se dá ověřit jen ve virtuálu. Do té doby KeyPad v tomhle stavu nic neopakuje (druhé automatické spuštění instalátoru bylo odebráno — nikdy víc než jedno spuštění) a poradí odebrat „ViGEm Bus Driver“ v Aplikacích a spustit KeyPadSetup znovu.
 32. **Aktualizace ovladače zavře KeyPad** (nesmí držet sběrnici) a pak ho znovu spustí — ve všech režimech, i z tlačítka v aplikaci. Tlačítko „Aktualizovat ovladač“ se ukazuje i při zapnutém ovladači; kliknutí ovladač nejdřív vypne.
 33. **Logování stisků.** Fáze 3 chtěla „log ukazuje scan kódy“. Aplikace ale stisky do `keypad.log` **nikdy** nezapisuje — log by jinak obsahoval i hesla a kamarád by ho posílal při hlášení chyby. Scan kódy vypisuje jen příklad `hook_selftest`, a to jen do konzole. Kdyby byla potřeba diagnostika u kamaráda, návrh: jen nemapovatelné klávesy (AltGr, média) a jen scan kód, zapnuté proměnnou prostředí.
+34. **Zapnutí ovladače = hned hrát.** Připojený ovladač (vždy po kliknutí na přepínač) engine povolí a spustí zachytávání (`capture`). Když uživatel předtím zachytávání pozastavil Scroll Lockem a zapne DALŠÍ ovladač, pozastavení se tím zruší pro všechny. Alternativa: zapnutí dalšího ovladače pozastavení respektuje.
+35. **Upřesnění přiřazování (Fáze 4, zjistil agent při implementaci):** (a) `capture()` během přiřazování bez připraveného ovladače jen nastaví „pak zachytávat“ — po konci jde engine do `Disabled` a příznak zanikne; (b) nové `start_binding` se stejným cílem pošle `ModeChanged` i beze změny režimu; (c) `disable()` nepřipraveného ovladače si pamatuje důvod — po konci přiřazování v `Disabled` tak může být vidět důvod od jiného ovladače; (d) přiřazování začaté ve hře nejde zkratkou ani tlačítkem „přepnout“ změnit na „po uložení nehrát“ (zkratka se odmítne jako vazba) — jen vynucením nebo změnou mapování; (e) odmítnuté `capture()` hlásí `ToggleRejected { Disabled }`.
+36. **Stav padů při změně režimu jde všem 4 ovladačům** (i nepřipojeným — vždy neutrál). Aplikace ho zapíše do jejich slotů; vlákno nepřipojeného ovladače neběží nebo stav nepošle. Engine při každé klávese přepočítá všechny 4 ovladače (4× tabulka 256 položek, bez alokace) — princip 7 má přednost před mikrooptimalizací.
+37. **Hook se instaluje jen se zapnutým ovladačem** (nebo při přiřazování); po vypnutí posledního ovladače zmizí a držené klávesy se zapomenou. Zapnutí z pozastavení hook vždy přeinstaluje (ochrana proti tichému odebrání), zapnutí druhého ovladače během hry ne (zapomněly by se klávesy, které hráč 1 drží).
 
 ---
 

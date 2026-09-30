@@ -24,7 +24,8 @@ use std::ffi::c_void;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use crossbeam_channel::Sender;
+use std::sync::Arc;
+
 use windows::core::{s, w};
 use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE};
 use windows::Win32::System::LibraryLoader::{
@@ -35,7 +36,27 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DEVICE_NOTIFY_CALLBACK, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND,
 };
 
-use super::pad::PadPrikaz;
+use super::pad::{PadPrikaz, Pady};
+
+/// Co potřebuje spánek od virtuálních ovladačů. Rozhraní kvůli testu
+/// obsluhy bez skutečných pad vláken.
+pub trait Napajeni: Send + Sync {
+    /// Všechny ovladače neutrál → odpojit; `true` = potvrzeno do `limit`.
+    fn uspat(&self, limit: Duration) -> bool;
+    /// Počítač se probudil — nic se nezapíná, jen končí pojistka proti
+    /// zapnutí těsně před spánkem.
+    fn probuzeni(&self);
+}
+
+impl Napajeni for Pady {
+    fn uspat(&self, limit: Duration) -> bool {
+        Pady::uspat(self, limit)
+    }
+
+    fn probuzeni(&self) {
+        self.vsem(|| PadPrikaz::Probuzeni);
+    }
+}
 
 /// `PowerRegisterSuspendResumeNotification` (powerbase.h): příznaky,
 /// příjemce, výstup registrace → kód Win32.
@@ -62,11 +83,11 @@ const LIMIT_ODPOJENI: Duration = Duration::from_secs(2);
 
 /// Kam posílat. Callback nemá jiný kontext než ukazatel, statická
 /// proměnná je jednodušší a nic nevisí na životnosti.
-static PAD: OnceLock<Sender<PadPrikaz>> = OnceLock::new();
+static PAD: OnceLock<Arc<dyn Napajeni>> = OnceLock::new();
 
 /// Zaregistruje hlídání spánku. Chyba se jen zaloguje — aplikace běží
 /// dál, jen bez vypnutí padu před spánkem.
-pub fn registruj(pad: Sender<PadPrikaz>) {
+pub fn registruj(pad: Arc<dyn Napajeni>) {
     if PAD.set(pad).is_err() {
         return;
     }
@@ -110,7 +131,7 @@ unsafe extern "system" fn zmena_napajeni(
 ) -> u32 {
     let _ = std::panic::catch_unwind(|| {
         if let Some(pad) = PAD.get() {
-            obsluz(pad, typ);
+            obsluz(pad.as_ref(), typ);
         }
     });
     ERROR_SUCCESS.0
@@ -118,15 +139,12 @@ unsafe extern "system" fn zmena_napajeni(
 
 /// Obsluha oznámení — mimo callback, ať ji test prožene bez skutečného
 /// spánku.
-pub(super) fn obsluz(pad: &Sender<PadPrikaz>, typ: u32) {
+pub(super) fn obsluz(pad: &dyn Napajeni, typ: u32) {
     match typ {
         PBT_APMSUSPEND => {
-            log::info!("počítač se uspává — vypínám virtuální pad (ViGEmBus #160)");
-            let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
-            if pad.send(PadPrikaz::Uspat(ack_tx)).is_ok()
-                && ack_rx.recv_timeout(LIMIT_ODPOJENI).is_err()
-            {
-                log::warn!("pad se před spánkem do 2 s neodpojil — spánek nečeká");
+            log::info!("počítač se uspává — vypínám virtuální ovladače (ViGEmBus #160)");
+            if !pad.uspat(LIMIT_ODPOJENI) {
+                log::warn!("ovladače se před spánkem do 2 s neodpojily — spánek nečeká");
             }
             // Ať řádky o spánku přežijí i výpadek napájení ve spánku.
             crate::logger::flush(Duration::from_millis(500));
@@ -135,8 +153,8 @@ pub(super) fn obsluz(pad: &Sender<PadPrikaz>, typ: u32) {
         // se probudil uživatel. Pad zůstává vypnutý — zapne ho uživatel;
         // probuzení jen ruší pojistku proti zapnutí těsně před spánkem.
         PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND => {
-            log::info!("počítač se probudil — virtuální pad zůstává vypnutý");
-            let _ = pad.send(PadPrikaz::Probuzeni);
+            log::info!("počítač se probudil — virtuální ovladače zůstávají vypnuté");
+            pad.probuzeni();
         }
         _ => {}
     }
@@ -153,36 +171,30 @@ mod tests {
         assert!(registracni_funkce().is_ok());
     }
 
-    /// Cesta oznámení o spánku: obsluha počká na potvrzení pad vlákna
-    /// (ne na limit) a probuzení pošle jen „probuzení" — nic, co by pad
-    /// zapnulo. Pad vlákno tu hraje test; co s tím dělá skutečná smyčka
-    /// (neutrál → odpojit → vypnuto, po probuzení nic), testuje `pad.rs`.
+    /// Obsluha oznámení o spánku: uspání počká na potvrzení (ne na
+    /// limit) a probuzení jen ohlásí probuzení — nic, co by pad zapnulo.
+    /// Co s tím dělají skutečná pad vlákna, testuje `pad.rs`.
     #[test]
     fn uspani_ceka_na_potvrzeni_a_probuzeni_nic_nezapne() {
-        let (tx, rx) = crossbeam_channel::unbounded::<PadPrikaz>();
-        let pad_vlakno = std::thread::spawn(move || {
-            let mut prijato = Vec::new();
-            while let Ok(p) = rx.recv() {
-                match p {
-                    PadPrikaz::Uspat(ack) => {
-                        prijato.push("uspat");
-                        let _ = ack.send(());
-                    }
-                    PadPrikaz::Probuzeni => prijato.push("probuzeni"),
-                    jiny => panic!("nečekaný příkaz {jiny:?}"),
-                }
+        use std::sync::Mutex;
+        #[derive(Default)]
+        struct Zaznam(Mutex<Vec<&'static str>>);
+        impl Napajeni for Zaznam {
+            fn uspat(&self, _limit: Duration) -> bool {
+                self.0.lock().unwrap().push("uspat");
+                true
             }
-            prijato
-        });
+            fn probuzeni(&self) {
+                self.0.lock().unwrap().push("probuzeni");
+            }
+        }
+        let z = Zaznam::default();
         let start = std::time::Instant::now();
-        obsluz(&tx, PBT_APMSUSPEND);
+        obsluz(&z, PBT_APMSUSPEND);
         assert!(start.elapsed() < LIMIT_ODPOJENI, "potvrzení, ne limit");
-        obsluz(&tx, PBT_APMRESUMEAUTOMATIC);
-        obsluz(&tx, PBT_APMRESUMESUSPEND);
-        drop(tx);
-        assert_eq!(
-            pad_vlakno.join().unwrap(),
-            ["uspat", "probuzeni", "probuzeni"]
-        );
+        obsluz(&z, PBT_APMRESUMEAUTOMATIC);
+        obsluz(&z, PBT_APMRESUMESUSPEND);
+        obsluz(&z, 0xFFFF);
+        assert_eq!(*z.0.lock().unwrap(), ["uspat", "probuzeni", "probuzeni"]);
     }
 }

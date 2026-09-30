@@ -1,4 +1,5 @@
-//! Co se na gamepadu stane, když se stiskne namapovaná klávesa.
+//! Co se na gamepadu stane, když se stiskne namapovaná klávesa — a na
+//! kterém z ovladačů.
 
 use serde::{Deserialize, Serialize};
 
@@ -115,9 +116,130 @@ impl Action {
     }
 }
 
+/// Nejvýš tolik virtuálních ovladačů z jedné klávesnice.
+///
+/// Strop XInputu: hry přes XInput vidí jen čtyři ovladače (hráč 1–4),
+/// pátý by pro ně neexistoval.
+pub const MAX_PADS: usize = 4;
+
+/// Který virtuální ovladač (0 až [`MAX_PADS`] − 1).
+///
+/// Hodnota mimo rozsah nejde vyrobit — ani deserializací (konfigurace,
+/// příkaz z okna): pevné tabulky enginu se jím indexují a index mimo
+/// rozsah by v hook callbacku znamenal paniku.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "u8", into = "u8")]
+pub struct PadId(u8);
+
+impl PadId {
+    /// První ovladač — na něm je výchozí mapování.
+    pub const FIRST: PadId = PadId(0);
+
+    /// Všechny ovladače vzestupně.
+    pub const ALL: [PadId; MAX_PADS] = [PadId(0), PadId(1), PadId(2), PadId(3)];
+
+    pub const fn new(i: usize) -> Option<PadId> {
+        if i < MAX_PADS {
+            // `i < MAX_PADS ≤ u8::MAX`, přetypování nic neusekne.
+            Some(PadId(i as u8))
+        } else {
+            None
+        }
+    }
+
+    /// Index do tabulek o [`MAX_PADS`] položkách — vždy menší než
+    /// [`MAX_PADS`].
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Číslo ovladače mimo rozsah 0 až [`MAX_PADS`] − 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvalidPadId(pub u8);
+
+impl std::fmt::Display for InvalidPadId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ovladač č. {} neexistuje (nejvýš {} ovladače)",
+            self.0, MAX_PADS
+        )
+    }
+}
+
+impl std::error::Error for InvalidPadId {}
+
+impl TryFrom<u8> for PadId {
+    type Error = InvalidPadId;
+
+    fn try_from(v: u8) -> Result<PadId, InvalidPadId> {
+        PadId::new(usize::from(v)).ok_or(InvalidPadId(v))
+    }
+}
+
+impl From<PadId> for u8 {
+    fn from(p: PadId) -> u8 {
+        p.0
+    }
+}
+
+/// Akce na konkrétním ovladači — to, na co se klávesa mapuje.
+///
+/// Klávesa patří vždy jen jednomu ovladači: dva hráči na jedné
+/// klávesnici si nesmí sdílet klávesu, jinak by jeden stisk hýbal oběma.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct PadAction {
+    pub pad: PadId,
+    pub action: Action,
+}
+
+impl PadAction {
+    pub const fn new(pad: PadId, action: Action) -> PadAction {
+        PadAction { pad, action }
+    }
+
+    /// Akce na prvním ovladači.
+    pub const fn first(action: Action) -> PadAction {
+        PadAction::new(PadId::FIRST, action)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::de::value::{Error as DeError, U8Deserializer};
+    use serde::de::IntoDeserializer;
+
+    #[test]
+    fn pad_id_jen_v_rozsahu() {
+        for (i, p) in PadId::ALL.into_iter().enumerate() {
+            assert_eq!(p.index(), i);
+            assert_eq!(PadId::new(i), Some(p));
+            assert_eq!(PadId::try_from(i as u8), Ok(p));
+            assert_eq!(u8::from(p), i as u8);
+        }
+        assert_eq!(PadId::FIRST, PadId::ALL[0]);
+        assert_eq!(PadId::new(MAX_PADS), None);
+        assert_eq!(PadId::new(usize::MAX), None);
+        assert_eq!(PadId::try_from(4), Err(InvalidPadId(4)));
+        assert_eq!(PadId::try_from(u8::MAX), Err(InvalidPadId(u8::MAX)));
+    }
+
+    #[test]
+    fn deserializace_odmitne_neexistujici_ovladac() {
+        // serde_json v core není; deserializátor z holého u8 stačí —
+        // jde přes tentýž `try_from` jako JSON z konfigurace.
+        let z = |v: u8| {
+            let d: U8Deserializer<DeError> = v.into_deserializer();
+            PadId::deserialize(d)
+        };
+        assert_eq!(z(0).unwrap(), PadId::FIRST);
+        assert_eq!(z(3).unwrap(), PadId::ALL[3]);
+        for v in [4, 5, 200, u8::MAX] {
+            assert!(z(v).is_err(), "{v} prošlo");
+        }
+    }
 
     #[test]
     fn masky_tlacitek_jsou_ruzne_bity() {

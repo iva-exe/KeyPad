@@ -38,7 +38,7 @@
 				return 'Zapínám…';
 			case 'on':
 				// Bez čísla hráče: ViGEmBus ho s víc pady hlásí špatně.
-				return 'Zapnutý';
+				return pad.rezim === 'paused' ? 'Pozastaveno' : 'Zapnutý';
 			case 'bus_missing':
 				return 'Chybí ViGEmBus';
 			case 'bus_not_running':
@@ -60,7 +60,9 @@
 			case 'connecting':
 				return pad.detail || 'Zapínám virtuální ovladač Xbox 360';
 			case 'on':
-				return 'Virtuální ovladač Xbox 360 je zapnutý';
+				return pad.rezim === 'paused'
+					? 'Klávesy jdou do Windows — Scroll Lock ovladač zase pustí'
+					: 'Klávesy ovládají virtuální ovladač — Scroll Lock je vrátí Windows';
 			case 'bus_missing':
 				return 'Bez ovladače ViGEmBus virtuální gamepad nevznikne. Instalaci potvrdíš ve výzvě Windows.';
 			case 'bus_not_running':
@@ -101,7 +103,13 @@
 
 <!-- data-seq: pořadí poslední převzaté změny — podle něj jde zvenku
      (test přes CDP) poznat, že dorazila událost, ne jen odpověď. -->
-<section class="card" data-stav={pad.state} data-seq={pad.seq} aria-live="polite">
+<section
+	class="card"
+	data-stav={pad.state}
+	data-rezim={pad.rezim}
+	data-seq={pad.seq}
+	aria-live="polite"
+>
 	<div class="radek">
 		<span class="ikona"><Gamepad2 size={18} strokeWidth={1.75} /></span>
 		<div class="text">
@@ -265,6 +273,13 @@
 	.card[data-stav='bus_not_running'] .dot {
 		background: var(--warn);
 		box-shadow: var(--glow-warn);
+	}
+	/* Pozastaveno zkratkou: ovladač existuje (zelená zůstává pravdivá),
+	   ale klávesy teď jdou do Windows — tečka zhasne na obrys, ať je
+	   rozdíl vidět na první pohled bez čtení. */
+	.card[data-stav='on'][data-rezim='paused'] .dot {
+		background: transparent;
+		box-shadow: inset 0 0 0 1.5px var(--ok);
 	}
 	/* Zapínání: jemné pulzování — je vidět, že se něco děje, ale
 	   nekřičí. „Omezit pohyb" ve Windows ho vypne (app.css). */

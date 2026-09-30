@@ -9,13 +9,12 @@
 //! a klávesy by šly do hry, i když má ovladač běžet.
 //!
 //! Všechno ostatní (příkazy z okna, časovač přiřazování, hlášení paniky
-//! do logu) dělá táž smyčka mimo callback. Zapnutí hooku z přepínače
-//! přijde ve Fázi 4 — do té doby ho používá jen příklad `hook_selftest`
-//! a testy.
-
-// Aplikace hook zapne až přepínačem ve Fázi 4; teď ho volají jen testy
-// a příklad `hook_selftest`, a to každý jinou část.
-#![allow(dead_code)]
+//! do logu) dělá táž smyčka mimo callback.
+//!
+//! Vlákno s enginem běží celou dobu, samotný hook je ale v systému JEN
+//! tehdy, když ho engine potřebuje — je zapnutý aspoň jeden ovladač
+//! (nebo se přiřazuje klávesa). Jinak KeyPad na klávesnici vůbec nesahá
+//! (princip 10) a nic nemůže zdržet psaní v jiných programech.
 
 use std::cell::RefCell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -24,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
-use keypad_core::{Decision, DisabledReason, Engine, ForceReason, KeyId, Mapping, Mode};
+use keypad_core::{Decision, DisabledReason, Engine, ForceReason, KeyId, Mapping, Mode, PadId};
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetTickCount64;
@@ -107,15 +106,25 @@ pub trait Vystup: Send + Sync {
 /// Příkazy hook vláknu. Každý vede na volání enginu a jeho rozhodnutí
 /// jde do [`Vystup`]u stejně jako rozhodnutí o klávese.
 #[derive(Debug, Clone)]
+#[allow(
+    dead_code,
+    reason = "Vynut použije Fáze 5 (hlídání), Mapovani Fáze 6–7 (editor, konfigurace)"
+)]
 pub enum HookPrikaz {
     /// Nové mapování (v režimu Gamepad nejdřív vynutí Klávesnici).
     Mapovani(Box<Mapping>),
-    /// Pad je připojený — z `Disabled` na Klávesnici.
-    Povol,
-    /// Pad není — do `Disabled`.
-    Zakaz(DisabledReason),
+    /// Ovladač se připojil — engine ho povolí (z `Disabled` na
+    /// Klávesnici, nikdy sám na Gamepad).
+    Povol(PadId),
+    /// Ovladač není — jeho klávesy jdou zase do Windows; poslední
+    /// vypnutý → `Disabled` (a hook ze systému zmizí).
+    Zakaz(PadId, DisabledReason),
     /// Přepnout Klávesnice ↔ Gamepad (tlačítko v okně).
     Prepni,
+    /// Uživatel zapnul ovladač přepínačem: zachytávat. Z pozastavení se
+    /// hook předtím nainstaluje znovu — Windows ho mohli potichu odebrat
+    /// a zachytávání by jinak jen předstíralo, že běží.
+    Zachytavej,
     /// Vynutit Klávesnici (fail-safe).
     Vynut(ForceReason),
     /// Odhooknout a nainstalovat znovu (Windows mohli hook potichu
@@ -134,6 +143,10 @@ pub struct HookStatus {
     rozbity: AtomicBool,
 }
 
+#[allow(
+    dead_code,
+    reason = "paniky a rozbitý hook čte hook_selftest; aplikace ve Fázi 5 (hlídání)"
+)]
 impl HookStatus {
     pub fn nainstalovan(&self) -> bool {
         self.nainstalovan.load(Ordering::Acquire)
@@ -152,28 +165,15 @@ impl HookStatus {
     }
 }
 
-/// Běžící hook vlákno. Drop ho zastaví.
-pub struct Hook {
+/// Odesílatel příkazů hook vláknu — klonuje se (pad vlákna hlásí
+/// připojení a odpojení ovladačů přímo). Nikdy ho nepoužívá callback.
+#[derive(Clone)]
+pub struct HookOdesilatel {
     tid: u32,
     tx: Sender<HookPrikaz>,
-    status: Arc<HookStatus>,
-    konec: Receiver<()>,
-    vlakno: Option<std::thread::JoinHandle<()>>,
 }
 
-impl Hook {
-    /// Spustí vlákno, nainstaluje hook a vrátí se, až hook běží.
-    ///
-    /// Engine startuje jako vždy v `Disabled { PadNotConnected }` —
-    /// klávesy zachytávat začne až po [`HookPrikaz::Povol`] a přepnutí.
-    pub fn spust(mapovani: Mapping, vystup: Arc<dyn Vystup>) -> Result<Hook, String> {
-        spust_s(mapovani, vystup, || Ok(()))
-    }
-
-    pub fn status(&self) -> &Arc<HookStatus> {
-        &self.status
-    }
-
+impl HookOdesilatel {
     /// Pošle příkaz a probudí smyčku. `false` = vlákno už neběží.
     pub fn posli(&self, p: HookPrikaz) -> bool {
         if self.tx.send(p).is_err() {
@@ -183,16 +183,56 @@ impl Hook {
         // vlákno = chyba, kterou vrátí volání.
         unsafe { PostThreadMessageW(self.tid, WM_PRIKAZ, WPARAM(0), LPARAM(0)) }.is_ok()
     }
+}
 
-    /// Odhookne a ukončí vlákno. Engine před koncem vynutí Klávesnici
-    /// (neutrální pad jde do [`Vystup`]u). `false` = vlákno neskončilo
-    /// v limitu (proces ho pak ukončí sám; hook zmizí s ním).
+/// Běžící hook vlákno. Drop ho zastaví.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "status čtou testy a hook_selftest")
+)]
+pub struct Hook {
+    tx: HookOdesilatel,
+    status: Arc<HookStatus>,
+    konec: Receiver<()>,
+    vlakno: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "status a posli používají testy a hook_selftest")
+)]
+impl Hook {
+    /// Spustí vlákno s enginem. Samotný hook se do systému dostane až
+    /// s prvním povoleným ovladačem ([`HookPrikaz::Povol`]).
+    ///
+    /// Engine startuje jako vždy v `Disabled { PadNotConnected }`.
+    pub fn spust(mapovani: Mapping, vystup: Arc<dyn Vystup>) -> Result<Hook, String> {
+        spust_s(mapovani, vystup, || Ok(()))
+    }
+
+    pub fn status(&self) -> &Arc<HookStatus> {
+        &self.status
+    }
+
+    pub fn odesilatel(&self) -> HookOdesilatel {
+        self.tx.clone()
+    }
+
+    /// Pošle příkaz a probudí smyčku. `false` = vlákno už neběží.
+    pub fn posli(&self, p: HookPrikaz) -> bool {
+        self.tx.posli(p)
+    }
+
+    /// Ukončí vlákno: engine nejdřív vynutí Klávesnici (neutrální stav
+    /// všech ovladačů jde do [`Vystup`]u), pak se hook odebere.
+    /// `false` = vlákno neskončilo v limitu (proces ho pak ukončí sám;
+    /// hook zmizí s ním).
     pub fn zastav(&mut self) -> bool {
         let Some(vlakno) = self.vlakno.take() else {
             return true;
         };
         // SAFETY: jen odeslání zprávy do fronty vlákna.
-        let _ = unsafe { PostThreadMessageW(self.tid, WM_QUIT, WPARAM(0), LPARAM(0)) };
+        let _ = unsafe { PostThreadMessageW(self.tx.tid, WM_QUIT, WPARAM(0), LPARAM(0)) };
         if self.konec.recv_timeout(LIMIT).is_err() {
             log::warn!("hook vlákno neskončilo do {} s", LIMIT.as_secs());
             return false;
@@ -236,8 +276,7 @@ fn spust_s(
         .map_err(|e| format!("hook vlákno nejde spustit: {e}"))?;
     match hotovo_rx.recv_timeout(LIMIT) {
         Ok(Ok(tid)) => Ok(Hook {
-            tid,
-            tx,
+            tx: HookOdesilatel { tid, tx },
             status,
             konec: konec_rx,
             vlakno: Some(vlakno),
@@ -297,17 +336,8 @@ fn vlakno(
             rozbity: false,
         })
     });
-    let mut hook = match nainstaluj() {
-        Ok(h) => h,
-        Err(e) => {
-            STAV.with(|s| s.borrow_mut().take());
-            let _ = hotovo.send(Err(e));
-            return;
-        }
-    };
-    status.nainstalovan.store(true, Ordering::Release);
-    status.instalaci.fetch_add(1, Ordering::AcqRel);
-    log::info!("hook klávesnice nainstalován");
+    // Hook zatím ne: bez zapnutého ovladače ho engine nepotřebuje.
+    let mut hook = HHOOK::default();
     let _ = hotovo.send(Ok(tid));
 
     let mut casovac = 0usize;
@@ -321,11 +351,21 @@ fn vlakno(
         match msg.message {
             WM_PRIKAZ => {
                 while let Ok(p) = rx.try_recv() {
-                    if matches!(p, HookPrikaz::Preinstaluj) {
-                        hook = preinstaluj(hook, &status);
-                        continue;
+                    match p {
+                        HookPrikaz::Preinstaluj if !hook.is_invalid() => {
+                            hook = preinstaluj(hook, &status);
+                        }
+                        HookPrikaz::Zachytavej => {
+                            // Jen z pozastavení: při běžícím zachytávání
+                            // (zapnutý druhý ovladač) by přeinstalace
+                            // zapomněla klávesy, které hráč 1 právě drží.
+                            if rezim() == Some(Mode::Keyboard) {
+                                hook = preinstaluj(hook, &status);
+                            }
+                            s_enginem(|e| e.capture(ted_ms()));
+                        }
+                        p => s_enginem(|e| prikaz(e, p, ted_ms())),
                     }
-                    s_enginem(|e| prikaz(e, p, ted_ms()));
                 }
             }
             WM_TIMER if msg.hwnd.is_invalid() => {
@@ -353,21 +393,64 @@ fn vlakno(
                 unsafe { DispatchMessageW(&msg) };
             }
         }
+        hook = hlidej_hook(hook, &status);
         casovac = hlidej_casovac(casovac);
     }
 
+    // Pořadí jako u každého konce: neutrál → odhooknout (→ odpojit pady
+    // udělá volající). Po vynucené Klávesnici hook už nic nepotlačí.
+    s_enginem(|e| e.force_keyboard(ForceReason::Shutdown));
     if !hook.is_invalid() {
         odhookni(hook);
+        log::info!("hook klávesnice odebrán (konec)");
     }
     status.nainstalovan.store(false, Ordering::Release);
     if casovac != 0 {
         // SAFETY: časovač vlákna vytvořený v `hlidej_casovac`.
         let _ = unsafe { KillTimer(None, casovac) };
     }
-    // Hook je pryč, nic už klávesy nepotlačí: pad musí dostat neutrál.
-    s_enginem(|e| e.force_keyboard(ForceReason::Shutdown));
     STAV.with(|s| s.borrow_mut().take());
-    log::info!("hook klávesnice odebrán");
+}
+
+/// Režim enginu (`None` = stav je pryč nebo rozbitý).
+fn rezim() -> Option<Mode> {
+    STAV.with(|s| {
+        s.borrow()
+            .as_ref()
+            .filter(|s| !s.rozbity)
+            .map(|s| s.engine.mode())
+    })
+}
+
+/// Hook je v systému právě tehdy, když ho engine potřebuje: mimo
+/// `Disabled` (zapnutý ovladač, přiřazování). Po odebrání se držené
+/// klávesy zapomenou — jejich key-upy hook neuvidí a zastaralý záznam
+/// by příští stisk téže klávesy vzal jako autorepeat.
+fn hlidej_hook(hook: HHOOK, status: &HookStatus) -> HHOOK {
+    let potreba = rezim().is_some_and(|m| !matches!(m, Mode::Disabled { .. }));
+    match (potreba, hook.is_invalid()) {
+        (true, true) => match nainstaluj() {
+            Ok(h) => {
+                status.nainstalovan.store(true, Ordering::Release);
+                status.instalaci.fetch_add(1, Ordering::AcqRel);
+                log::info!("hook klávesnice nainstalován (zapnutý ovladač)");
+                h
+            }
+            Err(e) => {
+                // Klávesy pak jdou do Windows — bezpečná strana (princip 1).
+                log::error!("hook klávesnice nejde nainstalovat: {e}");
+                hook
+            }
+        },
+        (false, false) => {
+            odhookni(hook);
+            status.nainstalovan.store(false, Ordering::Release);
+            s_enginem(|e| e.reset_held(ForceReason::HookReinstalled));
+            log::info!("hook klávesnice odebrán (žádný zapnutý ovladač)");
+            HHOOK::default()
+        }
+        _ => hook,
+    }
 }
 
 fn nainstaluj() -> Result<HHOOK, String> {
@@ -435,10 +518,12 @@ fn hlidej_casovac(casovac: usize) -> usize {
 fn prikaz(e: &mut Engine, p: HookPrikaz, ted: u64) -> Decision {
     match p {
         HookPrikaz::Mapovani(m) => e.set_mapping(*m),
-        HookPrikaz::Povol => e.enable(),
-        HookPrikaz::Zakaz(duvod) => e.disable(duvod),
+        HookPrikaz::Povol(pad) => e.enable(pad),
+        HookPrikaz::Zakaz(pad, duvod) => e.disable(pad, duvod),
         HookPrikaz::Prepni => e.toggle(ted),
+        HookPrikaz::Zachytavej => e.capture(ted),
         HookPrikaz::Vynut(duvod) => e.force_keyboard(duvod),
+        // Přeinstalaci dělá smyčka; bez hooku v systému není co dělat.
         HookPrikaz::Preinstaluj => Decision::NONE,
     }
 }
@@ -545,7 +630,7 @@ fn po_panice() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use keypad_core::{Action, ModeCause, PadButton, PadState, UiEvent};
+    use keypad_core::{Action, ModeCause, PadAction, PadButton, PadState, UiEvent};
     use std::sync::Mutex;
     use windows::Win32::UI::WindowsAndMessaging::{KBDLLHOOKSTRUCT_FLAGS, LLKHF_UP};
 
@@ -555,7 +640,7 @@ mod tests {
     const F24: KeyId = KeyId::new(0x76);
 
     fn mapovani() -> Mapping {
-        Mapping::new(F23, [(F24, Action::Button(PadButton::A))]).unwrap()
+        Mapping::new(F23, [(F24, PadAction::first(Action::Button(PadButton::A)))]).unwrap()
     }
 
     /// Jedno předané rozhodnutí: událost, rozhodnutí, režim po něm.
@@ -593,7 +678,7 @@ mod tests {
     /// povolený a přepnutý na Gamepad.
     fn priprav(z: &Arc<Zaznam>) {
         let mut engine = Engine::new(mapovani());
-        let _ = engine.enable();
+        let _ = engine.enable(PadId::FIRST);
         let _ = engine.toggle(0);
         assert_eq!(engine.mode(), Mode::Gamepad);
         let vystup: Arc<dyn Vystup> = z.clone();
@@ -651,11 +736,14 @@ mod tests {
         let (u, d, m) = z.posledni();
         assert_eq!(u.unwrap().klavesa, F24);
         assert!(d.suppress && m == Mode::Gamepad);
-        assert!(d.pad.unwrap().is_pressed(PadButton::A));
+        assert!(d.pads.get(PadId::FIRST).unwrap().is_pressed(PadButton::A));
         // Autorepeat se potlačí taky, key-up vrátí neutrál.
         assert!(zavolej(0, WM_KEYDOWN, &kb(0x76, 0)));
         assert!(zavolej(0, WM_KEYUP, &kb(0x76, LLKHF_UP.0)));
-        assert_eq!(z.posledni().1.pad, Some(PadState::NEUTRAL));
+        assert_eq!(
+            z.posledni().1.pads.get(PadId::FIRST),
+            Some(PadState::NEUTRAL)
+        );
         // WM_SYSKEYDOWN (s Altem) je taky stisk.
         assert!(zavolej(0, WM_SYSKEYDOWN, &kb(0x76, 0)));
         assert!(zavolej(0, WM_SYSKEYUP, &kb(0x76, LLKHF_UP.0)));
@@ -745,7 +833,7 @@ mod tests {
         assert!(!drzeno(F24));
         let (u, d, m) = z.posledni();
         assert_eq!((u, m), (None, Mode::Keyboard));
-        assert_eq!(d.pad, Some(PadState::NEUTRAL));
+        assert_eq!(d.pads.get(PadId::FIRST), Some(PadState::NEUTRAL));
         assert_eq!(
             d.ui,
             Some(UiEvent::ModeChanged {
@@ -787,7 +875,7 @@ mod tests {
             }
         }
         let mut engine = Engine::new(Mapping::default());
-        let _ = engine.enable();
+        let _ = engine.enable(PadId::FIRST);
         let vystup: Arc<dyn Vystup> = Arc::new(Tichy(AtomicU32::new(0)));
         STAV.with(|s| {
             *s.borrow_mut() = Some(Stav {
@@ -817,16 +905,18 @@ mod tests {
         assert_eq!(crate::testy_alokace::pocet(), pred, "alokace v callbacku");
     }
 
-    /// Skutečný hook na skryté ploše: instalace, příkazy, přeinstalace
-    /// a konec. Mapování jen na F23/F24 — na ploše vlastníka nic nezmění.
+    /// Skutečný hook na skryté ploše: bez zapnutého ovladače v systému
+    /// není, s prvním povoleným se nainstaluje, zachytávání z pozastavení
+    /// ho přeinstaluje, s posledním zakázaným zmizí; konec pošle neutrál.
+    /// Mapování jen na F23/F24 — na ploše vlastníka nic nezmění.
     #[test]
-    fn vlakno_nainstaluje_prepina_preinstaluje_a_uklidi() {
+    fn hook_jen_se_zapnutym_ovladacem() {
         let z = Arc::new(Zaznam::default());
         let vystup: Arc<dyn Vystup> = z.clone();
         let mut hook = spust_s(mapovani(), vystup, testy_plocha::na_skryte_plose).unwrap();
         let st = Arc::clone(hook.status());
-        assert!(st.nainstalovan());
-        assert_eq!(st.instalaci(), 1);
+        assert!(!st.nainstalovan(), "bez ovladače hook v systému není");
+        assert_eq!(st.instalaci(), 0);
 
         let pockej = |podminka: &dyn Fn(&Radek) -> bool| {
             let konec = std::time::Instant::now() + LIMIT;
@@ -838,11 +928,29 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(5));
             }
         };
+        let pockej_na = |co: &dyn Fn() -> bool| {
+            let konec = std::time::Instant::now() + LIMIT;
+            while !co() {
+                assert!(std::time::Instant::now() < konec, "vlákno neodpovědělo");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let p2 = PadId::new(1).unwrap();
 
-        assert!(hook.posli(HookPrikaz::Povol));
-        assert!(hook.posli(HookPrikaz::Prepni));
+        // Přeinstalace bez hooku v systému nic neinstaluje.
+        assert!(hook.posli(HookPrikaz::Preinstaluj));
+        assert!(hook.posli(HookPrikaz::Povol(PadId::FIRST)));
+        pockej(&|r| r.2 == Mode::Keyboard);
+        pockej_na(&|| st.nainstalovan());
+        assert_eq!(st.instalaci(), 1);
+
+        // Zapnutí přepínačem z pozastavení: hook znovu a zachytávat.
+        assert!(hook.posli(HookPrikaz::Zachytavej));
         pockej(&|r| r.2 == Mode::Gamepad);
-
+        pockej_na(&|| st.instalaci() == 2);
+        // Druhý ovladač při běžícím zachytávání hook nepřeinstaluje.
+        assert!(hook.posli(HookPrikaz::Povol(p2)));
+        assert!(hook.posli(HookPrikaz::Zachytavej));
         assert!(hook.posli(HookPrikaz::Preinstaluj));
         pockej(&|r| {
             r.1.ui
@@ -851,23 +959,62 @@ mod tests {
                     cause: ModeCause::Forced(ForceReason::HookReinstalled),
                 })
         });
-        let konec = std::time::Instant::now() + LIMIT;
-        while st.instalaci() < 2 {
-            assert!(std::time::Instant::now() < konec);
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        pockej_na(&|| st.instalaci() == 3);
         assert!(st.nainstalovan());
+
+        // Vypnutý jeden ovladač hook nechá, vypnutý poslední ho odebere.
+        assert!(hook.posli(HookPrikaz::Zakaz(
+            PadId::FIRST,
+            DisabledReason::PadNotConnected
+        )));
+        assert!(hook.posli(HookPrikaz::Prepni));
+        pockej(&|r| r.2 == Mode::Gamepad && r.0.is_none());
+        assert!(st.nainstalovan());
+        assert!(hook.posli(HookPrikaz::Zakaz(p2, DisabledReason::PadNotConnected)));
+        pockej(&|r| matches!(r.2, Mode::Disabled { .. }));
+        pockej_na(&|| !st.nainstalovan());
+        assert_eq!(st.instalaci(), 3);
 
         assert!(hook.zastav());
         assert!(!st.nainstalovan());
         let (u, d, m) = z.posledni();
         assert_eq!(
-            (u, m, d.pad),
-            (None, Mode::Keyboard, Some(PadState::NEUTRAL))
+            (u, d.pads.get(PadId::FIRST)),
+            (None, Some(PadState::NEUTRAL))
         );
+        assert!(matches!(m, Mode::Disabled { .. }));
         // Po konci vlákna příkazy neprojdou.
         assert!(!hook.posli(HookPrikaz::Prepni));
         assert!(hook.zastav(), "druhé zastavení nic nedělá");
+    }
+
+    /// Konec při zachytávání: neutrál všem ovladačům ještě před
+    /// odebráním hooku (pořadí neutrál → odhooknout).
+    #[test]
+    fn konec_pri_zachytavani_posle_neutral() {
+        let z = Arc::new(Zaznam::default());
+        let vystup: Arc<dyn Vystup> = z.clone();
+        let mut hook = spust_s(mapovani(), vystup, testy_plocha::na_skryte_plose).unwrap();
+        assert!(hook.posli(HookPrikaz::Povol(PadId::FIRST)));
+        assert!(hook.posli(HookPrikaz::Zachytavej));
+        let konec = std::time::Instant::now() + LIMIT;
+        while z.rozhodnuti.lock().unwrap().last().map(|r| r.2) != Some(Mode::Gamepad) {
+            assert!(std::time::Instant::now() < konec);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(hook.zastav());
+        let (_, d, m) = z.posledni();
+        assert_eq!(m, Mode::Keyboard);
+        for p in PadId::ALL {
+            assert_eq!(d.pads.get(p), Some(PadState::NEUTRAL), "{p:?}");
+        }
+        assert_eq!(
+            d.ui,
+            Some(UiEvent::ModeChanged {
+                mode: Mode::Keyboard,
+                cause: ModeCause::Forced(ForceReason::Shutdown),
+            })
+        );
     }
 
     /// Časovač přiřazování běží jen při přiřazování.
@@ -880,9 +1027,7 @@ mod tests {
             let mut s = s.borrow_mut();
             let e = &mut s.as_mut().unwrap().engine;
             let _ = e.force_keyboard(ForceReason::Shutdown);
-            let _ = e
-                .start_binding(Action::Button(PadButton::B), ted_ms())
-                .unwrap();
+            let _ = e.start_binding(PadAction::first(Action::Button(PadButton::B)), ted_ms());
         });
         let id = hlidej_casovac(0);
         assert_ne!(id, 0);
@@ -903,19 +1048,24 @@ mod tests {
 /// vlastníka (může na ní běžet hra).
 #[cfg(test)]
 pub(crate) mod testy_plocha {
-    use windows::core::w;
+    use windows::core::HSTRING;
     use windows::Win32::System::StationsAndDesktops::{
         CreateDesktopW, SetThreadDesktop, DESKTOP_CONTROL_FLAGS,
     };
+    use windows::Win32::System::Threading::GetCurrentThreadId;
 
     /// Přesune volající vlákno na novou skrytou plochu. Plocha zanikne,
-    /// až ji přestane používat poslední vlákno.
+    /// až ji přestane používat poslední vlákno. Jméno s číslem vlákna:
+    /// testy běží souběžně a druhé `CreateDesktopW` se stejným jménem by
+    /// otevíralo cizí plochu (a dostalo „přístup odepřen").
     pub fn na_skryte_plose() -> Result<(), String> {
+        // SAFETY: bez parametrů.
+        let jmeno = HSTRING::from(format!("KeyPadTestHook{}", unsafe { GetCurrentThreadId() }));
         // SAFETY: vytvoření plochy s výchozími právy; handle se nechává
         // otevřený po celý život vlákna (SetThreadDesktop ho potřebuje).
         unsafe {
             let plocha = CreateDesktopW(
-                w!("KeyPadTestHook"),
+                &jmeno,
                 None,
                 None,
                 DESKTOP_CONTROL_FLAGS(0),

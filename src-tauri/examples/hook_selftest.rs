@@ -14,12 +14,17 @@
 //! padu se jen vypíše. Konec po zadaném čase nebo Ctrl+C (hook zmizí
 //! s procesem).
 //!
-//! `instalace`: jen nainstaluje, přeinstaluje a odebere hook (engine
-//! zůstane vypnutý, všechno propouští) a nic o klávesách nevypisuje.
+//! `instalace`: jen nainstaluje, přeinstaluje a odebere hook a nic
+//! o klávesách nevypisuje. Mapuje jen F23/F24 (zkratka F23) — klávesy,
+//! které nikdo nezmáčkne, takže ani na chvilku nic nepotlačí.
 //!
 //! Hook i názvy kláves jsou TYTÉŽ soubory, které používá aplikace
 //! (`#[path]`).
 
+#[allow(
+    dead_code,
+    reason = "příklad používá jen část hooku, zbytek je pro aplikaci"
+)]
 #[path = "../src/platform/windows/hook.rs"]
 mod hook;
 #[path = "../src/platform/windows/klavesy.rs"]
@@ -37,7 +42,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hook::{Hook, HookPrikaz, Udalost, Vystup};
-use keypad_core::{Decision, KeyId, Mapping, Mode, PadButton};
+use keypad_core::{Action, Decision, KeyId, Mapping, Mode, PadAction, PadButton, PadId};
 
 /// Kapacita fronty z callbacku. Hlavní vlákno ji vybírá každých 20 ms;
 /// tolik událostí za tu dobu nikdo nenaťuká.
@@ -106,7 +111,8 @@ fn zabal(u: Option<&Udalost>, d: &Decision, rezim: Mode) -> u64 {
         Mode::Disabled { .. } => 3,
     };
     x |= r << 36;
-    if let Some(p) = d.pad {
+    // Výchozí mapování je celé na prvním ovladači, jiný se tu neukáže.
+    if let Some(p) = d.pads.get(PadId::FIRST) {
         let osa = |v: i16| -> u64 {
             match v {
                 0 => 0,
@@ -210,28 +216,40 @@ fn vypis(x: u64, posledni_rezim: &mut u64, posledni_pad: &mut Option<u64>) {
 
 fn jen_instalace() -> ExitCode {
     let fronta: Arc<dyn Vystup> = Arc::new(Fronta::new());
-    let mut h = match Hook::spust(Mapping::default(), fronta) {
+    let f23 = KeyId::new(0x6E);
+    let f24 = KeyId::new(0x76);
+    let Ok(mapovani) = Mapping::new(f23, [(f24, PadAction::first(Action::Button(PadButton::A)))])
+    else {
+        return ExitCode::FAILURE;
+    };
+    let mut h = match Hook::spust(mapovani, fronta) {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("hook nejde nainstalovat: {e}");
+            eprintln!("hook vlákno nejde spustit: {e}");
             return ExitCode::FAILURE;
         }
     };
     let st = Arc::clone(h.status());
-    let preinstalovano = h.posli(HookPrikaz::Preinstaluj) && {
+    let cekej = |n: u32| {
         let konec = Instant::now() + Duration::from_secs(3);
-        while st.instalaci() < 2 && Instant::now() < konec {
+        while st.instalaci() < n && Instant::now() < konec {
             std::thread::sleep(Duration::from_millis(5));
         }
-        st.instalaci() >= 2 && st.nainstalovan()
+        st.instalaci() >= n && st.nainstalovan()
     };
+    let bez_ovladace = !st.nainstalovan();
+    // Jako by se připojil ovladač: teprve teď hook do systému.
+    let nainstalovano = h.posli(HookPrikaz::Povol(PadId::FIRST)) && cekej(1);
+    let preinstalovano = h.posli(HookPrikaz::Preinstaluj) && cekej(2);
     let zastaveno = h.zastav() && !st.nainstalovan();
     println!(
-        "instalace ok, přeinstalace {}, odebrání {}",
+        "bez ovladače bez hooku {}, instalace {}, přeinstalace {}, odebrání {}",
+        if bez_ovladace { "ok" } else { "SELHALO" },
+        if nainstalovano { "ok" } else { "SELHALA" },
         if preinstalovano { "ok" } else { "SELHALA" },
         if zastaveno { "ok" } else { "SELHALO" }
     );
-    if preinstalovano && zastaveno {
+    if bez_ovladace && nainstalovano && preinstalovano && zastaveno {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
@@ -263,7 +281,7 @@ fn main() -> ExitCode {
     };
     // Jako by se připojil pad: z „Vypnuto" na Klávesnici. Na Gamepad
     // přepne až Scroll Lock.
-    h.posli(HookPrikaz::Povol);
+    h.posli(HookPrikaz::Povol(PadId::FIRST));
     println!(
         "Hook běží {sekund} s. Klávesy se vypisují jen sem, nic se neukládá.\n\
          Scroll Lock = Klávesnice ↔ Gamepad (WASD, šipky, IJKL… se v Gamepadu potlačí).\n\

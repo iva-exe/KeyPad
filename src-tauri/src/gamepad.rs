@@ -1,63 +1,183 @@
-//! Virtuální gamepad z pohledu okna: příkazy, událost se stavem padu
-//! a popisek ikony v oznamovací oblasti.
+//! Virtuální ovladače z pohledu okna: příkazy, události se stavem padů
+//! a režimem, popisek ikony v oznamovací oblasti — a lepidlo mezi pad
+//! vlákny a hookem klávesnice (Fáze 4).
 //!
-//! Samotný pad (ViGEmBus, pad vlákno) je v `platform::windows::pad`;
-//! tady je jen lepidlo k Tauri, ať platformní kód na Tauri nezávisí
-//! a jde testovat bez okna.
+//! Samotné pady (ViGEmBus, pad vlákna) jsou v `platform::windows::pad`,
+//! hook v `platform::windows::hook`; tady je jen spojení s Tauri, ať
+//! platformní kód na Tauri nezávisí a jde testovat bez okna.
 //!
 //! Fáze 2b: ovladač se připojuje JEN přepínačem v okně (`pad_on`) —
-//! nikdy sám po startu, po probuzení ani po aktualizaci.
+//! nikdy sám po startu, po probuzení ani po aktualizaci. Fáze 4: jakmile
+//! se zapnutý ovladač ohlásí jako připojený, engine ho povolí a začne
+//! zachytávat jeho klávesy (přepnutí přepínače JE povel „hrát");
+//! zkratka (Scroll Lock) zachytávání jen pozastaví. Hook klávesnice je
+//! v systému, jen když je zapnutý aspoň jeden ovladač.
 
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use keypad_core::{DisabledReason, Mapping, PadId, MAX_PADS};
 use serde::Deserialize;
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::platform::windows::pad::{Oznam, Pad, PadInfo, PadPrikaz, PadStav, UDALOST};
+use crate::platform::windows::hook::{Hook, HookOdesilatel, HookPrikaz, Vystup};
+use crate::platform::windows::pad::{Oznam, PadInfo, PadPrikaz, PadStav, Pady, UDALOST};
+use crate::platform::windows::slot::Budik;
+use crate::platform::windows::vystup::{HookVystup, Rezim};
 use crate::platform::windows::{power, shell};
 
-/// Jak dlouho při konci aplikace čekat na neutrál + odpojení padu.
-/// Normálně milisekundy; když ovladač visí, proces skončí i tak a pad
+/// Tauri událost se změnou režimu (payload [`Rezim`]).
+pub const UDALOST_REZIM: &str = "rezim";
+
+/// Jak dlouho při konci aplikace čekat na neutrál + odpojení padů.
+/// Normálně milisekundy; když ovladač visí, proces skončí i tak a pady
 /// odpojí ovladač sám se zavřením spojení.
 const LIMIT_KONCE: Duration = Duration::from_millis(1_500);
 
-/// Jak dlouho před spuštěním instalátoru ViGEmBus čekat, než pad vlákno
-/// ovladač vypne. Normálně milisekundy; zdrží ho jen rozjeté zapínání
-/// (`wait_ready`). Bez potvrzení se instalátor nespustí.
+/// Jak dlouho před spuštěním instalátoru ViGEmBus čekat, než pad
+/// vlákna ovladače vypnou. Normálně milisekundy; zdrží je jen rozjeté
+/// zapínání (`wait_ready`). Bez potvrzení se instalátor nespustí.
 const LIMIT_VYPNUTI: Duration = Duration::from_secs(3);
 
-/// Spustí pad vlákno a hlídání spánku; stav je pak v `app.state::<Pad>()`.
-/// Pad vlákno sběrnici jen ověří — nic nepřipojí.
-pub fn spust(app: &tauri::App) {
+/// Všechno kolem virtuálních ovladačů, co potřebují příkazy okna.
+pub struct Ovladani {
+    pady: Arc<Pady>,
+    /// Hook vlákno; `None` po konci aplikace.
+    hook: Mutex<Option<Hook>>,
+    vystup: Arc<HookVystup>,
+}
+
+/// Spustí pad vlákno prvního ovladače (jen ověří sběrnici — nic
+/// nepřipojí), hlídání spánku a hook vlákno (hook sám se nainstaluje až
+/// se zapnutým ovladačem). Stav je pak v `app.state::<Ovladani>()`.
+pub fn spust(app: &tauri::App) -> Result<(), String> {
+    // Pad vlákna vznikají dřív než hook a hlásí se hned — odesílatel
+    // hooku se do jejich oznámení doplní, jakmile hook běží. Oznámení
+    // před tím (první ověření sběrnice) engine nepotřebuje: startuje
+    // bez povolených ovladačů.
+    let hook_tx: Arc<OnceLock<HookOdesilatel>> = Arc::default();
+    let predchozi: Arc<[AtomicU8; MAX_PADS]> = Arc::new(std::array::from_fn(|_| AtomicU8::new(0)));
     let handle = app.handle().clone();
-    let oznam: Oznam = std::sync::Arc::new(move |info: &PadInfo| {
+    let tx = Arc::clone(&hook_tx);
+    let oznam: Oznam = Arc::new(move |info: &PadInfo| {
         // `emit` i `popisek` jen předají práci hlavnímu vláknu, nečekají
         // (pad vlákno nesmí stát na hlavním — to může čekat na pad).
         let _ = handle.emit(UDALOST, info);
-        crate::tray::popisek(&handle, popisek(info));
+        if info.pad == 0 {
+            crate::tray::popisek(&handle, popisek(info));
+        }
+        let Some(pad) = PadId::new(usize::from(info.pad)) else {
+            return;
+        };
+        let pred = predchozi[pad.index()].swap(kod_stavu(info.state), Ordering::AcqRel);
+        if let Some(h) = tx.get() {
+            for p in prikazy_hooku(pad, stav_z_kodu(pred), info.state) {
+                h.posli(p);
+            }
+        }
     });
-    let pad = Pad::spust(oznam);
-    power::registruj(pad.odesilatel());
-    // Fáze 4: stavy z enginu do pad vlákna NE přes `pad.odesilatel()`.
-    // Ta fronta bere zámek sdílený s GUI a alokuje — hook callback nesmí
-    // ani jedno (princip 3). Hook dostane atomický slot „nejnovější stav"
-    // + auto-reset událost, na kterou pad vlákno čeká spolu s frontou
-    // (podrobně u `PadPrikaz::Stav`). Opačný směr: pad vlákno při
-    // zapnutí pošle hooku `enable()`, při chybě a vypnutí `disable(…)`.
-    app.manage(pad);
+    let pady = Arc::new(Pady::spust(oznam)?);
+    power::registruj(Arc::clone(&pady) as Arc<dyn power::Napajeni>);
+
+    let budik = Arc::new(Budik::new()?);
+    let vystup = Arc::new(HookVystup::new(pady.sloty(), Arc::clone(&budik)));
+    // Rozložení zatím výchozí; vlastní klávesy přinese Fáze 6/7.
+    let hook = Hook::spust(Mapping::default(), Arc::clone(&vystup) as Arc<dyn Vystup>)?;
+    let _ = hook_tx.set(hook.odesilatel());
+
+    // Změna režimu → okno. Vlastní vlákno, protože hook callback smí jen
+    // nastavit událost (princip 3); tohle vlákno spí, dokud nepřijde.
+    let handle = app.handle().clone();
+    let v = Arc::clone(&vystup);
+    std::thread::Builder::new()
+        .name("keypad-rezim".into())
+        .spawn(move || {
+            let mut posledni = Rezim::Disabled;
+            loop {
+                budik.cekej(None);
+                let r = v.rezim();
+                if r != posledni {
+                    log::info!("režim: {r:?}");
+                    posledni = r;
+                    let _ = handle.emit(UDALOST_REZIM, r);
+                }
+            }
+        })
+        .map_err(|e| format!("vlákno režimu nejde spustit: {e}"))?;
+
+    app.manage(Ovladani {
+        pady,
+        hook: Mutex::new(Some(hook)),
+        vystup,
+    });
+    Ok(())
 }
 
-/// Konec aplikace: neutrál → odpojit → zavřít (s časovým limitem).
-/// Smí se volat víckrát a z libovolného vlákna (konec relace Windows,
-/// `RunEvent::Exit`).
-pub fn ukonci(app: &AppHandle) {
-    if let Some(pad) = app.try_state::<Pad>() {
-        if !pad.ukonci(LIMIT_KONCE) {
-            log::warn!(
-                "pad se do {} ms neodpojil — odpojí ho ovladač se zavřením procesu",
-                LIMIT_KONCE.as_millis()
-            );
+/// Co má hook udělat, když se stav ovladače změnil.
+///
+/// Připojený ovladač (přechod na `On`) engine povolí a začne zachytávat
+/// — ovladač se připojuje jen přepínačem, takže tohle je vždy povel
+/// uživatele. Cokoli jiného ovladač v enginu zakáže: jeho klávesy jdou
+/// zase do Windows a držené se spolknou (OS jejich stisk neviděl).
+/// Stejný stav znovu (nová podrobnost, ohlášení po instalátoru) nic
+/// nemění — hlavně nesmí znovu spustit zachytávání pozastavené zkratkou.
+fn prikazy_hooku(pad: PadId, pred: Option<PadStav>, ted: PadStav) -> Vec<HookPrikaz> {
+    if pred == Some(ted) {
+        return Vec::new();
+    }
+    match ted {
+        PadStav::On => vec![HookPrikaz::Povol(pad), HookPrikaz::Zachytavej],
+        PadStav::BusMissing => vec![HookPrikaz::Zakaz(pad, DisabledReason::ViGEmMissing)],
+        PadStav::Error => vec![HookPrikaz::Zakaz(pad, DisabledReason::PadError)],
+        PadStav::Off | PadStav::Connecting | PadStav::BusNotRunning => {
+            vec![HookPrikaz::Zakaz(pad, DisabledReason::PadNotConnected)]
         }
+    }
+}
+
+/// Poslední ohlášený stav ovladače v atomiku (0 = zatím nic).
+fn kod_stavu(s: PadStav) -> u8 {
+    match s {
+        PadStav::Off => 1,
+        PadStav::Connecting => 2,
+        PadStav::On => 3,
+        PadStav::BusMissing => 4,
+        PadStav::BusNotRunning => 5,
+        PadStav::Error => 6,
+    }
+}
+
+fn stav_z_kodu(k: u8) -> Option<PadStav> {
+    Some(match k {
+        1 => PadStav::Off,
+        2 => PadStav::Connecting,
+        3 => PadStav::On,
+        4 => PadStav::BusMissing,
+        5 => PadStav::BusNotRunning,
+        6 => PadStav::Error,
+        _ => return None,
+    })
+}
+
+/// Konec aplikace: hook pryč (engine předtím pošle neutrál), pak pady
+/// neutrál → odpojit → zavřít (s časovým limitem). Smí se volat víckrát
+/// a z libovolného vlákna (konec relace Windows, `RunEvent::Exit`).
+pub fn ukonci(app: &AppHandle) {
+    let Some(o) = app.try_state::<Ovladani>() else {
+        return;
+    };
+    let hook = o.hook.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(mut h) = hook {
+        if !h.zastav() {
+            log::warn!("hook se nezastavil včas — zmizí s procesem");
+        }
+    }
+    if !o.pady.ukonci(LIMIT_KONCE) {
+        log::warn!(
+            "ovladače se do {} ms neodpojily — odpojí je ViGEmBus se zavřením procesu",
+            LIMIT_KONCE.as_millis()
+        );
     }
 }
 
@@ -75,55 +195,76 @@ fn popisek(info: &PadInfo) -> String {
     format!("KeyPad — {stav}")
 }
 
-fn posli(pad: &Pad, p: PadPrikaz) -> Result<(), String> {
-    if pad.posli(p) {
+/// Číslo ovladače z okna (bez čísla = první).
+fn cislo(pad: Option<u8>) -> Result<usize, String> {
+    let i = usize::from(pad.unwrap_or(0));
+    if i < MAX_PADS {
+        Ok(i)
+    } else {
+        Err("Takový ovladač není.".into())
+    }
+}
+
+fn posli(o: &Ovladani, pad: Option<u8>, p: PadPrikaz) -> Result<(), String> {
+    if o.pady.posli(cislo(pad)?, p) {
         Ok(())
     } else {
         Err("KeyPad je potřeba spustit znovu.".into())
     }
 }
 
-/// Stav padu pro okno (při startu a po návratu okna z oznamovací
+/// Stav ovladače pro okno (při startu a po návratu okna z oznamovací
 /// oblasti). Změny pak chodí událostí `pad-stav`.
 #[tauri::command]
-pub fn pad_status(pad: tauri::State<'_, Pad>) -> PadInfo {
-    pad.status().snapshot()
+pub fn pad_status(o: tauri::State<'_, Ovladani>, pad: Option<u8>) -> Result<PadInfo, String> {
+    o.pady
+        .stav(cislo(pad)?)
+        .ok_or_else(|| "Takový ovladač není.".into())
+}
+
+/// Režim zachytávání pro okno (změny chodí událostí `rezim`).
+#[tauri::command]
+pub fn rezim(o: tauri::State<'_, Ovladani>) -> Rezim {
+    o.vystup.rezim()
 }
 
 /// Přepínač „zapnout" — jediná cesta, kudy se virtuální ovladač
-/// připojuje. Výsledek přijde událostí `pad-stav`.
+/// připojuje. Výsledek přijde událostí `pad-stav`; po připojení engine
+/// začne zachytávat klávesy ovladače.
 #[tauri::command]
-pub fn pad_on(pad: tauri::State<'_, Pad>) -> Result<(), String> {
+pub fn pad_on(o: tauri::State<'_, Ovladani>, pad: Option<u8>) -> Result<(), String> {
     // Okno má přepínač během instalátoru zablokovaný a pad vlákno by
     // zapnutí odmítlo samo — tohle jen dá klikajícímu srozumitelnou větu.
-    if pad.status().snapshot().installer || shell::instalator_bezi() {
+    let i = cislo(pad)?;
+    if o.pady.stav(i).is_some_and(|s| s.installer) || shell::instalator_bezi() {
         return Err("Počkej, až doběhne instalátor ovladače.".into());
     }
-    posli(&pad, PadPrikaz::Zapnout)
+    posli(&o, pad, PadPrikaz::Zapnout)
 }
 
-/// Přepínač „vypnout": neutrál → odpojit.
+/// Přepínač „vypnout": neutrál → odpojit. Engine se to dozví ze stavu
+/// padu (klávesy ovladače jdou zase do Windows).
 #[tauri::command]
-pub fn pad_off(pad: tauri::State<'_, Pad>) -> Result<(), String> {
-    posli(&pad, PadPrikaz::Vypnout)
+pub fn pad_off(o: tauri::State<'_, Ovladani>, pad: Option<u8>) -> Result<(), String> {
+    posli(&o, pad, PadPrikaz::Vypnout)
 }
 
-/// Zkouška: levá páčka opíše kruh a vrátí se na neutrál.
+/// Zkouška: levá páčka opíše kruh a vrátí se na neutrál. Stisk klávesy
+/// ovladače ji přeruší (vstup z klávesnice má přednost).
 #[tauri::command]
-pub fn pad_test(pad: tauri::State<'_, Pad>) -> Result<(), String> {
-    if pad.status().stav() != PadStav::On {
+pub fn pad_test(o: tauri::State<'_, Ovladani>, pad: Option<u8>) -> Result<(), String> {
+    let i = cislo(pad)?;
+    if o.pady.stav(i).map(|s| s.state) != Some(PadStav::On) {
         return Err("Ovladač je vypnutý.".into());
     }
-    // Fáze 4: jen v režimu Klávesnice — v režimu Gamepad by se kruh
-    // pral s klávesami (pad vlákno ho při stavu z enginu stejně přeruší).
-    posli(&pad, PadPrikaz::Test)
+    posli(&o, pad, PadPrikaz::Test)
 }
 
 /// „Zkusit znovu" — sběrnici znovu ověřit (po chybě, po ruční instalaci
-/// nebo zapnutí ViGEmBus). Nic nepřipojí.
+/// nebo zapnutí ViGEmBus) ve všech ovladačích. Nic nepřipojí.
 #[tauri::command]
-pub fn pad_retry(pad: tauri::State<'_, Pad>) -> Result<(), String> {
-    posli(&pad, PadPrikaz::Znovu)
+pub fn pad_retry(o: tauri::State<'_, Ovladani>) {
+    o.pady.vsem(|| PadPrikaz::Znovu);
 }
 
 /// Smí se teď spustit `KeyPadSetup /vigembus`? `Err` = proč ne.
@@ -131,9 +272,10 @@ pub fn pad_retry(pad: tauri::State<'_, Pad>) -> Result<(), String> {
 /// Instalace jen tam, kde ViGEmBus opravdu chybí (`BusMissing` pad
 /// vlákno hlásí jen pro `BusState::NotInstalled`), aktualizace jen
 /// u staršího ovladače (`needs_update`) — v jakémkoli stavu padu:
-/// zapnutý pad se před spuštěním vypne ([`install_vigembus`]). Instalátor
-/// to hlídá taky; tohle je druhá pojistka (instalátor ViGEmBus nad cizí
-/// instalací škodí).
+/// zapnuté pady se před spuštěním vypnou ([`install_vigembus`]).
+/// Instalátor to hlídá taky; tohle je druhá pojistka (instalátor
+/// ViGEmBus nad cizí instalací škodí). Stav sběrnice hlásí první
+/// ovladač — jeho vlákno běží vždy.
 fn smi_instalovat(info: &PadInfo) -> Result<(), &'static str> {
     if info.installer {
         return Err("Instalátor už běží.");
@@ -149,16 +291,17 @@ fn smi_instalovat(info: &PadInfo) -> Result<(), &'static str> {
 /// Spustí `KeyPadSetup.exe /vigembus` z instalační složky: instalace
 /// chybějícího ViGEmBus, nebo aktualizace staršího.
 ///
-/// Plán → provedení → ověření: nejdřív pad vypnout (neutrál → odpojit
-/// → zavřít spojení) a přepínač zablokovat — nový ovladač by zapnutý
-/// pad odebral uprostřed hry a otevřené spojení by držel starý ovladač
-/// v paměti. Pak instalátor. Po jeho konci (i když se nespustil) pad
-/// vlákno blokaci zruší a sběrnici jen ověří; zapne zase uživatel.
+/// Plán → provedení → ověření: nejdřív všechny pady vypnout (neutrál →
+/// odpojit → zavřít spojení) a přepínače zablokovat — nový ovladač by
+/// zapnutý pad odebral uprostřed hry a otevřené spojení by drželo starý
+/// ovladač v paměti. Pak instalátor. Po jeho konci (i když se nespustil)
+/// pad vlákna blokaci zruší a sběrnici jen ověří; zapne zase uživatel.
 #[tauri::command(async)]
-pub fn install_vigembus(pad: tauri::State<'_, Pad>) -> Result<(), String> {
-    smi_instalovat(&pad.status().snapshot()).map_err(String::from)?;
+pub fn install_vigembus(o: tauri::State<'_, Ovladani>) -> Result<(), String> {
+    let info = o.pady.stav(0).ok_or("KeyPad je potřeba spustit znovu.")?;
+    smi_instalovat(&info).map_err(String::from)?;
     let setup = updater::install_dir().join(updater::SETUP_EXE);
-    if !pad.simulace() && !setup.is_file() {
+    if !o.pady.simulace() && !setup.is_file() {
         log::warn!(
             "instalátor KeyPadu tu není ({}) — ViGEmBus jen ručně z {}",
             setup.display(),
@@ -169,23 +312,21 @@ pub fn install_vigembus(pad: tauri::State<'_, Pad>) -> Result<(), String> {
         return Err("KeyPad neběží z instalace — ovladač stáhni ručně.".into());
     }
     // Uvolnění zámku (v každém případě, i při chybě níž) = konec
-    // blokace přepínače a ověření sběrnice.
-    let tx = pad.odesilatel();
-    let Some(zamek) = shell::Zamek::zaber(move || {
-        let _ = tx.send(PadPrikaz::PoInstalaci);
-    }) else {
+    // blokace přepínačů a ověření sběrnice.
+    let pady = Arc::clone(&o.pady);
+    let Some(zamek) = shell::Zamek::zaber(move || pady.po_instalaci()) else {
         return Err("Instalátor už běží.".into());
     };
-    if !pad.pred_instalaci(LIMIT_VYPNUTI) {
+    if !o.pady.pred_instalaci(LIMIT_VYPNUTI) {
         log::error!(
-            "pad se do {} ms nevypnul — instalátor ViGEmBus se nespouští",
+            "ovladače se do {} ms nevypnuly — instalátor ViGEmBus se nespouští",
             LIMIT_VYPNUTI.as_millis()
         );
         return Err("Ovladač se nepodařilo vypnout — zkus to znovu.".into());
     }
-    if pad.simulace() {
-        // Test okna (KEYPAD_BEZ_VIGEM / KEYPAD_VIGEM_STARY): pad se
-        // vypne jako naostro, ale skutečný instalátor ovladače se nikdy
+    if o.pady.simulace() {
+        // Test okna (KEYPAD_BEZ_VIGEM / KEYPAD_VIGEM_STARY): pady se
+        // vypnou jako naostro, ale skutečný instalátor ovladače se nikdy
         // nespouští.
         log::warn!("simulace ViGEmBus — instalátor se nespouští");
         return Err("Simulace — instalátor se nespouští.".into());
@@ -233,6 +374,7 @@ mod tests {
 
     fn info(state: PadStav, player: Option<u8>, needs_update: bool) -> PadInfo {
         PadInfo {
+            pad: 0,
             state,
             player,
             detail: String::new(),
@@ -241,6 +383,15 @@ mod tests {
             seq: 1,
         }
     }
+
+    const VSECHNY: [PadStav; 6] = [
+        PadStav::Off,
+        PadStav::Connecting,
+        PadStav::On,
+        PadStav::BusMissing,
+        PadStav::BusNotRunning,
+        PadStav::Error,
+    ];
 
     #[test]
     fn popisek_ikony() {
@@ -252,17 +403,57 @@ mod tests {
             popisek(&info(PadStav::Off, None, false)),
             "KeyPad — ovladač vypnutý"
         );
-        for s in [
-            PadStav::Off,
-            PadStav::Connecting,
-            PadStav::On,
-            PadStav::BusMissing,
-            PadStav::BusNotRunning,
-            PadStav::Error,
-        ] {
+        for s in VSECHNY {
             // NOTIFYICONDATAW::szTip má 128 znaků včetně nuly.
             assert!(popisek(&info(s, Some(4), false)).encode_utf16().count() < 128);
         }
+    }
+
+    /// Zachytávání spouští jen PŘECHOD na „zapnuto" (povel přepínače);
+    /// opakované ohlášení téhož stavu nesmí obnovit zachytávání, které
+    /// uživatel pozastavil zkratkou. Každý jiný stav ovladač zakáže.
+    #[test]
+    fn hook_jen_na_prechod_stavu() {
+        let p = PadId::new(1).unwrap();
+        for s in VSECHNY {
+            assert!(prikazy_hooku(p, Some(s), s).is_empty(), "{s:?}");
+        }
+        for pred in [None, Some(PadStav::Off), Some(PadStav::Connecting)] {
+            let v = prikazy_hooku(p, pred, PadStav::On);
+            assert!(
+                matches!(v[..], [HookPrikaz::Povol(x), HookPrikaz::Zachytavej] if x == p),
+                "{v:?}"
+            );
+        }
+        let v = prikazy_hooku(p, Some(PadStav::On), PadStav::Error);
+        assert!(matches!(
+            v[..],
+            [HookPrikaz::Zakaz(x, DisabledReason::PadError)] if x == p
+        ));
+        let v = prikazy_hooku(p, Some(PadStav::Off), PadStav::BusMissing);
+        assert!(matches!(
+            v[..],
+            [HookPrikaz::Zakaz(_, DisabledReason::ViGEmMissing)]
+        ));
+        for s in [PadStav::Off, PadStav::Connecting, PadStav::BusNotRunning] {
+            let v = prikazy_hooku(p, Some(PadStav::On), s);
+            assert!(matches!(
+                v[..],
+                [HookPrikaz::Zakaz(_, DisabledReason::PadNotConnected)]
+            ));
+        }
+        for s in VSECHNY {
+            assert_eq!(stav_z_kodu(kod_stavu(s)), Some(s));
+        }
+        assert_eq!(stav_z_kodu(0), None);
+    }
+
+    #[test]
+    fn cislo_ovladace_z_okna() {
+        assert_eq!(cislo(None), Ok(0));
+        assert_eq!(cislo(Some(3)), Ok(3));
+        assert!(cislo(Some(4)).is_err());
+        assert!(cislo(Some(255)).is_err());
     }
 
     /// Instalace jen při chybějícím ViGEmBus, aktualizace jen staršího —

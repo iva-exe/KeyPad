@@ -326,6 +326,7 @@ fn main() {
             update::check_update,
             update::run_update,
             gamepad::pad_status,
+            gamepad::rezim,
             gamepad::pad_on,
             gamepad::pad_off,
             gamepad::pad_test,
@@ -372,8 +373,18 @@ fn main() {
             }
             // Pad vlákno ViGEmBus jen ověří; virtuální ovladač připojí
             // až přepínač v okně (Fáze 2b). Stav jde do okna událostí
-            // `pad-stav`. Hook přibude ve Fázi 3.
-            gamepad::spust(app);
+            // `pad-stav`, režim událostí `rezim`. Hook klávesnice se
+            // nainstaluje až se zapnutým ovladačem (Fáze 4).
+            if let Err(e) = gamepad::spust(app) {
+                nespusteno(
+                    &format!("virtuální ovladače nejde připravit: {e}"),
+                    "KeyPad se nepodařilo spustit — Windows nedaly prostředky pro                      virtuální ovladač.
+
+Zkus to znovu, případně po restartu počítače.
+
+                     Podrobnosti jsou v logu (keypad.log).",
+                );
+            }
             let handle = app.handle().clone();
             let ukonceni = platform::windows::ukonceni::hlidej(move || {
                 // Stejná cesta jako „Ukončit" v nabídce: na hlavním vlákně.

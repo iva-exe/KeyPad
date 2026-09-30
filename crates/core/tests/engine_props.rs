@@ -1,16 +1,19 @@
 //! Property testy enginu: libovolná sekvence událostí klávesnice,
-//! přepínání, přiřazování, vynucení, výpadků padu a skoků času.
+//! přepínání, zachytávání, přiřazování, vynucení, výpadků a připojení
+//! jednotlivých ovladačů a skoků času.
 //!
 //! Hlavní vlastnost z ROADMAP.md (Fáze 1): po uvolnění všech kláves je
-//! PadState neutrální a `held` prázdné.
+//! každý ovladač neutrální a `held` prázdné.
 //!
 //! Engine se po každém kroku porovnává s **nezávislým referenčním
 //! modelem** (`Model`) — druhou, co nejpřímočařejší implementací
-//! specifikace s vlastním mapováním a vlastním výpočtem padu. Dřívější
-//! verze testu brala očekávání z enginu samotného (jeho mapování, jeho
-//! výpočet padu) a revize ukázala čtyři mutanty enginu, které jí prošly.
-//! Model je naopak zabije: nesedí-li režim, mapování, vlastník, pořadí
-//! stisku, spočítaný pad, odeslaný pad nebo oznámení, test spadne.
+//! specifikace s vlastním mapováním, vlastní evidencí připravených
+//! ovladačů a vlastním výpočtem padu. Dřívější verze testu brala
+//! očekávání z enginu samotného (jeho mapování, jeho výpočet padu)
+//! a revize ukázala čtyři mutanty enginu, které jí prošly. Model je
+//! naopak zabije: nesedí-li režim, připravenost ovladačů, mapování,
+//! vlastník, pořadí stisku, spočítaný nebo odeslaný stav kteréhokoli
+//! ovladače nebo oznámení (i jeho obsah), test spadne.
 //!
 //! Navíc se hlídají invarianty „fyzického světa", ze kterých plyne, že
 //! se nic nezasekne:
@@ -18,19 +21,23 @@
 //!   mají stejné rozhodnutí o potlačení → OS dostane key-up právě ke
 //!   key-downům, které viděl (princip 2);
 //! - autorepeat nikdy nic nespouští;
-//! - mimo režim Gamepad je pad neutrální, osa nikdy `i16::MIN`.
+//! - nepřipravený ovladač je neutrální a nedrží žádnou klávesu;
+//! - mimo režim Gamepad jsou všechny ovladače neutrální, osa nikdy
+//!   `i16::MIN`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use keypad_core::{
-    Action, BindingCancel, Decision, DisabledReason, Engine, ForceReason, KeyId, Mapping, Mode,
-    Owner, PadButton, PadState, StickDir, UiEvent, BINDING_TIMEOUT_MS, STALE_KEY_MS,
+    Action, BindingCancel, BindingReject, Decision, DisabledReason, Engine, ForceReason, KeyId,
+    Mapping, Mode, ModeCause, Owner, PadAction, PadButton, PadId, PadState, StickDir, ToggleReject,
+    UiEvent, BINDING_TIMEOUT_MS, MAX_PADS, STALE_KEY_MS,
 };
 use proptest::prelude::*;
 
-/// Klávesy, se kterými se hraje: namapované (i dvě na jeden směr),
-/// zkratky obou mapování, Esc, nenamapované, dvojice se stejným scan
-/// kódem (šipka × numpad), falešný Ctrl z AltGr a klávesa bez scan kódu.
+/// Klávesy, se kterými se hraje: namapované (i dvě na jeden směr, i na
+/// různých ovladačích), zkratky všech mapování, Esc, nenamapované,
+/// dvojice se stejným scan kódem (šipka × numpad), falešný Ctrl z AltGr
+/// a klávesa bez scan kódu.
 const KEYS: [KeyId; 17] = [
     KeyId::W,
     KeyId::A,
@@ -51,6 +58,9 @@ const KEYS: [KeyId; 17] = [
     KeyId::new(0),
 ];
 
+const P1: PadId = PadId::ALL[1];
+const P2: PadId = PadId::ALL[2];
+
 #[derive(Debug, Clone)]
 enum Op {
     /// Key-down: nový stisk, nebo autorepeat, pokud už je klávesa dole.
@@ -58,7 +68,10 @@ enum Op {
     /// Key-up: skutečné uvolnění, nebo key-up bez key-down.
     Release(usize),
     Toggle,
-    StartBinding(usize),
+    /// Zapnout zachytávání (přepínač ovladače v okně).
+    Capture,
+    /// Přiřazování: ovladač 0–2 × 24 akcí.
+    StartBinding(usize, usize),
     CancelBinding,
     /// Posun času + tik časovače.
     Advance(u64),
@@ -69,10 +82,13 @@ enum Op {
     Jump(u64),
     ForceKeyboard,
     ResetHeld,
-    Disable(u8),
-    Enable,
-    /// 0 = výchozí, 1 = jiná zkratka (X) + dvě klávesy na jednom směru,
-    /// 2 = Esc namapovaný, zkratka na levém Shiftu.
+    /// Ovladač, důvod.
+    Disable(usize, u8),
+    Enable(usize),
+    /// 0 = výchozí (vše na prvním ovladači); 1 = jiná zkratka (X), dvě
+    /// klávesy na jednom směru, část kláves na druhém ovladači (SOCD
+    /// pár); 2 = Esc namapovaný, zkratka na levém Shiftu, klávesy na
+    /// druhém a třetím ovladači; 3 = skoro vše na druhém ovladači.
     SetMapping(u8),
 }
 
@@ -82,7 +98,8 @@ fn op() -> impl Strategy<Value = Op> {
         10 => (0..n).prop_map(Op::Press),
         8 => (0..n).prop_map(Op::Release),
         2 => Just(Op::Toggle),
-        2 => (0..24usize).prop_map(Op::StartBinding),
+        2 => Just(Op::Capture),
+        2 => (0..3usize, 0..24usize).prop_map(|(p, a)| Op::StartBinding(p, a)),
         1 => Just(Op::CancelBinding),
         2 => prop_oneof![0..60u64, 1_400..1_600u64, 9_000..12_000u64].prop_map(Op::Advance),
         2 => prop_oneof![0..60u64, 1_400..1_600u64, 9_000..12_000u64].prop_map(Op::AdvanceNoTick),
@@ -90,9 +107,9 @@ fn op() -> impl Strategy<Value = Op> {
             .prop_map(Op::Jump),
         1 => Just(Op::ForceKeyboard),
         1 => Just(Op::ResetHeld),
-        1 => (0..3u8).prop_map(Op::Disable),
-        2 => Just(Op::Enable),
-        1 => (0..3u8).prop_map(Op::SetMapping),
+        2 => (0..MAX_PADS, 0..3u8).prop_map(|(p, r)| Op::Disable(p, r)),
+        4 => (0..MAX_PADS).prop_map(Op::Enable),
+        1 => (0..4u8).prop_map(Op::SetMapping),
     ]
 }
 
@@ -100,36 +117,73 @@ fn action_nr(i: usize) -> Action {
     Action::all().nth(i).expect("24 akcí")
 }
 
+fn pad_nr(i: usize) -> PadId {
+    PadId::new(i).expect("ovladač v rozsahu")
+}
+
 // ── Nezávislý referenční model ─────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq)]
 struct MMapping {
     toggle: KeyId,
-    keys: HashMap<KeyId, Action>,
+    keys: HashMap<KeyId, PadAction>,
+}
+
+/// Vazba do mapování enginu i do modelu — každé zvlášť.
+fn bind_both(m: &mut Mapping, keys: &mut HashMap<KeyId, PadAction>, k: KeyId, t: PadAction) {
+    m.bind(k, t).unwrap();
+    keys.insert(k, t);
 }
 
 fn mapping_variant(v: u8) -> (Mapping, MMapping) {
+    use Action::{Button, LeftStick, RightStick};
+    use StickDir::{Left, Right, Up};
+
     let d = Mapping::default();
-    let mut keys: HashMap<KeyId, Action> = d.bindings().collect();
+    let mut keys: HashMap<KeyId, PadAction> = d.bindings().collect();
     let mut m = d.clone();
-    let toggle = match v {
-        1 => {
-            m.bind(KeyId::NUMPAD_8, Action::LeftStick(StickDir::Up))
-                .unwrap();
-            keys.insert(KeyId::NUMPAD_8, Action::LeftStick(StickDir::Up));
-            m.set_toggle_key(KeyId::X).unwrap();
-            KeyId::X
-        }
+    let vazby: Vec<(KeyId, PadAction)> = match v {
+        1 => vec![
+            (KeyId::NUMPAD_8, PadAction::first(LeftStick(Up))),
+            // I a levý Ctrl: protilehlé směry druhého ovladače (SOCD jen
+            // v rámci ovladače), mezerník se přesune z prvního.
+            (KeyId::I, PadAction::new(P1, LeftStick(Left))),
+            (KeyId::LEFT_CTRL, PadAction::new(P1, LeftStick(Right))),
+            (KeyId::SPACE, PadAction::new(P1, Button(PadButton::A))),
+        ],
         2 => {
-            m.bind(KeyId::ESC, Action::Button(PadButton::Back)).unwrap();
-            keys.insert(KeyId::ESC, Action::Button(PadButton::Back));
             m.unbind(KeyId::LEFT_SHIFT).unwrap();
             keys.remove(&KeyId::LEFT_SHIFT);
-            m.set_toggle_key(KeyId::LEFT_SHIFT).unwrap();
-            KeyId::LEFT_SHIFT
+            vec![
+                (KeyId::ESC, PadAction::first(Button(PadButton::Back))),
+                // A vlevo zůstává prvnímu ovladači, D vpravo patří
+                // druhému: stisk obou nesmí dělat SOCD napříč ovladači.
+                (KeyId::D, PadAction::new(P1, LeftStick(Right))),
+                (KeyId::ARROW_UP, PadAction::new(P2, RightStick(Up))),
+            ]
         }
+        3 => {
+            // Všechno na druhý ovladač (první zůstane prázdný), pak
+            // prvnímu jen X.
+            let mut v: Vec<_> = d
+                .bindings()
+                .map(|(k, t)| (k, PadAction::new(P1, t.action)))
+                .collect();
+            v.push((KeyId::X, PadAction::first(Button(PadButton::A))));
+            v.push((KeyId::NUMPAD_8, PadAction::new(P2, LeftStick(Up))));
+            v
+        }
+        _ => Vec::new(),
+    };
+    for (k, t) in vazby {
+        bind_both(&mut m, &mut keys, k, t);
+    }
+    let toggle = match v {
+        1 => KeyId::X,
+        2 => KeyId::LEFT_SHIFT,
         _ => KeyId::SCROLL_LOCK,
     };
+    m.set_toggle_key(toggle).unwrap();
     (m, MMapping { toggle, keys })
 }
 
@@ -149,6 +203,17 @@ struct Model {
     mapping: MMapping,
     held: HashMap<KeyId, MHeld>,
     seq: u64,
+    /// Připravené (připojené) ovladače.
+    ready: HashSet<PadId>,
+    /// Důvod posledního vypnutí ovladače.
+    reason: DisabledReason,
+    /// Po konci přiřazování zachytávat.
+    resume: bool,
+    /// Tenhle krok musí vydat stav všech ovladačů (změna režimu,
+    /// vynucení).
+    emit_all: bool,
+    /// Tenhle krok musí vydat stav právě vypnutého ovladače.
+    emit_one: Option<PadId>,
 }
 
 impl Model {
@@ -160,6 +225,11 @@ impl Model {
             mapping: mapping_variant(0).1,
             held: HashMap::new(),
             seq: 0,
+            ready: HashSet::new(),
+            reason: DisabledReason::PadNotConnected,
+            resume: false,
+            emit_all: false,
+            emit_one: None,
         }
     }
 
@@ -172,35 +242,78 @@ impl Model {
             }
         }
         self.mode = new;
+        self.emit_all = true;
     }
 
-    fn expire(&mut self, now: u64) {
+    /// Konec přiřazování: bez ovladače Disabled, jinak zpět do hry,
+    /// pokud se hrálo (a konec nebyl vynucený), jinak Klávesnice.
+    fn end_binding(&mut self, may_capture: bool) {
+        let resume = self.resume;
+        self.resume = false;
+        let to = if self.ready.is_empty() {
+            Mode::Disabled {
+                reason: self.reason,
+            }
+        } else if resume && may_capture {
+            Mode::Gamepad
+        } else {
+            Mode::Keyboard
+        };
+        self.set_mode(to);
+    }
+
+    fn expire(&mut self, now: u64) -> Option<UiEvent> {
         if let Mode::Binding { started_at_ms, .. } = self.mode {
             if now.saturating_sub(started_at_ms) >= BINDING_TIMEOUT_MS {
-                self.set_mode(Mode::Keyboard);
+                self.end_binding(true);
+                return Some(UiEvent::BindingCancelled {
+                    reason: BindingCancel::Timeout,
+                });
             }
         }
+        None
     }
 
-    fn toggle(&mut self) {
+    fn toggle(&mut self, cause: ModeCause) -> Option<UiEvent> {
         match self.mode {
-            Mode::Keyboard => self.set_mode(Mode::Gamepad),
-            Mode::Gamepad => self.set_mode(Mode::Keyboard),
-            _ => {}
+            Mode::Keyboard | Mode::Gamepad => {
+                let new = if self.mode == Mode::Keyboard {
+                    Mode::Gamepad
+                } else {
+                    Mode::Keyboard
+                };
+                self.set_mode(new);
+                Some(UiEvent::ModeChanged { mode: new, cause })
+            }
+            Mode::Binding { .. } if cause == ModeCause::Hotkey => Some(UiEvent::BindingRejected {
+                key: self.mapping.toggle,
+                reason: BindingReject::ToggleKey,
+            }),
+            Mode::Binding { .. } => Some(UiEvent::ToggleRejected {
+                reason: ToggleReject::Binding,
+            }),
+            Mode::Disabled { reason } => Some(UiEvent::ToggleRejected {
+                reason: ToggleReject::Disabled(reason),
+            }),
         }
     }
 
-    /// Vrací očekávané potlačení.
-    fn key_down(&mut self, key: KeyId, now: u64) -> bool {
-        self.expire(now);
+    /// Vrací očekávané potlačení a oznámení.
+    fn key_down(&mut self, key: KeyId, now: u64) -> (bool, Option<UiEvent>) {
+        let expired = self.expire(now);
         if !mappable(key) {
-            return false;
+            let ui =
+                matches!(self.mode, Mode::Binding { .. }).then_some(UiEvent::BindingRejected {
+                    key,
+                    reason: BindingReject::Unmappable,
+                });
+            return (false, ui.or(expired));
         }
         if let Some(h) = self.held.get_mut(&key) {
             let stale = h.owner != Owner::Os && now.saturating_sub(h.last) >= STALE_KEY_MS;
             if !stale {
                 h.last = now;
-                return h.owner != Owner::Os;
+                return (h.owner != Owner::Os, expired);
             }
             self.held.remove(&key);
         }
@@ -211,8 +324,8 @@ impl Model {
             match self.mode {
                 Mode::Binding { .. } => Owner::Swallow,
                 Mode::Gamepad => match self.mapping.keys.get(&key) {
-                    Some(&a) => Owner::Pad(a),
-                    None => Owner::Os,
+                    Some(&t) if self.ready.contains(&t.pad) => Owner::Pad(t),
+                    _ => Owner::Os,
                 },
                 _ => Owner::Os,
             }
@@ -225,40 +338,174 @@ impl Model {
                 last: now,
             },
         );
-        if key == self.mapping.toggle {
-            self.toggle();
-        } else if let Mode::Binding { action, .. } = self.mode {
-            if key != KeyId::ESC {
-                // Přesun: klávesa má vždy nejvýš jednu akci.
-                self.mapping.keys.insert(key, action);
+        let ui = if key == self.mapping.toggle {
+            self.toggle(ModeCause::Hotkey)
+        } else if let Mode::Binding { target, .. } = self.mode {
+            if key == KeyId::ESC {
+                self.end_binding(true);
+                Some(UiEvent::BindingCancelled {
+                    reason: BindingCancel::Escape,
+                })
+            } else {
+                // Přesun: klávesa má vždy nejvýš jeden cíl.
+                let old = self.mapping.keys.insert(key, target);
+                self.end_binding(true);
+                Some(UiEvent::BindingSaved {
+                    key,
+                    target,
+                    moved_from: old.filter(|&o| o != target),
+                })
             }
+        } else {
+            None
+        };
+        (owner != Owner::Os, ui.or(expired))
+    }
+
+    fn key_up(&mut self, key: KeyId, now: u64) -> (bool, Option<UiEvent>) {
+        let expired = self.expire(now);
+        let suppress = self.held.remove(&key).is_some_and(|h| h.owner != Owner::Os);
+        (suppress, expired)
+    }
+
+    fn capture(&mut self, now: u64) -> Option<UiEvent> {
+        let expired = self.expire(now);
+        let ui = match self.mode {
+            Mode::Keyboard => {
+                self.set_mode(Mode::Gamepad);
+                Some(UiEvent::ModeChanged {
+                    mode: Mode::Gamepad,
+                    cause: ModeCause::Gui,
+                })
+            }
+            Mode::Gamepad => None,
+            Mode::Disabled { reason } => Some(UiEvent::ToggleRejected {
+                reason: ToggleReject::Disabled(reason),
+            }),
+            Mode::Binding { .. } => {
+                self.resume = true;
+                None
+            }
+        };
+        ui.or(expired)
+    }
+
+    fn start_binding(&mut self, target: PadAction, now: u64) -> Option<UiEvent> {
+        let _ = self.expire(now);
+        self.resume = match self.mode {
+            Mode::Gamepad => true,
+            Mode::Binding { .. } => self.resume,
+            Mode::Keyboard | Mode::Disabled { .. } => false,
+        };
+        let new = Mode::Binding {
+            target,
+            started_at_ms: now,
+        };
+        self.set_mode(new);
+        Some(UiEvent::ModeChanged {
+            mode: new,
+            cause: ModeCause::Gui,
+        })
+    }
+
+    fn cancel_binding(&mut self, now: u64) -> Option<UiEvent> {
+        let expired = self.expire(now);
+        if matches!(self.mode, Mode::Binding { .. }) {
+            self.end_binding(true);
+            return Some(UiEvent::BindingCancelled {
+                reason: BindingCancel::Gui,
+            });
+        }
+        expired
+    }
+
+    fn force(&mut self, reason: ForceReason) -> Option<UiEvent> {
+        match self.mode {
+            Mode::Gamepad => {
+                self.set_mode(Mode::Keyboard);
+                Some(UiEvent::ModeChanged {
+                    mode: Mode::Keyboard,
+                    cause: ModeCause::Forced(reason),
+                })
+            }
+            Mode::Binding { .. } => {
+                self.end_binding(false);
+                Some(UiEvent::BindingCancelled {
+                    reason: BindingCancel::Forced(reason),
+                })
+            }
+            // Vynucení vždy potvrdí neutrál.
+            Mode::Keyboard | Mode::Disabled { .. } => {
+                self.emit_all = true;
+                None
+            }
+        }
+    }
+
+    fn disable(&mut self, pad: PadId, reason: DisabledReason) -> Option<UiEvent> {
+        self.reason = reason;
+        if self.ready.remove(&pad) {
+            for h in self.held.values_mut() {
+                if matches!(h.owner, Owner::Pad(t) if t.pad == pad) {
+                    h.owner = Owner::Swallow;
+                }
+            }
+            if matches!(self.mode, Mode::Keyboard | Mode::Gamepad) && self.ready.is_empty() {
+                let new = Mode::Disabled { reason };
+                self.set_mode(new);
+                return Some(UiEvent::ModeChanged {
+                    mode: new,
+                    cause: ModeCause::PadStatus,
+                });
+            }
+            self.emit_one = Some(pad);
+            return None;
+        }
+        match self.mode {
+            Mode::Disabled { reason: r } if r != reason => {
+                let new = Mode::Disabled { reason };
+                self.set_mode(new);
+                Some(UiEvent::ModeChanged {
+                    mode: new,
+                    cause: ModeCause::PadStatus,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn enable(&mut self, pad: PadId) -> Option<UiEvent> {
+        if !self.ready.insert(pad) {
+            return None;
+        }
+        if matches!(self.mode, Mode::Disabled { .. }) {
             self.set_mode(Mode::Keyboard);
+            return Some(UiEvent::ModeChanged {
+                mode: Mode::Keyboard,
+                cause: ModeCause::PadStatus,
+            });
         }
-        owner != Owner::Os
+        None
     }
 
-    fn key_up(&mut self, key: KeyId, now: u64) -> bool {
-        self.expire(now);
-        match self.held.remove(&key) {
-            Some(h) => h.owner != Owner::Os,
-            None => false,
-        }
-    }
-
-    /// Stav padu spočítaný nezávisle na enginu: tlačítka OR, triggery,
-    /// SOCD podle pořadí stisku, diagonála 23170.
-    fn pad(&self) -> PadState {
+    /// Stav jednoho ovladače spočítaný nezávisle na enginu: tlačítka
+    /// OR, triggery, SOCD podle pořadí stisku, diagonála 23170 — jen
+    /// z kláves, které patří tomuhle ovladači.
+    fn pad(&self, pad: PadId) -> PadState {
         let mut p = PadState::NEUTRAL;
         // [páčka][směr] → nejnovější seq
         let mut newest: HashMap<(bool, StickDir), u64> = HashMap::new();
         for h in self.held.values() {
-            let Owner::Pad(a) = h.owner else { continue };
-            match a {
+            let Owner::Pad(t) = h.owner else { continue };
+            if t.pad != pad {
+                continue;
+            }
+            match t.action {
                 Action::Button(b) => p.buttons |= b.mask(),
                 Action::LeftTrigger => p.left_trigger = 255,
                 Action::RightTrigger => p.right_trigger = 255,
                 Action::LeftStick(d) | Action::RightStick(d) => {
-                    let right = matches!(a, Action::RightStick(_));
+                    let right = matches!(t.action, Action::RightStick(_));
                     let e = newest.entry((right, d)).or_insert(0);
                     *e = (*e).max(h.seq);
                 }
@@ -307,8 +554,8 @@ struct World {
     m: Model,
     now: u64,
     physical: HashMap<KeyId, Press>,
-    /// Co naposledy odešlo do ViGEm.
-    sent: PadState,
+    /// Co naposledy odešlo do ViGEm — pro každý ovladač.
+    sent: [PadState; MAX_PADS],
 }
 
 impl World {
@@ -318,66 +565,38 @@ impl World {
             m: Model::new(),
             now: 1_000,
             physical: HashMap::new(),
-            sent: PadState::NEUTRAL,
+            sent: [PadState::NEUTRAL; MAX_PADS],
         }
     }
 
     fn step(&mut self, op: &Op) -> Result<(), TestCaseError> {
         let mode_before = self.e.mode();
-        let mut is_key = false;
-        let mut forced_pad = false;
-        let d = match *op {
-            Op::Press(i) => {
-                is_key = true;
-                self.press(KEYS[i])?
-            }
-            Op::Release(i) => {
-                is_key = true;
-                self.release(KEYS[i])?
-            }
+        self.m.emit_all = false;
+        self.m.emit_one = None;
+        let now = self.now;
+        let (d, want_ui) = match *op {
+            Op::Press(i) => self.press(KEYS[i])?,
+            Op::Release(i) => self.release(KEYS[i])?,
             Op::Toggle => {
-                self.m.expire(self.now);
-                self.m.toggle();
-                self.e.toggle(self.now)
+                let expired = self.m.expire(now);
+                let ui = self.m.toggle(ModeCause::Gui).or(expired);
+                (self.e.toggle(now), ui)
             }
-            Op::StartBinding(i) => {
-                let action = action_nr(i);
-                self.m.expire(self.now);
-                let ok = self.m.mode == Mode::Keyboard;
-                if ok {
-                    self.m.set_mode(Mode::Binding {
-                        action,
-                        started_at_ms: self.now,
-                    });
-                }
-                match self.e.start_binding(action, self.now) {
-                    Ok(d) => {
-                        prop_assert!(ok, "binding mimo Klávesnici");
-                        d
-                    }
-                    Err(_) => {
-                        prop_assert!(!ok, "binding z Klávesnice musí jít");
-                        // I odmítnutý příkaz mohl zrušit propadlé
-                        // přiřazování — to ale model neumí odmítnout
-                        // (v Klávesnici by přiřazování začalo).
-                        Decision::NONE
-                    }
-                }
+            Op::Capture => (self.e.capture(now), self.m.capture(now)),
+            Op::StartBinding(p, a) => {
+                let target = PadAction::new(pad_nr(p), action_nr(a));
+                (
+                    self.e.start_binding(target, now),
+                    self.m.start_binding(target, now),
+                )
             }
-            Op::CancelBinding => {
-                self.m.expire(self.now);
-                if matches!(self.m.mode, Mode::Binding { .. }) {
-                    self.m.set_mode(Mode::Keyboard);
-                }
-                self.e.cancel_binding(self.now)
-            }
+            Op::CancelBinding => (self.e.cancel_binding(now), self.m.cancel_binding(now)),
             Op::Advance(ms) => {
-                self.now = self.now.saturating_add(ms);
-                self.m.expire(self.now);
-                self.e.tick(self.now)
+                self.now = now.saturating_add(ms);
+                (self.e.tick(self.now), self.m.expire(self.now))
             }
             Op::AdvanceNoTick(ms) => {
-                self.now = self.now.saturating_add(ms);
+                self.now = now.saturating_add(ms);
                 return Ok(());
             }
             Op::Jump(t) => {
@@ -385,58 +604,57 @@ impl World {
                 return Ok(());
             }
             Op::ForceKeyboard => {
-                forced_pad = true;
-                if matches!(self.m.mode, Mode::Gamepad | Mode::Binding { .. }) {
-                    self.m.set_mode(Mode::Keyboard);
-                }
-                self.e.force_keyboard(ForceReason::Watchdog)
+                let ui = self.m.force(ForceReason::Watchdog);
+                (self.e.force_keyboard(ForceReason::Watchdog), ui)
             }
             Op::ResetHeld => {
-                forced_pad = true;
                 for p in self.physical.values_mut() {
                     p.forgotten = true;
                 }
-                if matches!(self.m.mode, Mode::Gamepad | Mode::Binding { .. }) {
-                    self.m.set_mode(Mode::Keyboard);
-                }
+                let ui = self.m.force(ForceReason::SessionLock);
                 self.m.held.clear();
-                self.e.reset_held(ForceReason::SessionLock)
+                self.m.emit_all = true;
+                (self.e.reset_held(ForceReason::SessionLock), ui)
             }
-            Op::Disable(r) => {
+            Op::Disable(p, r) => {
                 let reason = match r {
                     0 => DisabledReason::ViGEmMissing,
                     1 => DisabledReason::PadNotConnected,
                     _ => DisabledReason::PadError,
                 };
-                self.m.set_mode(Mode::Disabled { reason });
-                self.e.disable(reason)
+                let pad = pad_nr(p);
+                (self.e.disable(pad, reason), self.m.disable(pad, reason))
             }
-            Op::Enable => {
-                if matches!(self.m.mode, Mode::Disabled { .. }) {
-                    self.m.set_mode(Mode::Keyboard);
-                }
-                self.e.enable()
+            Op::Enable(p) => {
+                let pad = pad_nr(p);
+                (self.e.enable(pad), self.m.enable(pad))
             }
             Op::SetMapping(v) => {
                 let (em, mm) = mapping_variant(v);
-                if matches!(self.m.mode, Mode::Gamepad | Mode::Binding { .. }) {
-                    self.m.set_mode(Mode::Keyboard);
-                }
+                let ui = if matches!(self.m.mode, Mode::Gamepad | Mode::Binding { .. }) {
+                    self.m.force(ForceReason::MappingChanged)
+                } else {
+                    None
+                };
                 self.m.mapping = mm;
-                self.e.set_mapping(em)
+                (self.e.set_mapping(em), ui)
             }
         };
-        self.check_after(&d, mode_before, is_key, forced_pad)
+        let is_key = matches!(op, Op::Press(_) | Op::Release(_));
+        if !is_key {
+            prop_assert!(!d.suppress, "příkaz nemá co potlačovat");
+        }
+        self.check_after(&d, want_ui, mode_before)
     }
 
-    fn press(&mut self, key: KeyId) -> Result<Decision, TestCaseError> {
+    fn press(&mut self, key: KeyId) -> Result<(Decision, Option<UiEvent>), TestCaseError> {
         let now = self.now;
         // Klávesa, o které engine zapomněl (reset_held), je pro něj po
         // návratu nový stisk — LL hook autorepeat nerozliší.
         if self.physical.get(&key).is_some_and(|p| p.forgotten) {
             self.physical.remove(&key);
         }
-        let expected = self.m.key_down(key, now);
+        let (expected, want_ui) = self.m.key_down(key, now);
         let d = self.e.on_key(key, true, now);
         prop_assert_eq!(
             d.suppress,
@@ -471,6 +689,9 @@ impl World {
                     ) || (!mappable(key)
                         && matches!(d.ui, Some(UiEvent::BindingRejected { .. })));
                     prop_assert!(quiet, "autorepeat {} něco spustil: {:?}", key, d.ui);
+                    if d.ui.is_none() {
+                        prop_assert!(d.pads.is_empty(), "autorepeat {} hnul ovladačem", key);
+                    }
                 }
                 p.last = now;
             }
@@ -485,11 +706,11 @@ impl World {
                 );
             }
         }
-        Ok(d)
+        Ok((d, want_ui))
     }
 
-    fn release(&mut self, key: KeyId) -> Result<Decision, TestCaseError> {
-        let expected = self.m.key_up(key, self.now);
+    fn release(&mut self, key: KeyId) -> Result<(Decision, Option<UiEvent>), TestCaseError> {
+        let (expected, want_ui) = self.m.key_up(key, self.now);
         let d = self.e.on_key(key, false, self.now);
         prop_assert_eq!(d.suppress, expected, "key-up {}", key);
         match self.physical.remove(&key) {
@@ -514,21 +735,28 @@ impl World {
         );
         prop_assert!(quiet, "key-up {} něco spustil: {:?}", key, d.ui);
         prop_assert_eq!(self.e.held(key), None);
-        Ok(d)
+        Ok((d, want_ui))
     }
 
     fn check_after(
         &mut self,
         d: &Decision,
+        want_ui: Option<UiEvent>,
         mode_before: Mode,
-        is_key: bool,
-        forced_pad: bool,
     ) -> Result<(), TestCaseError> {
         let mode = self.e.mode();
         prop_assert_eq!(mode, self.m.mode, "režim enginu a modelu");
         prop_assert_eq!(self.e.mapping().toggle_key(), self.m.mapping.toggle);
-        let bindings: HashMap<KeyId, Action> = self.e.mapping().bindings().collect();
+        let bindings: HashMap<KeyId, PadAction> = self.e.mapping().bindings().collect();
         prop_assert_eq!(&bindings, &self.m.mapping.keys, "mapování enginu a modelu");
+        for p in PadId::ALL {
+            prop_assert_eq!(
+                self.e.is_ready(p),
+                self.m.ready.contains(&p),
+                "připravenost {:?}",
+                p
+            );
+        }
 
         // Držené klávesy: vlastník, pořadí stisku i čas.
         prop_assert_eq!(self.e.held_len(), self.m.held.len());
@@ -536,70 +764,85 @@ impl World {
             let e = self.e.held(k).map(|h| (h.owner, h.seq, h.last_ms));
             let m = self.m.held.get(&k).map(|h| (h.owner, h.seq, h.last));
             prop_assert_eq!(e, m, "záznam {}", k);
-            if e.is_some() {
+            if let Some((owner, ..)) = e {
                 prop_assert!(
                     self.physical.contains_key(&k),
                     "engine drží {} co není dole",
                     k
                 );
+                if let Owner::Pad(t) = owner {
+                    prop_assert!(mode == Mode::Gamepad, "klávesa ovladače mimo Gamepad");
+                    prop_assert!(
+                        self.e.is_ready(t.pad),
+                        "{} patří nepřipravenému {:?}",
+                        k,
+                        t.pad
+                    );
+                }
             }
         }
 
-        // Stav padu: spočítaný nezávisle.
-        let expected_pad = self.m.pad();
-        prop_assert_eq!(self.e.pad_state(), expected_pad, "stav padu");
-
-        // Co odešlo do ViGEm: při změně režimu a u vynucení vždy, jinak
-        // právě tehdy, když se stav změnil.
-        let changed = mode != mode_before;
-        if changed || forced_pad {
-            prop_assert_eq!(d.pad, Some(expected_pad), "pad při změně režimu / vynucení");
-        } else if is_key || d.pad.is_some() {
-            let want = (expected_pad != self.sent).then_some(expected_pad);
-            prop_assert_eq!(d.pad, want, "pad jen při změně");
-        }
-        if let Some(p) = d.pad {
-            self.sent = p;
-        }
-        prop_assert_eq!(
-            self.sent,
-            self.e.pad_state(),
-            "ViGEm má jiný stav, než se drží"
-        );
-
-        // Oznámení: změna režimu se oznámí, beze změny se nic neoznamuje.
-        match d.ui {
-            Some(UiEvent::ModeChanged { mode: m, .. }) => {
-                prop_assert!(changed, "ModeChanged beze změny");
-                prop_assert_eq!(m, mode);
-            }
-            Some(UiEvent::BindingSaved { .. } | UiEvent::BindingCancelled { .. }) => {
-                let was_binding = matches!(mode_before, Mode::Binding { .. });
-                prop_assert!(was_binding, "konec přiřazování mimo přiřazování");
-                let still_binding = matches!(mode, Mode::Binding { .. });
-                prop_assert!(!still_binding, "po konci přiřazování se pořád přiřazuje");
-            }
-            _ => prop_assert!(
-                !changed,
+        // Oznámení — i obsah.
+        prop_assert_eq!(d.ui, want_ui, "oznámení");
+        if mode != mode_before {
+            prop_assert!(
+                d.ui.is_some(),
                 "změna režimu {:?} → {:?} bez oznámení",
                 mode_before,
                 mode
-            ),
-        }
-
-        if mode != Mode::Gamepad {
-            prop_assert!(
-                self.sent.is_neutral(),
-                "mimo Gamepad nesmí být pad vychýlený"
             );
         }
-        for axis in [
-            self.sent.thumb_lx,
-            self.sent.thumb_ly,
-            self.sent.thumb_rx,
-            self.sent.thumb_ry,
-        ] {
-            prop_assert!(axis != i16::MIN);
+
+        // Stavy ovladačů: spočítané nezávisle. Do ViGEm se posílají
+        // všechny při změně režimu a u vynucení, vypnutý ovladač vždy
+        // (neutrál), jinak právě ty, které se změnily.
+        for p in PadId::ALL {
+            let i = p.index();
+            let expected = self.m.pad(p);
+            prop_assert_eq!(self.e.pad_state(p), expected, "stav {:?}", p);
+            let want = if self.m.emit_all || self.m.emit_one == Some(p) {
+                Some(expected)
+            } else {
+                (expected != self.sent[i]).then_some(expected)
+            };
+            prop_assert_eq!(d.pads.get(p), want, "odeslaný stav {:?}", p);
+            if let Some(s) = d.pads.get(p) {
+                self.sent[i] = s;
+            }
+            prop_assert_eq!(
+                self.sent[i],
+                self.e.pad_state(p),
+                "ViGEm má u {:?} jiný stav, než se drží",
+                p
+            );
+            if mode != Mode::Gamepad || !self.e.is_ready(p) {
+                prop_assert!(
+                    self.sent[i].is_neutral(),
+                    "{:?} je vychýlený mimo Gamepad nebo nepřipravený",
+                    p
+                );
+            }
+            for axis in [
+                self.sent[i].thumb_lx,
+                self.sent[i].thumb_ly,
+                self.sent[i].thumb_rx,
+                self.sent[i].thumb_ry,
+            ] {
+                prop_assert!(axis != i16::MIN);
+            }
+        }
+
+        // Disabled právě tehdy, když není připravený žádný ovladač
+        // (přiřazování smí běžet s ovladači i bez nich).
+        if !matches!(mode, Mode::Binding { .. }) {
+            let any_ready = PadId::ALL.into_iter().any(|p| self.e.is_ready(p));
+            prop_assert_eq!(
+                matches!(mode, Mode::Disabled { .. }),
+                !any_ready,
+                "Disabled × připravené ovladače v {:?}",
+                mode
+            );
+            prop_assert!(!self.m.resume, "příznak návratu mimo přiřazování");
         }
         Ok(())
     }
@@ -610,8 +853,10 @@ impl World {
         down.sort();
         for k in down {
             let before = self.e.mode();
-            let d = self.release(k)?;
-            self.check_after(&d, before, true, false)?;
+            self.m.emit_all = false;
+            self.m.emit_one = None;
+            let (d, want_ui) = self.release(k)?;
+            self.check_after(&d, want_ui, before)?;
         }
         Ok(())
     }
@@ -622,8 +867,8 @@ proptest! {
     // proptest-regressions) a přehrávají se při každém běhu jako první.
     // Výchozí umístění hledá lib.rs, které integrační test nemá.
     //
-    // 1500 sekvencí trvá v ladicím buildu ~20 s; mutanty enginu model
-    // zabíjí do 0,5 s. Důkladnější běh: `PROPTEST_CASES=50000`.
+    // 1500 sekvencí trvá v ladicím buildu desítky sekund; mutanty enginu
+    // model zabíjí do vteřiny. Důkladnější běh: `PROPTEST_CASES=50000`.
     #![proptest_config(ProptestConfig {
         cases: std::env::var("PROPTEST_CASES")
             .ok()
@@ -645,8 +890,10 @@ proptest! {
         }
         w.release_all()?;
         prop_assert_eq!(w.e.held_len(), 0, "held po uvolnění všeho");
-        prop_assert!(w.e.pad_state().is_neutral(), "pad po uvolnění všeho");
-        prop_assert!(w.sent.is_neutral(), "odeslaný stav po uvolnění všeho");
+        for p in PadId::ALL {
+            prop_assert!(w.e.pad_state(p).is_neutral(), "{:?} po uvolnění všeho", p);
+            prop_assert!(w.sent[p.index()].is_neutral(), "odeslaný {:?} po uvolnění všeho", p);
+        }
     }
 
     #[test]

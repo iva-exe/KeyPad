@@ -8,5 +8,7 @@ pub mod pad;
 pub mod power;
 pub mod relace;
 pub mod shell;
+pub mod slot;
 pub mod ukonceni;
 pub mod vigem;
+pub mod vystup;

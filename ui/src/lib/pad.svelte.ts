@@ -6,7 +6,12 @@
 // Odpovědi a události se můžou předběhnout — pořadí drží `seq`.
 //
 // Ovladač se připojuje JEN přepínačem (`pad_on`) — po startu, po
-// probuzení i po aktualizaci je vypnutý (Fáze 2b).
+// probuzení i po aktualizaci je vypnutý (Fáze 2b). Po připojení backend
+// hned zachytává jeho klávesy; zkratka (Scroll Lock) zachytávání
+// pozastaví — to okno pozná z režimu (událost `rezim`, Fáze 4).
+//
+// Backend umí až 4 ovladače; okno zatím ukazuje první (další přinese
+// editor kláves, Fáze 6) — události ostatních proto ignoruje.
 import { poslouchej, textChyby, vAplikaci, zavolej } from './tauri';
 
 export type PadStav =
@@ -20,8 +25,20 @@ export type PadStav =
 	| 'bus_not_running'
 	| 'error';
 
+/** Režim zachytávání kláves (událost `rezim`, příkaz `rezim`). */
+export type Rezim =
+	/** Žádný ovladač není zapnutý. */
+	| 'disabled'
+	/** Pozastaveno zkratkou — klávesy jdou do Windows. */
+	| 'paused'
+	/** Klávesy ovládají zapnuté ovladače. */
+	| 'capturing'
+	| 'binding';
+
 /** Odpověď `pad_status` i obsah události `pad-stav`. */
 interface PadInfo {
+	/** Který ovladač (0–3). */
+	pad: number;
 	state: PadStav;
 	/** Číslo hráče podle ViGEmBus — okno ho neukazuje (s víc pady lže). */
 	player: number | null;
@@ -55,8 +72,13 @@ export const pad = $state({
 	    neskončí; po jeho konci backend ovladač sám ověří. */
 	instalatorBezi: false,
 	/** Chyba posledního kliknutí — krátká věta u tlačítek. */
-	chybaAkce: ''
+	chybaAkce: '',
+	/** Režim zachytávání (zdroj pravdy je engine v backendu). */
+	rezim: 'disabled' as Rezim
 });
+
+/** Ovladač, který okno zatím ukazuje. */
+const PRVNI = 0;
 
 /** Je ovladač zapnutý (nebo se právě zapíná)? */
 export function zapnuto(): boolean {
@@ -66,6 +88,8 @@ export function zapnuto(): boolean {
 let casovacPrepnuti: ReturnType<typeof setTimeout> | undefined;
 
 function prevezmi(i: PadInfo): void {
+	// Každý ovladač má vlastní `seq` — cizí události do karty nepatří.
+	if ((i.pad ?? PRVNI) !== PRVNI) return;
 	// Starší změnu zahodit. Stejný `seq` projde: backend zapisuje
 	// a čte celý stav najednou pod zámkem, takže stejný `seq` = stejný
 	// obsah (odpověď `pad_status` po události se stejným číslem nic
@@ -89,7 +113,8 @@ function prevezmi(i: PadInfo): void {
 
 async function nacti(): Promise<void> {
 	try {
-		prevezmi(await zavolej<PadInfo>('pad_status'));
+		prevezmi(await zavolej<PadInfo>('pad_status', { pad: PRVNI }));
+		pad.rezim = await zavolej<Rezim>('rezim');
 	} catch {
 		// Mimo aplikaci backend není — zůstane „vypnuto".
 	}
@@ -103,7 +128,10 @@ export function startPad(): void {
 	spusteno = true;
 	// Nejdřív poslouchat, pak se zeptat: změna mezi dotazem a přihlášením
 	// k události by se jinak ztratila. Starší odpověď zahodí `seq`.
-	void poslouchej<PadInfo>('pad-stav', prevezmi).then(nacti);
+	void Promise.all([
+		poslouchej<PadInfo>('pad-stav', prevezmi),
+		poslouchej<Rezim>('rezim', (r) => (pad.rezim = r))
+	]).then(nacti);
 	// Schované okno má uspaný webview; po návratu stav pro jistotu znovu.
 	document.addEventListener('visibilitychange', () => {
 		if (!document.hidden) void nacti();
@@ -128,7 +156,7 @@ export async function prepni(): Promise<void> {
 	clearTimeout(casovacPrepnuti);
 	casovacPrepnuti = setTimeout(() => (pad.prepina = false), PREPNUTI_MS);
 	try {
-		await zavolej(chce ? 'pad_on' : 'pad_off');
+		await zavolej(chce ? 'pad_on' : 'pad_off', { pad: PRVNI });
 	} catch (e) {
 		pad.chybaAkce = textChyby(e);
 		pad.prepina = false;
@@ -143,7 +171,7 @@ export async function vyzkousej(): Promise<void> {
 	pad.chybaAkce = '';
 	pad.testuje = true;
 	try {
-		await zavolej('pad_test');
+		await zavolej('pad_test', { pad: PRVNI });
 		setTimeout(() => (pad.testuje = false), TEST_MS);
 	} catch (e) {
 		pad.chybaAkce = textChyby(e);

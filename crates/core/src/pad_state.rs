@@ -1,5 +1,8 @@
 //! Stav virtuálního gamepadu a jeho výpočet z držených kláves.
 //!
+//! Při víc ovladačích se počítá každý zvlášť, jen z kláves, které patří
+//! jemu ([`PadUpdates`] pak nese ty, které se mají poslat).
+//!
 //! Princip 7: stav se VŽDY přepočítává celý z množiny držených kláves
 //! (čistá funkce), nikdy se inkrementálně nepřičítá ani neodečítá.
 //! Inkrementální stav se při první ztracené nebo zdvojené události
@@ -8,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::action::{Action, PadButton, StickDir};
+use crate::action::{Action, PadButton, PadId, StickDir, MAX_PADS};
 
 /// Plná výchylka na ose.
 pub const AXIS_MAX: i16 = 32_767;
@@ -60,6 +63,61 @@ impl PadState {
 
     pub fn is_pressed(&self, button: PadButton) -> bool {
         self.buttons & button.mask() != 0
+    }
+}
+
+/// Nové stavy ovladačů k odeslání do ViGEm — jen ty, které se mají
+/// poslat.
+///
+/// Pevné pole + bitová maska, ne `Vec` ani mapa: vzniká v hook
+/// callbacku, který nesmí alokovat (princip 3). Ovladač bez nastaveného
+/// bitu se neposílá (beze změny); jeho slot v poli je vždy neutrální,
+/// ať porovnání dvou hodnot nezávisí na tom, co v nepoužitém slotu zbylo.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PadUpdates {
+    /// Bit `1 << pad.index()` = stav toho ovladače je platný.
+    changed: u8,
+    states: [PadState; MAX_PADS],
+}
+
+impl PadUpdates {
+    /// Nic se neposílá.
+    pub const NONE: PadUpdates = PadUpdates {
+        changed: 0,
+        states: [PadState::NEUTRAL; MAX_PADS],
+    };
+
+    /// Stav ovladače k odeslání; `None` = beze změny.
+    pub fn get(&self, pad: PadId) -> Option<PadState> {
+        let i = pad.index();
+        (self.changed & (1 << i) != 0).then(|| self.states[i])
+    }
+
+    pub fn set(&mut self, pad: PadId, s: PadState) {
+        let i = pad.index();
+        self.changed |= 1 << i;
+        self.states[i] = s;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.changed == 0
+    }
+
+    /// Nastavené stavy vzestupně podle ovladače.
+    pub fn iter(&self) -> impl Iterator<Item = (PadId, PadState)> + '_ {
+        PadId::ALL
+            .into_iter()
+            .filter_map(|p| self.get(p).map(|s| (p, s)))
+    }
+
+    /// Sloučí s dřívějším krokem téhož volání: u každého ovladače platí
+    /// novější stav, když ho tenhle krok nastavil, jinak ten dřívější.
+    pub(crate) fn or(self, earlier: PadUpdates) -> PadUpdates {
+        let mut out = earlier;
+        for (p, s) in self.iter() {
+            out.set(p, s);
+        }
+        out
     }
 }
 
@@ -255,5 +313,54 @@ mod tests {
         let s = compute_pad_state([(ls(Up), 1), (Action::RightStick(Left), 2)]);
         assert_eq!((s.thumb_lx, s.thumb_ly), (0, 32_767));
         assert_eq!((s.thumb_rx, s.thumb_ry), (-32_767, 0));
+    }
+
+    fn stav_a() -> PadState {
+        compute_pad_state([(Action::Button(PadButton::A), 1)])
+    }
+
+    #[test]
+    fn pad_updates_nese_jen_nastavene_ovladace() {
+        let mut u = PadUpdates::NONE;
+        assert!(u.is_empty());
+        assert_eq!(u, PadUpdates::default());
+        assert_eq!(u.iter().count(), 0);
+
+        // Neutrál je platný stav k odeslání, ne „nic".
+        u.set(PadId::ALL[2], PadState::NEUTRAL);
+        u.set(PadId::FIRST, stav_a());
+        assert!(!u.is_empty());
+        assert_eq!(u.get(PadId::FIRST), Some(stav_a()));
+        assert_eq!(u.get(PadId::ALL[1]), None);
+        assert_eq!(u.get(PadId::ALL[2]), Some(PadState::NEUTRAL));
+        assert_eq!(u.get(PadId::ALL[3]), None);
+        assert_eq!(
+            u.iter().collect::<Vec<_>>(),
+            vec![(PadId::FIRST, stav_a()), (PadId::ALL[2], PadState::NEUTRAL)],
+            "vzestupně podle ovladače"
+        );
+    }
+
+    #[test]
+    fn pad_updates_slouceni_bere_novejsi() {
+        let mut drivejsi = PadUpdates::NONE;
+        drivejsi.set(PadId::FIRST, stav_a());
+        drivejsi.set(PadId::ALL[1], stav_a());
+        let mut novejsi = PadUpdates::NONE;
+        novejsi.set(PadId::FIRST, PadState::NEUTRAL);
+        novejsi.set(PadId::ALL[3], stav_a());
+
+        let s = novejsi.or(drivejsi);
+        assert_eq!(
+            s.get(PadId::FIRST),
+            Some(PadState::NEUTRAL),
+            "novější vyhrává"
+        );
+        assert_eq!(s.get(PadId::ALL[1]), Some(stav_a()), "z dřívějšího");
+        assert_eq!(s.get(PadId::ALL[2]), None);
+        assert_eq!(s.get(PadId::ALL[3]), Some(stav_a()));
+        assert_eq!(PadUpdates::NONE.or(PadUpdates::NONE), PadUpdates::NONE);
+        assert_eq!(PadUpdates::NONE.or(drivejsi), drivejsi);
+        assert_eq!(drivejsi.or(PadUpdates::NONE), drivejsi);
     }
 }
