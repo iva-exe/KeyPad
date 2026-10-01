@@ -51,6 +51,12 @@ const WM_PANIKA: u32 = WM_APP + 2;
 /// jen během přiřazování — nečinný hook nikdy netiká (princip 10).
 const TIK_MS: u32 = 250;
 
+/// Levá a pravá Win jako virtuální klávesy (`Udalost::vk`). Vlastní
+/// konstanty, ne `VIRTUAL_KEY` z `windows`: soubor sdílí i příklad
+/// `hook_selftest` (`#[path]`) a dotaz jde přes podvrhnutelné `os_drzi`.
+const VK_LWIN: u32 = 0x5B;
+const VK_RWIN: u32 = 0x5C;
+
 /// Watchdog (Fáze 5): ovladač, jehož pad vlákno déle nemluvilo s ViGEm,
 /// je zaseknutý. Keep-alive chodí každých 200 ms — 1 s je pět
 /// vynechaných a pořád dost pod tím, co by hráč považoval za „visí".
@@ -771,11 +777,20 @@ fn zpracuj(wparam: WPARAM, kb: &KBDLLHOOKSTRUCT) -> bool {
             let d = s.engine.force_keyboard(ForceReason::Watchdog);
             s.vystup.rozhodnuti(None, &d, s.engine.mode());
         }
-        // Key-down klávesy, o které engine neví, ale OS ji drží: hook ji
-        // neviděl stisknout (nainstaloval se později, nebo se držené
-        // klávesy zapomněly). Je to autorepeat klávesy OS — ne nový
-        // stisk, který by se spolkl i s key-upem (klávesa by v OS visela).
-        if dolu && s.engine.held(u.klavesa).is_none() && (s.os_drzi)(u.vk) {
+        // Key-down klávesy, o které engine neví, patří OS, když:
+        // - OS tu klávesu drží: hook ji neviděl stisknout (nainstaloval se
+        //   později, nebo se držené klávesy zapomněly). Je to autorepeat
+        //   klávesy OS — ne nový stisk, který by se spolkl i s key-upem
+        //   (klávesa by v OS visela);
+        // - OS drží Win (Fáze 4b, OQ 44): Win+D, Win+E, Win+Tab patří
+        //   Windows i za hry a při přiřazování. Win sama jde do OS vždy
+        //   (engine ji nesleduje) — kdyby hook druhou klávesu spolkl jako
+        //   klávesu ovladače, Windows by viděly osamělou Win a otevřely
+        //   Start.
+        if dolu
+            && s.engine.held(u.klavesa).is_none()
+            && ((s.os_drzi)(u.vk) || (s.os_drzi)(VK_LWIN) || (s.os_drzi)(VK_RWIN))
+        {
             let _ = s.engine.adopt_os_key(u.klavesa, ted);
         }
         let d = s.engine.on_key(u.klavesa, dolu, ted);
@@ -885,7 +900,11 @@ mod tests {
     /// Stav callbacku na tomhle vlákně bez skutečného hooku: engine
     /// povolený a přepnutý na Gamepad.
     fn priprav(z: &Arc<Zaznam>) {
-        let mut engine = Engine::new(mapovani());
+        priprav_s(z, mapovani());
+    }
+
+    fn priprav_s(z: &Arc<Zaznam>, m: Mapping) {
+        let mut engine = Engine::new(m);
         let _ = engine.enable(PadId::FIRST);
         let _ = engine.toggle(0);
         assert_eq!(engine.mode(), Mode::Gamepad);
@@ -907,6 +926,15 @@ mod tests {
 
     fn vse_drzi(_vk: u32) -> bool {
         true
+    }
+
+    /// OS drží jen levou Win (uživatel mačká Win+něco).
+    fn jen_win(vk: u32) -> bool {
+        vk == 0x5B
+    }
+
+    fn jen_pravou_win(vk: u32) -> bool {
+        vk == 0x5C
     }
 
     fn podvrhni_os(f: fn(u32) -> bool) {
@@ -1087,7 +1115,8 @@ mod tests {
     }
 
     /// Callback nic nealokuje — ani při stisku, autorepeatu, key-upu,
-    /// přepnutí zkratkou, nemapovatelné či vstříknuté klávese.
+    /// přepnutí zkratkou, nemapovatelné či vstříknuté klávese, ani když
+    /// OS drží Win a klávesa se převezme jako klávesa OS.
     #[test]
     fn callback_nealokuje() {
         struct Tichy(AtomicU32);
@@ -1096,38 +1125,123 @@ mod tests {
                 self.0.fetch_add(1, Ordering::Relaxed);
             }
         }
-        let mut engine = Engine::new(Mapping::default());
-        let _ = engine.enable(PadId::FIRST);
-        let vystup: Arc<dyn Vystup> = Arc::new(Tichy(AtomicU32::new(0)));
-        STAV.with(|s| {
-            *s.borrow_mut() = Some(Stav {
-                engine,
-                vystup,
-                rozbity: false,
-                // Skutečný dotaz na stav klávesy — i ten musí být bez alokace.
-                os_drzi,
-                povoleno_ms: [0; MAX_PADS],
-            })
-        });
-        // Scroll Lock (přepnutí), W, šipka, AltGr, média, vstříknutá.
-        let udalosti = [
-            (0x46, 0),
-            (0x11, 0),
-            (0x48, LLKHF_EXTENDED.0),
-            (0x21D, 0),
-            (0, 0),
-            (0x1E, LLKHF_INJECTED.0),
-        ];
-        let pred = crate::testy_alokace::pocet();
-        for _ in 0..3 {
-            for &(scan, flags) in &udalosti {
-                let k = kb(scan, flags);
-                zavolej(0, WM_KEYDOWN, &k);
-                zavolej(0, WM_KEYDOWN, &k);
-                zavolej(0, WM_KEYUP, &kb(scan, flags | LLKHF_UP.0));
+        // Skutečný dotaz na stav klávesy — i ten musí být bez alokace;
+        // podvrh „drží Win“ projde větví převzetí klávesy OS.
+        let dotazy: [fn(u32) -> bool; 2] = [os_drzi, jen_win];
+        for dotaz in dotazy {
+            let mut engine = Engine::new(Mapping::default());
+            let _ = engine.enable(PadId::FIRST);
+            let vystup: Arc<dyn Vystup> = Arc::new(Tichy(AtomicU32::new(0)));
+            STAV.with(|s| {
+                *s.borrow_mut() = Some(Stav {
+                    engine,
+                    vystup,
+                    rozbity: false,
+                    os_drzi: dotaz,
+                    povoleno_ms: [0; MAX_PADS],
+                })
+            });
+            // Scroll Lock (přepnutí), W, šipka, AltGr, média, vstříknutá,
+            // Win.
+            let udalosti = [
+                (0x46, 0),
+                (0x11, 0),
+                (0x48, LLKHF_EXTENDED.0),
+                (0x21D, 0),
+                (0, 0),
+                (0x1E, LLKHF_INJECTED.0),
+                (0x5B, LLKHF_EXTENDED.0),
+            ];
+            let pred = crate::testy_alokace::pocet();
+            for _ in 0..3 {
+                for &(scan, flags) in &udalosti {
+                    let k = kb(scan, flags);
+                    zavolej(0, WM_KEYDOWN, &k);
+                    zavolej(0, WM_KEYDOWN, &k);
+                    zavolej(0, WM_KEYUP, &kb(scan, flags | LLKHF_UP.0));
+                }
             }
+            assert_eq!(crate::testy_alokace::pocet(), pred, "alokace v callbacku");
         }
-        assert_eq!(crate::testy_alokace::pocet(), pred, "alokace v callbacku");
+    }
+
+    /// L jako klávesa hook (virtuální klávesa 0x4C).
+    fn kb_l(flags: u32) -> KBDLLHOOKSTRUCT {
+        KBDLLHOOKSTRUCT {
+            vkCode: 0x4C,
+            ..kb(0x26, flags)
+        }
+    }
+
+    /// Win+L při hře (OQ 44): OS drží Win → L (ve výchozím mapování
+    /// D-pad vpravo) jde do Windows celé, stisk i key-up, a stav padu se
+    /// nezmění. Bez Win je L zase klávesa ovladače.
+    #[test]
+    fn win_s_klavesou_ve_hre_patri_windows() {
+        let z = Arc::new(Zaznam::default());
+        priprav_s(&z, Mapping::default());
+        let l = KeyId::L;
+        assert!(Mapping::default().target(l).is_some(), "L je namapovaná");
+        podvrhni_os(jen_win);
+        assert!(!zavolej(0, WM_KEYDOWN, &kb_l(0)), "Win+L do Windows");
+        let (u, d, m) = z.posledni();
+        assert_eq!((u.unwrap().klavesa, m), (l, Mode::Gamepad));
+        assert_eq!(d.pads, PadUpdates::NONE, "stav padu beze změny");
+        assert_eq!(
+            STAV.with(|s| s.borrow().as_ref().unwrap().engine.held(l).map(|h| h.owner)),
+            Some(keypad_core::Owner::Os)
+        );
+        // Autorepeat i key-up zůstávají Windows, i když Win mezitím pustil.
+        podvrhni_os(nic_nedrzi);
+        assert!(!zavolej(0, WM_KEYDOWN, &kb_l(0)));
+        assert!(!zavolej(0, WM_KEYUP, &kb_l(LLKHF_UP.0)));
+        assert_eq!(z.posledni().1.pads, PadUpdates::NONE);
+        assert!(!drzeno(l));
+        // Bez Win je L zase D-pad.
+        assert!(zavolej(0, WM_KEYDOWN, &kb_l(0)));
+        assert!(z
+            .posledni()
+            .1
+            .pads
+            .get(PadId::FIRST)
+            .unwrap()
+            .is_pressed(PadButton::DpadRight));
+        assert!(zavolej(0, WM_KEYUP, &kb_l(LLKHF_UP.0)));
+        // Pravá Win stejně.
+        podvrhni_os(jen_pravou_win);
+        assert!(!zavolej(0, WM_KEYDOWN, &kb_l(0)), "pravá Win+L do Windows");
+        assert!(!zavolej(0, WM_KEYUP, &kb_l(LLKHF_UP.0)));
+    }
+
+    /// Win+L při přiřazování: L jde do Windows a nepřiřadí se;
+    /// přiřazování čeká dál na klávesu bez Win.
+    #[test]
+    fn win_s_klavesou_pri_prirazovani_se_neprirazuje() {
+        let z = Arc::new(Zaznam::default());
+        priprav_s(&z, Mapping::default());
+        let cil = PadAction::first(Action::Button(PadButton::B));
+        let l = KeyId::L;
+        STAV.with(|s| {
+            let mut g = s.borrow_mut();
+            let _ = g.as_mut().unwrap().engine.start_binding(cil, ted_ms());
+        });
+        podvrhni_os(jen_win);
+        assert!(!zavolej(0, WM_KEYDOWN, &kb_l(0)), "Win+L do Windows");
+        assert!(!zavolej(0, WM_KEYUP, &kb_l(LLKHF_UP.0)));
+        let (_, d, m) = z.posledni();
+        assert!(
+            matches!(m, Mode::Binding { target, .. } if target == cil),
+            "{m:?}"
+        );
+        assert_eq!(d.ui, None, "nic se neuložilo ani neodmítlo");
+        let mapovani = STAV.with(|s| s.borrow().as_ref().unwrap().engine.mapping().clone());
+        assert_ne!(mapovani.target(l), Some(cil));
+        // Bez Win se L přiřadí (stisk přiřazování spolkne).
+        podvrhni_os(nic_nedrzi);
+        assert!(zavolej(0, WM_KEYDOWN, &kb_l(0)));
+        assert!(
+            matches!(z.posledni().1.ui, Some(UiEvent::BindingSaved { key, target, .. }) if key == l && target == cil)
+        );
     }
 
     /// Skutečný hook na skryté ploše: bez zapnutého ovladače v systému

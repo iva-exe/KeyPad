@@ -183,6 +183,9 @@ pub enum BindingReject {
     /// Klávesa nemá použitelný scan kód (mediální klávesy, AltGr…).
     /// Taková klávesa jde do OS.
     Unmappable,
+    /// Klávesa patří Windows (Win, [`KeyId::is_reserved`]). Jde do OS
+    /// jako ostatní nemapovatelné (otevře Start), okno jen řekne proč.
+    Reserved,
 }
 
 /// Proč přepnutí (nebo zapnutí zachytávání) neproběhlo.
@@ -420,12 +423,16 @@ impl Engine {
 
     fn key_down(&mut self, key: KeyId, now_ms: u64) -> Decision {
         let Some(i) = key.index() else {
-            // Nemapovatelná klávesa jde vždy do OS a nesleduje se.
-            // Při přiřazování okno aspoň dozví, proč se nic nestalo.
+            // Nemapovatelná klávesa (i Win) jde vždy do OS a nesleduje
+            // se. Při přiřazování se okno aspoň dozví, proč se nic nestalo.
             return Decision {
                 ui: matches!(self.mode, Mode::Binding { .. }).then_some(UiEvent::BindingRejected {
                     key,
-                    reason: BindingReject::Unmappable,
+                    reason: if key.is_reserved() {
+                        BindingReject::Reserved
+                    } else {
+                        BindingReject::Unmappable
+                    },
                 }),
                 ..Decision::NONE
             };
@@ -537,6 +544,7 @@ impl Engine {
                     key,
                     reason: match e {
                         MappingError::ToggleKeyMapped { .. } => BindingReject::ToggleKey,
+                        MappingError::Reserved { .. } => BindingReject::Reserved,
                         _ => BindingReject::Unmappable,
                     },
                 }),
@@ -1269,6 +1277,51 @@ mod tests {
         }
         assert_eq!(e.held_len(), 0, "nemapovatelné se nesledují");
         assert_eq!(e.mapping(), &before);
+    }
+
+    #[test]
+    fn win_jde_do_os_i_pri_prirazovani() {
+        // Přiřazování (i ze hry): Win se nepřiřadí ani nespolkne — otevře
+        // Start — a okno se dozví, že patří Windows.
+        let mut e = gamepad();
+        let before = e.mapping().clone();
+        let _ = e.start_binding(t0(Action::LeftTrigger), T0);
+        for k in [KeyId::LEFT_WIN, KeyId::RIGHT_WIN] {
+            let d = down(&mut e, k);
+            assert!(!d.suppress, "{k} jde do OS");
+            assert!(d.pads.is_empty());
+            assert_eq!(
+                d.ui,
+                Some(UiEvent::BindingRejected {
+                    key: k,
+                    reason: BindingReject::Reserved
+                })
+            );
+            assert_eq!(e.held(k), None, "{k} se nesleduje");
+            assert_eq!(up(&mut e, k), Decision::NONE);
+            assert!(matches!(e.mode(), Mode::Binding { .. }), "čeká se dál");
+        }
+        assert_eq!(e.held_len(), 0);
+        assert_eq!(e.mapping(), &before);
+        // Další klávesa se přiřadí a hra pokračuje.
+        let d = down(&mut e, KeyId::X);
+        assert!(matches!(d.ui, Some(UiEvent::BindingSaved { .. })));
+        assert_eq!(e.mode(), Mode::Gamepad);
+    }
+
+    #[test]
+    fn win_ve_hre_jde_do_os() {
+        let mut e = gamepad();
+        let _ = down(&mut e, KeyId::W);
+        for k in [KeyId::LEFT_WIN, KeyId::RIGHT_WIN] {
+            let d = down(&mut e, k);
+            assert_eq!(d, Decision::NONE, "{k}: do OS, nic se nemění");
+            assert_eq!(up(&mut e, k), Decision::NONE);
+            // Hook ji ani nepřevezme jako klávesu OS — engine o ní neví.
+            assert!(!e.adopt_os_key(k, T0));
+        }
+        assert_eq!(e.held_len(), 1, "jen W");
+        assert_eq!(stick(e.pad_state(P0)), (0, AXIS_MAX));
     }
 
     #[test]

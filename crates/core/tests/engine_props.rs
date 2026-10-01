@@ -36,9 +36,9 @@ use proptest::prelude::*;
 
 /// Klávesy, se kterými se hraje: namapované (i dvě na jeden směr, i na
 /// různých ovladačích), zkratky všech mapování, Esc, nenamapované,
-/// dvojice se stejným scan kódem (šipka × numpad), falešný Ctrl z AltGr
-/// a klávesa bez scan kódu.
-const KEYS: [KeyId; 17] = [
+/// dvojice se stejným scan kódem (šipka × numpad), falešný Ctrl z AltGr,
+/// klávesa bez scan kódu a levá Win (patří Windows).
+const KEYS: [KeyId; 18] = [
     KeyId::W,
     KeyId::A,
     KeyId::S,
@@ -56,6 +56,7 @@ const KEYS: [KeyId; 17] = [
     KeyId::ALTGR_FAKE_CTRL,
     KeyId::LEFT_CTRL,
     KeyId::new(0),
+    KeyId::LEFT_WIN,
 ];
 
 const P1: PadId = PadId::ALL[1];
@@ -187,8 +188,14 @@ fn mapping_variant(v: u8) -> (Mapping, MMapping) {
     (m, MMapping { toggle, keys })
 }
 
+/// Win (E0 0x5B / E0 0x5C) — zapsaná syrovými kódy, ne přes
+/// `KeyId::is_reserved`, ať model nezdědí chybu enginu.
+fn reserved(k: KeyId) -> bool {
+    k.extended && (k.scan == 0x5B || k.scan == 0x5C)
+}
+
 fn mappable(k: KeyId) -> bool {
-    (1..=0x7F).contains(&k.scan)
+    (1..=0x7F).contains(&k.scan) && !reserved(k)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -323,7 +330,11 @@ impl Model {
             let ui =
                 matches!(self.mode, Mode::Binding { .. }).then_some(UiEvent::BindingRejected {
                     key,
-                    reason: BindingReject::Unmappable,
+                    reason: if reserved(key) {
+                        BindingReject::Reserved
+                    } else {
+                        BindingReject::Unmappable
+                    },
                 });
             return (false, ui.or(expired));
         }

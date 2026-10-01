@@ -12,8 +12,15 @@
 //! zachytávat jeho klávesy (přepnutí přepínače JE povel „hrát");
 //! zkratka (Scroll Lock) zachytávání jen pozastaví. Hook klávesnice je
 //! v systému, jen když je zapnutý aspoň jeden ovladač.
+//!
+//! Fáze 4b: vlákno okna při změně režimu navíc pípne a přepne ikonu
+//! v oznamovací oblasti (pravidla v [`znameni`]) — okno je během hry
+//! schované a pozastavení by jinak nešlo poznat.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+mod znameni;
+
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -25,10 +32,15 @@ use crate::platform::windows::hook::{Hook, HookOdesilatel, HookPrikaz, Vystup, W
 use crate::platform::windows::pad::{Oznam, PadInfo, PadPrikaz, PadStav, Pady, UDALOST};
 use crate::platform::windows::slot::Budik;
 use crate::platform::windows::vystup::{HookVystup, Rezim, RezimInfo};
-use crate::platform::windows::{power, shell};
+use crate::platform::windows::{klavesy, power, shell, zvuk};
+use crate::tray::TrayStav;
 
 /// Tauri událost se změnou režimu (payload [`RezimInfo`]).
 pub const UDALOST_REZIM: &str = "rezim";
+
+/// ✓ Zvuk v nabídce ikony po startu. Uložení volby do konfigurace
+/// přinese Fáze 6/7; do té doby platí jen do konce běhu.
+pub const ZVUK_VYCHOZI: bool = true;
 
 /// Jak často vlákno okna během hraní kontroluje tep ovladačů (Fáze 5).
 /// Callback hooku to kontroluje u každé klávesy; tohle pokryje chvíli,
@@ -55,12 +67,22 @@ pub struct Ovladani {
     /// ho můžou spustit souběžně a druhý by jinak odpojil pady dřív,
     /// než první odebere hook (pořadí neutrál → odhooknout → odpojit).
     konec: Mutex<()>,
+    /// Příkazy hooku z nabídky ikony — bez zámku `hook`, který drží konec.
+    prikazy: HookOdesilatel,
+    /// ✓ Zvuk v nabídce ikony.
+    zvuk: Arc<AtomicBool>,
+    /// Aplikace končí: vlákno okna už nepípá (konec vynutí Klávesnici
+    /// a to by jinak znělo jako pozastavení).
+    konci: Arc<AtomicBool>,
 }
 
 /// Spustí pad vlákno prvního ovladače (jen ověří sběrnici — nic
 /// nepřipojí), hlídání spánku a hook vlákno (hook sám se nainstaluje až
 /// se zapnutým ovladačem). Stav je pak v `app.state::<Ovladani>()`.
 pub fn spust(app: &tauri::App) -> Result<(), String> {
+    // Budík vlákna okna dřív než pady: budí ho i jejich oznámení (ikona
+    // a bublina se počítají ze stavu všech ovladačů).
+    let budik = Arc::new(Budik::new()?);
     // Pad vlákna vznikají dřív než hook a hlásí se hned — odesílatel
     // hooku se do jejich oznámení doplní, jakmile hook běží. Oznámení
     // před tím (první ověření sběrnice) engine nepotřebuje: startuje
@@ -69,13 +91,13 @@ pub fn spust(app: &tauri::App) -> Result<(), String> {
     let predchozi: Arc<[AtomicU8; MAX_PADS]> = Arc::new(std::array::from_fn(|_| AtomicU8::new(0)));
     let handle = app.handle().clone();
     let tx = Arc::clone(&hook_tx);
+    let budik_padu = Arc::clone(&budik);
     let oznam: Oznam = Arc::new(move |info: &PadInfo| {
-        // `emit` i `popisek` jen předají práci hlavnímu vláknu, nečekají
-        // (pad vlákno nesmí stát na hlavním — to může čekat na pad).
+        // `emit` jen předá práci hlavnímu vláknu, nečeká (pad vlákno
+        // nesmí stát na hlavním — to může čekat na pad).
         let _ = handle.emit(UDALOST, info);
-        if info.pad == 0 {
-            crate::tray::popisek(&handle, popisek(info));
-        }
+        // Ikonu přepočítá vlákno okna; tady jen `SetEvent`.
+        budik_padu.probud();
         let Some(pad) = PadId::new(usize::from(info.pad)) else {
             return;
         };
@@ -89,62 +111,176 @@ pub fn spust(app: &tauri::App) -> Result<(), String> {
     let pady = Arc::new(Pady::spust(oznam)?);
     power::registruj(Arc::clone(&pady) as Arc<dyn power::Napajeni>);
 
-    let budik = Arc::new(Budik::new()?);
     let vystup = Arc::new(HookVystup::new(pady.sloty(), Arc::clone(&budik)));
     // Rozložení zatím výchozí; vlastní klávesy přinese Fáze 6/7.
-    let hook = Hook::spust(Mapping::default(), Arc::clone(&vystup) as Arc<dyn Vystup>)?;
+    let mapovani = Mapping::default();
+    // Název zkratky pro bublinu ikony — tady, na hlavním vlákně, podle
+    // rozložení, se kterým aplikace startovala.
+    let zkratka = klavesy::nazev(mapovani.toggle_key());
+    let hook = Hook::spust(mapovani, Arc::clone(&vystup) as Arc<dyn Vystup>)?;
     let _ = hook_tx.set(hook.odesilatel());
-
-    // Změna režimu → okno. Vlastní vlákno, protože hook callback smí jen
-    // nastavit událost (princip 3); tohle vlákno spí, dokud nepřijde —
-    // jen během hraní se budí i samo a hlídá tep ovladačů (watchdog).
-    let handle = app.handle().clone();
-    let v = Arc::clone(&vystup);
-    let pady_rezimu = Arc::clone(&pady);
-    let tx = hook.odesilatel();
 
     // Zamčení relace (Fáze 5): key-upy kláves držených přes zámek hook
     // neuvidí — zapomenout je a vynutit Klávesnici. Po odemčení
     // zachytávání vrátí zkratka.
     let tx_relace = hook.odesilatel();
+    // Kdy se relace naposledy zamkla — vlákno okna podle toho ztiší tón
+    // k přepnutí plochy, které zamčení předchází (znameni::Znameni).
+    let zamek = Arc::new(AtomicU64::new(0));
+    let zamek_relace = Arc::clone(&zamek);
     crate::platform::windows::relace::pri_zamceni(move |duvod| {
+        zamek_relace.store(ted_ms().max(1), Ordering::Release);
         log::info!("relace: {duvod} — Klávesnice, držené klávesy zapomenuty");
         tx_relace.posli(HookPrikaz::Zapomen(ForceReason::SessionLock));
     });
+
+    // Změna režimu → okno, ikona a zvuk. Vlastní vlákno, protože hook
+    // callback smí jen nastavit událost (princip 3); tohle vlákno spí,
+    // dokud nepřijde — jen během hraní se budí i samo a hlídá tep
+    // ovladačů (watchdog).
+    let zvuk = Arc::new(AtomicBool::new(ZVUK_VYCHOZI));
+    let konci = Arc::new(AtomicBool::new(false));
+    let pocatek = vystup.info();
+    let okno = VlaknoOkna {
+        app: app.handle().clone(),
+        seq: pocatek.seq,
+        znameni: znameni::Znameni::new(pocatek.rezim),
+        vystup: Arc::clone(&vystup),
+        pady: Arc::clone(&pady),
+        hook: hook.odesilatel(),
+        budik,
+        zkratka,
+        zvuk: Arc::clone(&zvuk),
+        konci: Arc::clone(&konci),
+        zamek,
+        oblast: None,
+    };
     std::thread::Builder::new()
-        .name("keypad-rezim".into())
-        .spawn(move || {
-            let mut posledni = v.info().seq;
-            loop {
-                let hraje = v.info().rezim == Rezim::Capturing;
-                budik.cekej(hraje.then_some(PULS_MS));
-                let r = v.info();
-                if r.seq != posledni {
-                    log::info!("režim: {:?}", r.rezim);
-                    posledni = r.seq;
-                    let _ = handle.emit(UDALOST_REZIM, r);
-                }
-                if r.rezim == Rezim::Capturing {
-                    let zaseknuty = zaseknuty_pad(|i| pady_rezimu.stav_a_tep(i), ted_ms());
-                    if let Some(i) = zaseknuty {
-                        log::warn!(
-                            "ovladač {} přes {WATCHDOG_MS} ms nemluví s ViGEmBus — Klávesnice",
-                            i + 1
-                        );
-                        tx.posli(HookPrikaz::Vynut(ForceReason::Watchdog));
-                    }
-                }
-            }
-        })
-        .map_err(|e| format!("vlákno režimu nejde spustit: {e}"))?;
+        .name("keypad-okno".into())
+        .spawn(move || okno.smycka())
+        .map_err(|e| format!("vlákno okna nejde spustit: {e}"))?;
 
     app.manage(Ovladani {
         pady,
+        prikazy: hook.odesilatel(),
         hook: Mutex::new(Some(hook)),
         vystup,
         konec: Mutex::new(()),
+        zvuk,
+        konci,
     });
     Ok(())
+}
+
+/// Vlákno okna (`keypad-okno`): režim do okna, ikona, zvuk a watchdog
+/// během hraní. Nikdy nečeká na nic jiného než na budík — ikonu
+/// předává hlavnímu vláknu a zvuk vláknu zvuku.
+struct VlaknoOkna {
+    app: AppHandle,
+    vystup: Arc<HookVystup>,
+    pady: Arc<Pady>,
+    hook: HookOdesilatel,
+    budik: Arc<Budik>,
+    /// Název zkratky pozastavení pro bublinu.
+    zkratka: String,
+    zvuk: Arc<AtomicBool>,
+    konci: Arc<AtomicBool>,
+    /// Kdy se relace naposledy zamkla (`GetTickCount64`, 0 = zatím ne).
+    zamek: Arc<AtomicU64>,
+    /// Číslo naposledy ohlášené změny režimu.
+    seq: u64,
+    /// Co a kdy zapípat — čisté rozhodování, testuje se bez vlákna.
+    znameni: znameni::Znameni,
+    /// Naposledy předaný stav ikony — ikona se mění jen při změně.
+    oblast: Option<TrayStav>,
+}
+
+impl VlaknoOkna {
+    fn smycka(mut self) {
+        // První obrátka hned: ikona podle výchozího stavu (šedá „vypnuto“).
+        // Panika (zapíše ji panic hook) nesmí vlákno zastavit — hlídá tep
+        // ovladačů během hry (princip 1).
+        let _ = catch_unwind(AssertUnwindSafe(|| self.obratka()));
+        loop {
+            // Mimo hru a bez tónu čekajícího na odklad spí bez limitu
+            // (princip 10).
+            let hraje = self.vystup.info().rezim == Rezim::Capturing;
+            let limit = [hraje.then_some(PULS_MS), self.znameni.probudit_za(ted_ms())]
+                .into_iter()
+                .flatten()
+                .min();
+            self.budik.cekej(limit);
+            let _ = catch_unwind(AssertUnwindSafe(|| self.obratka()));
+        }
+    }
+
+    fn obratka(&mut self) {
+        let (r, pricina) = self.vystup.info_s_pricinou();
+        let stavy: [Option<(PadStav, u64)>; MAX_PADS] =
+            std::array::from_fn(|i| self.pady.stav_a_tep(i));
+        let pady = stavy.map(|s| s.map(|(stav, _)| stav));
+        let mut zmena = None;
+        if r.seq != self.seq {
+            log::info!("režim: {:?} ({pricina:?})", r.rezim);
+            self.seq = r.seq;
+            let _ = self.app.emit(UDALOST_REZIM, r);
+            zmena = Some((r.rezim, pricina));
+        }
+        let smi = znameni::smi_znit(
+            self.zvuk.load(Ordering::Acquire),
+            self.konci.load(Ordering::Acquire),
+            self.pady.simulace(),
+        );
+        let zamek = self.zamek.load(Ordering::Acquire);
+        if let Some(z) = self.znameni.obratka(zmena, ted_ms(), zamek, smi) {
+            zvuk::prehraj(z);
+        }
+        let oblast = znameni::stav_oblasti(r.rezim, &pady, &self.zkratka);
+        if self.oblast.as_ref() != Some(&oblast) {
+            crate::tray::stav(&self.app, oblast.clone());
+            self.oblast = Some(oblast);
+        }
+        if r.rezim == Rezim::Capturing {
+            if let Some(i) = zaseknuty_pad(|i| stavy[i], ted_ms()) {
+                log::warn!(
+                    "ovladač {} přes {WATCHDOG_MS} ms nemluví s ViGEmBus — Klávesnice",
+                    i + 1
+                );
+                self.hook.posli(HookPrikaz::Vynut(ForceReason::Watchdog));
+            }
+        }
+    }
+}
+
+/// „Pozastavit / Pokračovat“ z nabídky ikony.
+///
+/// Pozastavit = přepnout, jako Scroll Lock. Pokračovat = jako zapnutí
+/// přepínačem (`Zachytavej`): z pozastavení se hook nejdřív
+/// přeinstaluje — Windows ho mohli potichu odebrat a hra by jinak jen
+/// předstírala, že klávesy hrají (princip 8). Scroll Lock tohle
+/// nepotřebuje: jeho stisk sám dokazuje, že hook žije. A když se režim
+/// mezitím změnil (Scroll Lock s otevřenou nabídkou), `Zachytavej`
+/// hru nepozastaví, jen nic neudělá.
+pub fn prepni_z_nabidky(app: &AppHandle) {
+    let Some(o) = app.try_state::<Ovladani>() else {
+        return;
+    };
+    let (prikaz, co) = match o.vystup.info().rezim {
+        Rezim::Capturing => (HookPrikaz::Prepni, "pozastavit"),
+        Rezim::Paused => (HookPrikaz::Zachytavej, "pokračovat"),
+        // Položka je mimo hru a pauzu zakázaná; tohle je jen souběh.
+        _ => return,
+    };
+    log::info!("nabídka ikony: {co}");
+    o.prikazy.posli(prikaz);
+}
+
+/// „✓ Zvuk“ z nabídky ikony.
+pub fn zvuk_z_nabidky(app: &AppHandle, zapnuto: bool) {
+    if let Some(o) = app.try_state::<Ovladani>() {
+        o.zvuk.store(zapnuto, Ordering::Release);
+        log::info!("zvuk {}", if zapnuto { "zapnutý" } else { "vypnutý" });
+    }
 }
 
 /// Zapnutý ovladač, jehož pad vlákno přes [`WATCHDOG_MS`] nemluvilo
@@ -214,6 +350,8 @@ pub fn ukonci(app: &AppHandle) {
     let Some(o) = app.try_state::<Ovladani>() else {
         return;
     };
+    // První, ještě před vynucenou Klávesnicí: konec nepípá.
+    o.konci.store(true, Ordering::Release);
     let _konec = o.konec.lock().unwrap_or_else(|e| e.into_inner());
     let hook = o.hook.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(mut h) = hook {
@@ -227,20 +365,6 @@ pub fn ukonci(app: &AppHandle) {
             LIMIT_KONCE.as_millis()
         );
     }
-}
-
-/// Popisek ikony v oznamovací oblasti (Windows ho utne na 127 znaků).
-fn popisek(info: &PadInfo) -> String {
-    // Bez čísla hráče — ViGEmBus ho s víc pady hlásí špatně (PadInfo::player).
-    let stav = match info.state {
-        PadStav::On => "ovladač zapnutý",
-        PadStav::Connecting => "zapínám ovladač…",
-        PadStav::Off => "ovladač vypnutý",
-        PadStav::BusMissing => "chybí ViGEmBus",
-        PadStav::BusNotRunning => "ViGEmBus neběží",
-        PadStav::Error => "chyba ovladače",
-    };
-    format!("KeyPad — {stav}")
 }
 
 /// Číslo ovladače z okna (bez čísla = první).
@@ -441,22 +565,6 @@ mod tests {
         PadStav::BusNotRunning,
         PadStav::Error,
     ];
-
-    #[test]
-    fn popisek_ikony() {
-        assert_eq!(
-            popisek(&info(PadStav::On, Some(2), false)),
-            "KeyPad — ovladač zapnutý"
-        );
-        assert_eq!(
-            popisek(&info(PadStav::Off, None, false)),
-            "KeyPad — ovladač vypnutý"
-        );
-        for s in VSECHNY {
-            // NOTIFYICONDATAW::szTip má 128 znaků včetně nuly.
-            assert!(popisek(&info(s, Some(4), false)).encode_utf16().count() < 128);
-        }
-    }
 
     /// Zachytávání spouští jen PŘECHOD na „zapnuto" (povel přepínače);
     /// opakované ohlášení téhož stavu nesmí obnovit zachytávání, které

@@ -237,37 +237,19 @@ fn over_webview2() {
     }
 }
 
-/// DLL, které si za běhu dotahují samy systémové knihovny, jen ze
-/// System32.
-///
-/// `/DEPENDENTLOADFLAG` (build.rs) chrání jen statické importy
-/// KeyPad.exe. Systémové DLL si ale další knihovny načítají až za běhu
-/// (WinHttp → IPHLPAPI, šifrování → CRYPTSP/CRYPTBASE,
-/// SHGetKnownFolderPath → profapi) a ty by Windows hledaly NEJDŘÍV ve
-/// složce programu — přenosný KeyPad.exe ve Stažených souborech by
-/// načetl DLL, kterou tam podstrčila kdejaká stránka. Tohle platí pro
-/// celý proces, i pro LoadLibrary v cizím kódu (Tauri, WebView2).
-/// KeyPad žádné vlastní DLL nemá, složka programu se tedy nehledá vůbec.
-fn dll_jen_ze_system32() -> windows::core::Result<()> {
-    use windows::Win32::System::LibraryLoader::{
-        SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_SYSTEM32,
-    };
-    // SAFETY: jen nastaví pořadí hledání DLL pro tenhle proces.
-    unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) }
-}
-
 fn main() {
-    // ÚPLNĚ PRVNÍ, ještě před loggerem: každá DLL načtená dřív by se
-    // hledala postaru. Chyba (na Windows 10+ nenastává) se zapíše, až
-    // bude kam.
-    let dll = dll_jen_ze_system32();
+    // ÚPLNĚ PRVNÍ, ještě před loggerem: DLL, které si systémové
+    // knihovny dotahují za běhu, jen ze System32 (proč: `dll.rs`).
+    // Každá DLL načtená dřív by se hledala postaru. Chyba (na Windows
+    // 10+ nenastává) se zapíše, až bude kam — a zvuk pak nehraje.
+    let dll = platform::windows::dll::jen_ze_system32();
     let spusteno = Instant::now();
     // Logger a panic hook hned potom, ještě před Tauri: i pád při startu
     // (chybějící WebView2, rozbitá konfigurace) musí nechat stopu v logu.
     let cesta_logu = logger::init();
     nainstaluj_panic_hook();
     if let Err(e) = dll {
-        log::warn!("hledání DLL nejde omezit na System32: {e}");
+        log::warn!("hledání DLL nejde omezit na System32: {e} — zvuk pozastavení nebude");
     }
 
     let verze = update::bezici_verze();

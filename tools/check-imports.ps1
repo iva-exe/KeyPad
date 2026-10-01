@@ -426,6 +426,39 @@ function Get-DllProblem([string]$Name, [string]$SystemDir) {
     'není v System32 a není to ani sada API Windows — na čistém PC ji nikdo nedodá. Zjisti, která závislost ji přitáhla, a nalinkuj ji staticky.'
 }
 
+# ── DLL jen za běhu ────────────────────────────────────────────────
+# Binárka (jméno souboru malými písmeny) → DLL, které nesmí být mezi
+# jejími importy, statickými ani zpožděnými. Dnes zvuk pozastavení
+# (Fáze 4b), který hraje přes WASAPI: MMDevAPI.dll se načte až za běhu
+# přes COM (absolutní cesta z registru) a AudioSes.dll si MMDevAPI
+# dotáhne sama JMÉNEM — před kopií vedle KeyPad.exe ji chrání jen
+# SetDefaultDllDirectories(SYSTEM32) na začátku main (bez něj sonda
+# s podvrženými DLL načetla podvrženou AudioSes.dll), žádná z nich
+# není mezi KnownDLLs. Statický import by zvukovou knihovnu natáhl
+# při každém startu, i když zvuk nikdy nezazní (princip 10), a na
+# Windows 10 1507/1511 (bez /DEPENDENTLOADFLAG) by vzal kopii
+# podstrčenou vedle KeyPad.exe ještě před main. winmm.dll (a
+# winmmbase.dll, její dvojče ze starších buildů) KeyPad nesmí používat
+# vůbec: PlaySound hraje přes starou cestu zvukových ovladačů
+# a wdmaud.drv si načte i ze složky programu, a to i po
+# SetDefaultDllDirectories (ověřeno sondou s podvrženými DLL).
+#
+# Tyhle DLL ve Windows jsou — nález neznamená „na čistém PC se
+# nespustí", ale podvrženou DLL nebo zbytečnou zátěž. Proto se hlásí
+# zvlášť ($runtimeProblems), ne mezi chybějícími DLL.
+$RuntimeOnlyDlls = @{
+    'keypad.exe' = @('winmm.dll', 'winmmbase.dll', 'mmdevapi.dll', 'audioses.dll')
+}
+
+# $null = DLL smí být v importech binárky, jinak text, proč ne.
+function Get-RuntimeOnlyProblem([string]$Binary, [string]$Name) {
+    $list = $RuntimeOnlyDlls[$Binary.ToLowerInvariant()]
+    if ($list -and $list -contains $Name.ToLowerInvariant()) {
+        return 'tuhle DLL binárka nesmí importovat (viz platform\windows\zvuk.rs) — statický import ji natáhne při každém startu a na Windows 10 1507/1511 i z podvržené kopie vedle .exe; winmm.dll navíc načítá zvukové ovladače i ze složky programu. Najdi, kdo ji importuje (windows-rs funkce z ní, nová závislost). Zvuk patří jen do WASAPI přes COM (a jen po SetDefaultDllDirectories v main), jiné funkce za GetProcAddress po LoadLibraryExW ze System32.'
+    }
+    $null
+}
+
 # ── Funkce novější než Windows 10 1507 ─────────────────────────────
 # Jméno exportu → od kdy ho Windows mají (MS Learn, „Minimum supported
 # client"). Posuzuje se jen jméno, ne DLL: tatáž funkce jde importovat
@@ -492,6 +525,7 @@ if (-not $Path -or $Path.Count -eq 0) {
 
 $machineNames = @{ 0x8664 = 'x64'; 0x14C = 'x86'; 0xAA64 = 'ARM64' }
 $problems = @()
+$runtimeProblems = @()
 $flagProblems = @()
 $broken = @()
 
@@ -541,11 +575,17 @@ foreach ($p in $Path) {
 
     foreach ($r in $rows) {
         $why = Get-DllProblem $r.Name $sysDir
-        if (-not $why -and $r.Delay) {
+        # DLL jen za běhu: ve Windows je, vadí import (viz hlavička).
+        $runtimeWhy = $null
+        if (-not $why) { $runtimeWhy = Get-RuntimeOnlyProblem $leaf $r.Name }
+        if (-not $why -and -not $runtimeWhy -and $r.Delay) {
             $why = 'zpožděně načítaná DLL (delay-load) — zavaděč ji při startu nekontroluje, chybějící funkce shodí program až uprostřed práce a /DEPENDENTLOADFLAG ji spolehlivě nechrání. Importuj staticky, nebo volitelné API načti přes LoadLibraryExW(…, LOAD_LIBRARY_SEARCH_SYSTEM32) + GetProcAddress s náhradou.'
         }
         $note = if ($r.Delay) { '  (zpožděně)' } else { '' }
-        if ($why) {
+        if ($runtimeWhy) {
+            Write-Host ("  !!  {0}{1}" -f $r.Name, $note) -ForegroundColor Red
+            $runtimeProblems += [pscustomobject]@{ File = $leaf; Name = $r.Name; Why = $runtimeWhy }
+        } elseif ($why) {
             Write-Host ("  !!  {0}{1}" -f $r.Name, $note) -ForegroundColor Red
             $problems += [pscustomobject]@{ File = $leaf; Name = $r.Name; Why = $why }
         } else {
@@ -596,7 +636,7 @@ foreach ($p in $Path) {
 }
 
 Write-Host ""
-if ($problems.Count -gt 0 -or $flagProblems.Count -gt 0) {
+if ($problems.Count -gt 0 -or $runtimeProblems.Count -gt 0 -or $flagProblems.Count -gt 0) {
     if ($problems.Count -gt 0) {
         Write-Host "NEPROŠLO: binárka potřebuje DLL nebo funkci, která na čistém nebo starším PC chybí." -ForegroundColor Red
         foreach ($x in $problems) {
@@ -607,8 +647,21 @@ if ($problems.Count -gt 0 -or $flagProblems.Count -gt 0) {
         Write-Host ""
         Write-Host "Na tomhle PC se chyba neprojeví — Windows si DLL i funkci najde. Kamarádovi se KeyPad nespustí." -ForegroundColor Yellow
     }
-    if ($flagProblems.Count -gt 0) {
+    if ($runtimeProblems.Count -gt 0) {
         if ($problems.Count -gt 0) { Write-Host "" }
+        # Ne „kamarádovi se nespustí": tyhle DLL Windows mají, KeyPad by
+        # běžel — vadí podvržená DLL a zátěž (viz „DLL jen za běhu").
+        Write-Host "NEPROŠLO: binárka importuje DLL, kterou smí načítat jen za běhu (podvržené DLL, zvukové ovladače ze složky programu)." -ForegroundColor Red
+        foreach ($x in $runtimeProblems) {
+            Write-Host ""
+            Write-Host ("  {0} → {1}" -f $x.File, $x.Name) -ForegroundColor Red
+            Write-Host ("    {0}" -f $x.Why)
+        }
+        Write-Host ""
+        Write-Host "Tyhle DLL Windows mají (KeyPad se spustí i u kamaráda) — jde o bezpečnost a lehkost, ne o kompatibilitu." -ForegroundColor Yellow
+    }
+    if ($flagProblems.Count -gt 0) {
+        if ($problems.Count -gt 0 -or $runtimeProblems.Count -gt 0) { Write-Host "" }
         Write-Host "NEPROŠLO: binárka si nechá podstrčit DLL ze své složky (DependentLoadFlags)." -ForegroundColor Red
         foreach ($x in $flagProblems) {
             Write-Host ""

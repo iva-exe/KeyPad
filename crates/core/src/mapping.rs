@@ -32,6 +32,13 @@ pub enum MappingError {
     /// Zkratkou přepnutí nesmí být Esc — Esc ruší přiřazování kláves
     /// a se zkratkou by se z přiřazování nedalo vycouvat.
     ToggleIsEscape,
+    /// Klávesa patří Windows (Win, [`KeyId::is_reserved`]). Nemapovatelná
+    /// je taky, ale hlásí se zvlášť a přednostně: okno uživateli řekne
+    /// proč, ne jen „nejde". `action` je `None`, jde-li o zkratku přepnutí.
+    Reserved {
+        key: KeyId,
+        action: Option<PadAction>,
+    },
     /// Klávesa se mapovat nedá ([`KeyId::is_mappable`]). `action` je
     /// `None`, jde-li o zkratku přepnutí.
     Unmappable {
@@ -73,6 +80,7 @@ impl std::fmt::Display for MappingError {
                 Cil(*action)
             ),
             MappingError::ToggleIsEscape => write!(f, "Esc nemůže být zkratka přepnutí"),
+            MappingError::Reserved { key, .. } => write!(f, "klávesa {key} patří Windows"),
             MappingError::Unmappable { key, .. } => write!(f, "klávesu {key} nelze mapovat"),
             MappingError::NotMapped { key } => write!(f, "klávesa {key} nemá vazbu"),
         }
@@ -80,6 +88,17 @@ impl std::fmt::Display for MappingError {
 }
 
 impl std::error::Error for MappingError {}
+
+/// Chyba pro klávesu, která nejde mapovat. Win je nemapovatelná taky,
+/// ale hlásí se jako [`MappingError::Reserved`] — okno pak řekne „patří
+/// Windows" místo obecného „nejde použít".
+fn not_mappable(key: KeyId, action: Option<PadAction>) -> MappingError {
+    if key.is_reserved() {
+        MappingError::Reserved { key, action }
+    } else {
+        MappingError::Unmappable { key, action }
+    }
+}
 
 /// Kompletní rozvržení kláves: vazby klávesa → akce na ovladači
 /// a zkratka přepnutí.
@@ -126,10 +145,7 @@ impl Mapping {
     ) -> Result<Mapping, Vec<MappingError>> {
         let mut errors = Vec::new();
         if !toggle.is_mappable() {
-            errors.push(MappingError::Unmappable {
-                key: toggle,
-                action: None,
-            });
+            errors.push(not_mappable(toggle, None));
         }
         if toggle == KeyId::ESC {
             errors.push(MappingError::ToggleIsEscape);
@@ -139,10 +155,7 @@ impl Mapping {
         let mut rejected_binding = false;
         for (key, target) in bindings {
             let Some(slot) = key.index().and_then(|i| keys.get_mut(i)) else {
-                errors.push(MappingError::Unmappable {
-                    key,
-                    action: Some(target),
-                });
+                errors.push(not_mappable(key, Some(target)));
                 rejected_binding = true;
                 continue;
             };
@@ -237,10 +250,7 @@ impl Mapping {
             return Err(MappingError::ToggleKeyMapped { key, action: t });
         }
         let Some(slot) = key.index().and_then(|i| self.keys.get_mut(i)) else {
-            return Err(MappingError::Unmappable {
-                key,
-                action: Some(t),
-            });
+            return Err(not_mappable(key, Some(t)));
         };
         let previous = slot.replace(t);
         Ok(previous.filter(|&p| p != t))
@@ -278,10 +288,10 @@ impl Mapping {
         Ok(n)
     }
 
-    /// Změní zkratku přepnutí. Nesmí být namapovaná ani Esc.
+    /// Změní zkratku přepnutí. Nesmí být namapovaná, Esc ani Win.
     pub fn set_toggle_key(&mut self, key: KeyId) -> Result<(), MappingError> {
         if !key.is_mappable() {
-            return Err(MappingError::Unmappable { key, action: None });
+            return Err(not_mappable(key, None));
         }
         if key == KeyId::ESC {
             return Err(MappingError::ToggleIsEscape);
@@ -492,6 +502,50 @@ mod tests {
                 action: None
             }]
         );
+    }
+
+    #[test]
+    fn win_nejde_mapovat_ani_jako_zkratka() {
+        // Vazba na Win: jen „patří Windows", ne navíc „nejde mapovat" ani
+        // „prázdné" (vazba vypadla kvůli chybě, viz výše).
+        let e = Mapping::new(KeyId::SCROLL_LOCK, [(KeyId::LEFT_WIN, UP)]).unwrap_err();
+        assert_eq!(
+            e,
+            vec![MappingError::Reserved {
+                key: KeyId::LEFT_WIN,
+                action: Some(UP)
+            }]
+        );
+        let e = Mapping::new(KeyId::RIGHT_WIN, [(KeyId::W, UP)]).unwrap_err();
+        assert_eq!(
+            e,
+            vec![MappingError::Reserved {
+                key: KeyId::RIGHT_WIN,
+                action: None
+            }]
+        );
+        assert!(e[0].to_string().contains("patří Windows"), "{}", e[0]);
+
+        let mut m = Mapping::default();
+        let pred = m.clone();
+        assert_eq!(
+            m.bind(KeyId::RIGHT_WIN, na(P1, A_BTN)),
+            Err(MappingError::Reserved {
+                key: KeyId::RIGHT_WIN,
+                action: Some(na(P1, A_BTN))
+            })
+        );
+        assert_eq!(
+            m.set_toggle_key(KeyId::LEFT_WIN),
+            Err(MappingError::Reserved {
+                key: KeyId::LEFT_WIN,
+                action: None
+            })
+        );
+        assert_eq!(m, pred, "neúspěch nic nezměnil");
+        assert_eq!(m.target(KeyId::LEFT_WIN), None);
+        // Alt Windows nepatří — mapovat jde (okno jen varuje).
+        assert_eq!(m.bind(KeyId::LEFT_ALT, UP), Ok(None));
     }
 
     #[test]

@@ -41,6 +41,21 @@ impl KeyId {
         }
     }
 
+    /// Patří klávesa Windows (levá a pravá Win, E0 0x5B / E0 0x5C)?
+    ///
+    /// Win nejde mapovat, přiřadit ani použít jako zkratku (zpětná vazba
+    /// vlastníka k Fázi 4): kdyby ji engine sledoval, v Gamepadu by ji
+    /// spolkl jako klávesu ovladače a Win+D, Win+E ani Start by za hry
+    /// nefungovaly. Jako zkratka by se navíc bila se zkratkami Windows —
+    /// modifikátor zkratky bude jen Alt (Fáze 7). Proto ji engine vůbec
+    /// nesleduje a jde vždy do OS, i při přiřazování.
+    ///
+    /// Jen s E0: Win přichází vždy s prefixem (v hooku `LLKHF_EXTENDED`),
+    /// stejný scan kód bez něj je jiná klávesa a ta Windows nepatří.
+    pub const fn is_reserved(self) -> bool {
+        self.extended && (self.scan == 0x5B || self.scan == 0x5C)
+    }
+
     /// Dá se klávesa namapovat na akci (nebo použít jako zkratka)?
     ///
     /// Make kódy sady 1 leží v 0x01–0x7F; prefix E0 nese `extended`,
@@ -53,10 +68,13 @@ impl KeyId {
     ///   Ctrl se scan kódem typicky 0x21D. Kdyby prošel jako 0x1D, každé
     ///   napsané „@" nebo „€" by spustilo akci namapovanou na LCtrl.
     ///
+    /// Uvnitř rozsahu se stejně zachází s klávesou Win
+    /// ([`KeyId::is_reserved`]) — ta scan kód má, ale patří Windows.
+    ///
     /// Do rozsahu patří i F13–F24, Pause/NumLock, PrintScreen a japonské
     /// klávesy — vše pod 0x80.
     pub const fn is_mappable(self) -> bool {
-        self.scan >= 0x01 && self.scan <= 0x7F
+        self.scan >= 0x01 && self.scan <= 0x7F && !self.is_reserved()
     }
 
     /// Index do tabulek o [`KEY_TABLE_SIZE`] položkách: nízkých 7 bitů je
@@ -108,6 +126,9 @@ impl KeyId {
     pub const X: KeyId = KeyId::new(0x2D);
     pub const C: KeyId = KeyId::new(0x2E);
     pub const V: KeyId = KeyId::new(0x2F);
+    /// Levý Alt. Mapovat jde; okno u něj jen varuje, že při hraní
+    /// nepůjde Alt+Tab (Fáze 6).
+    pub const LEFT_ALT: KeyId = KeyId::new(0x38);
     pub const SPACE: KeyId = KeyId::new(0x39);
     pub const SCROLL_LOCK: KeyId = KeyId::new(0x46);
     /// 8 na numerické klávesnici — stejný scan kód jako šipka nahoru,
@@ -117,6 +138,12 @@ impl KeyId {
     pub const ARROW_LEFT: KeyId = KeyId::ext(0x4B);
     pub const ARROW_RIGHT: KeyId = KeyId::ext(0x4D);
     pub const ARROW_DOWN: KeyId = KeyId::ext(0x50);
+    /// Pravý Alt (na českém rozložení AltGr) — stejný scan kód jako levý,
+    /// jen s E0.
+    pub const RIGHT_ALT: KeyId = KeyId::ext(0x38);
+    /// Levá a pravá Win — patří Windows ([`KeyId::is_reserved`]).
+    pub const LEFT_WIN: KeyId = KeyId::ext(0x5B);
+    pub const RIGHT_WIN: KeyId = KeyId::ext(0x5C);
     /// Falešný levý Ctrl, který Windows posílají s AltGr (CZ rozložení).
     /// Hodnota podle ROADMAP.md — ve Fázi 3 ověřit v logu.
     pub const ALTGR_FAKE_CTRL: KeyId = KeyId::new(0x21D);
@@ -170,8 +197,33 @@ mod tests {
                 }
             }
         }
-        // 0x01–0x7F × {bez E0, s E0}
-        assert_eq!(seen.iter().filter(|&&s| s).count(), 254);
+        // 0x01–0x7F × {bez E0, s E0} bez levé a pravé Win
+        assert_eq!(seen.iter().filter(|&&s| s).count(), 252);
+    }
+
+    #[test]
+    fn win_patri_windows() {
+        for k in [KeyId::LEFT_WIN, KeyId::RIGHT_WIN] {
+            assert!(k.is_reserved(), "{k}");
+            assert!(!k.is_mappable(), "{k}");
+            assert_eq!(k.index(), None, "{k} engine nesleduje");
+        }
+        // Vyhrazené jsou právě tyhle dvě klávesy — Alt ani stejné scan
+        // kódy bez E0 ne.
+        let mut vyhrazene = Vec::new();
+        for scan in 0..=0x300u16 {
+            for extended in [false, true] {
+                let k = KeyId { scan, extended };
+                if k.is_reserved() {
+                    vyhrazene.push(k);
+                }
+            }
+        }
+        assert_eq!(vyhrazene, vec![KeyId::LEFT_WIN, KeyId::RIGHT_WIN]);
+        for k in [KeyId::LEFT_ALT, KeyId::RIGHT_ALT] {
+            assert!(k.is_mappable() && !k.is_reserved(), "{k}");
+        }
+        assert_ne!(KeyId::LEFT_ALT, KeyId::RIGHT_ALT);
     }
 
     #[test]

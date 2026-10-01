@@ -7,12 +7,23 @@
 //! Ukončit jde z její nabídky, na žádost instalátoru pojmenovanou
 //! událostí (`platform::windows::ukonceni`) a při konci relace Windows
 //! (`platform::windows::relace`).
+//!
+//! Fáze 4b: ikona ukazuje režim (hraje / pozastaveno / vypnuto /
+//! porucha) a nabídka umí pozastavit a vypnout zvuk — okno je během
+//! hry schované a přes hru se nic neukazuje (žádné balónky ani toasty,
+//! princip 8).
+
+mod ikona;
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 
-use tauri::menu::{Menu, MenuItem};
+use tauri::image::Image;
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, Wry};
+
+pub use ikona::DruhIkony;
 
 const ID: &str = "keypad";
 
@@ -21,11 +32,79 @@ const ID: &str = "keypad";
 /// okna pak aplikaci radši opravdu ukončí.
 static IKONA: AtomicBool = AtomicBool::new(false);
 
+/// Co ikona ukazuje (počítá `gamepad::znameni::stav_oblasti`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrayStav {
+    pub ikona: DruhIkony,
+    /// Bublina (Windows ji utne na 127 znaků).
+    pub popisek: String,
+    /// Položka Pozastavit/Pokračovat: `Some(true)` = pozastaveno
+    /// („Pokračovat“), `Some(false)` = hraje („Pozastavit“), `None` =
+    /// zakázaná (bez hry, přiřazování, porucha).
+    pub pauza: Option<bool>,
+}
+
+/// Položky nabídky, které se mění, a naposledy nastavený stav.
+struct Oblast {
+    pauza: MenuItem<Wry>,
+    zvuk: CheckMenuItem<Wry>,
+    /// Bere jen hlavní vlákno ([`stav`]); ikona se nastaví jen při změně
+    /// (každé `set_icon` vyrábí nový HICON).
+    posledni: Mutex<Option<TrayStav>>,
+    /// Čtyři varianty ikony, poprvé až při potřebě; `None` = aplikace
+    /// ikonu nemá a mění se jen bublina.
+    varianty: OnceLock<Option<[Vec<u8>; 4]>>,
+}
+
+impl Oblast {
+    fn obrazek(&self, app: &AppHandle, druh: DruhIkony) -> Option<Image<'_>> {
+        let varianty = self.varianty.get_or_init(|| {
+            let zaklad = app.default_window_icon()?;
+            let (rgba, w, h) = (zaklad.rgba(), zaklad.width(), zaklad.height());
+            Some(
+                [
+                    DruhIkony::Vypnuto,
+                    DruhIkony::Hraje,
+                    DruhIkony::Pauza,
+                    DruhIkony::Pozor,
+                ]
+                .map(|d| ikona::varianta(rgba, w, h, d)),
+            )
+        });
+        let i = match druh {
+            DruhIkony::Vypnuto => 0,
+            DruhIkony::Hraje => 1,
+            DruhIkony::Pauza => 2,
+            DruhIkony::Pozor => 3,
+        };
+        varianty
+            .as_ref()
+            .map(|v| Image::new(&v[i], ikona::STRANA, ikona::STRANA))
+    }
+}
+
 /// Ikona v oznamovací oblasti: levý klik otevře okno, pravý nabídku.
 pub fn nastav(app: &tauri::App) -> tauri::Result<()> {
     let otevrit = MenuItem::with_id(app, "otevrit", "Otevřít KeyPad", true, None::<&str>)?;
+    // Bez zapnutého ovladače není co pozastavit — povolí ji až hra.
+    let pauza = MenuItem::with_id(app, "pauza", TEXT_POZASTAVIT, false, None::<&str>)?;
+    let zvuk = CheckMenuItem::with_id(
+        app,
+        "zvuk",
+        "Zvuk",
+        true,
+        crate::gamepad::ZVUK_VYCHOZI,
+        None::<&str>,
+    )?;
+    let oddelovac = PredefinedMenuItem::separator(app)?;
     let ukoncit = MenuItem::with_id(app, "ukoncit", "Ukončit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&otevrit, &ukoncit])?;
+    let menu = Menu::with_items(app, &[&otevrit, &pauza, &zvuk, &oddelovac, &ukoncit])?;
+    app.manage(Oblast {
+        pauza,
+        zvuk,
+        posledni: Mutex::new(None),
+        varianty: OnceLock::new(),
+    });
     let mut stavba = TrayIconBuilder::with_id(ID)
         .tooltip("KeyPad")
         .menu(&menu)
@@ -33,6 +112,16 @@ pub fn nastav(app: &tauri::App) -> tauri::Result<()> {
         .on_menu_event(|app, udalost| match udalost.id.as_ref() {
             "otevrit" => {
                 ukaz_okno(app);
+            }
+            "pauza" => crate::gamepad::prepni_z_nabidky(app),
+            "zvuk" => {
+                // Zaškrtnutí přepnula nabídka sama už před touhle událostí.
+                if let Some(zap) = app
+                    .try_state::<Oblast>()
+                    .and_then(|o| o.zvuk.is_checked().ok())
+                {
+                    crate::gamepad::zvuk_z_nabidky(app, zap);
+                }
             }
             "ukoncit" => ukonci(app, "nabídka v oznamovací oblasti"),
             _ => {}
@@ -61,16 +150,45 @@ pub fn schovavat() -> bool {
     IKONA.load(Ordering::Acquire)
 }
 
-/// Popisek ikony (stav padu). Z libovolného vlákna — nečeká: práci
-/// jen předá hlavnímu vláknu. Pad vlákno tu nesmí stát, hlavní vlákno
-/// může zrovna čekat na něj (konec aplikace).
-pub fn popisek(app: &AppHandle, text: String) {
+const TEXT_POZASTAVIT: &str = "Pozastavit";
+const TEXT_POKRACOVAT: &str = "Pokračovat";
+
+/// Ikona, bublina a položka Pozastavit/Pokračovat podle režimu.
+/// Z libovolného vlákna — nečeká: práci jen předá hlavnímu vláknu
+/// (vlákno okna, které to volá, hlídá tep ovladačů a nesmí stát; hlavní
+/// vlákno může zrovna čekat na pady při konci aplikace).
+pub fn stav(app: &AppHandle, s: TrayStav) {
     let a = app.clone();
-    let _ = app.run_on_main_thread(move || {
-        if let Some(ikona) = a.tray_by_id(ID) {
-            let _ = ikona.set_tooltip(Some(text));
+    let _ = app.run_on_main_thread(move || proved(&a, s));
+}
+
+/// [`stav`] na hlavním vlákně: mění jen to, co se opravdu změnilo.
+fn proved(app: &AppHandle, s: TrayStav) {
+    let (Some(ikona), Some(o)) = (app.tray_by_id(ID), app.try_state::<Oblast>()) else {
+        return;
+    };
+    let mut posledni = o.posledni.lock().unwrap_or_else(|e| e.into_inner());
+    let stary = posledni.as_ref();
+    if stary.map(|p| p.ikona) != Some(s.ikona) {
+        if let Some(obrazek) = o.obrazek(app, s.ikona) {
+            if let Err(e) = ikona.set_icon(Some(obrazek)) {
+                log::warn!("ikona v oznamovací oblasti: nejde změnit ({e})");
+            }
         }
-    });
+    }
+    if stary.map(|p| p.popisek.as_str()) != Some(s.popisek.as_str()) {
+        let _ = ikona.set_tooltip(Some(&s.popisek));
+    }
+    if stary.map(|p| p.pauza) != Some(s.pauza) {
+        let text = if s.pauza == Some(true) {
+            TEXT_POKRACOVAT
+        } else {
+            TEXT_POZASTAVIT
+        };
+        let _ = o.pauza.set_text(text);
+        let _ = o.pauza.set_enabled(s.pauza.is_some());
+    }
+    *posledni = Some(s);
 }
 
 /// Ukáže, obnoví z minimalizace a vyzdvihne hlavní okno. Vrací `false`,
