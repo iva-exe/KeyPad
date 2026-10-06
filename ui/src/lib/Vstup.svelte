@@ -3,7 +3,7 @@
 	import X from 'lucide-svelte/icons/x';
 	import type { Efekt } from './klavesy.svelte';
 	import { prehraj } from './motion';
-	import type { Klavesa, Vstup } from './smlouva';
+	import type { Cil, Klavesa, Vstup } from './smlouva';
 	import { bublinaVstupu, jeAlt, type Sviti } from './vstupy';
 
 	// Čepička jednoho vstupu na schématu: krátký název klávesy, která ho
@@ -28,6 +28,14 @@
 		/** Na vstupu jsou všechny klávesy mapování — vyprázdnit nejde (OQ 6). */
 		posledni?: boolean;
 		efekt?: { druh: Efekt; id: number };
+		/** Kam ještě patří klávesa čepičky (sdílená klávesa, Fáze 7 Z4). */
+		dalsi?: (k: Klavesa) => readonly Cil[];
+		/** Některá klávesa čepičky patří i jinému vstupu — oranžově. */
+		sdilena?: boolean;
+		/** Myš je na čepičce téže sdílené klávesy — silnější obrys. */
+		zvyraznena?: boolean;
+		/** Najetí myší na sdílenou čepičku (`true`) a odjetí (`false`). */
+		onnajeti?: (najeto: boolean) => void;
 		onprirad: (pridat: boolean) => void;
 		onvyprazdni: () => void;
 	}
@@ -44,6 +52,10 @@
 		cil = false,
 		posledni = false,
 		efekt,
+		dalsi,
+		sdilena = false,
+		zvyraznena = false,
+		onnajeti,
 		onprirad,
 		onvyprazdni
 	}: Props = $props();
@@ -51,7 +63,8 @@
 	const TRIDY: Record<Efekt, string> = {
 		ulozeno: 'kp-zablesk',
 		presunuto: 'kp-zablesk-presun',
-		odmitnuto: 'kp-zatreseni'
+		odmitnuto: 'kp-zatreseni',
+		sdileno: 'kp-zablesk-sdilena'
 	};
 
 	const prvni = $derived(klavesy[0]);
@@ -61,7 +74,9 @@
 	// znacích (code points), ne po UTF-16 jednotkách.
 	const delka = $derived(prvni ? [...prvni.kratky].length : 1);
 	const alt = $derived(klavesy.some(jeAlt));
-	const bublina = $derived(bublinaVstupu(vstup, klavesy));
+	const bublina = $derived(bublinaVstupu(vstup, klavesy, dalsi));
+	// Čtečka uslyší i to, že je klávesa sdílená (barva nestojí sama).
+	const popisCtecky = $derived(sdilena ? `${bublina}, sdílená` : bublina);
 	const bublinaKrizku = $derived(posledni ? 'Poslední klávesu nejde odebrat' : 'Vyprázdnit');
 
 	function vyprazdnit(): void {
@@ -87,11 +102,15 @@
 	data-sviti={sviti ?? undefined}
 	data-prazdna={prazdna ? '' : undefined}
 	data-cil={cil ? '' : undefined}
+	data-sdilena={sdilena ? '' : undefined}
+	data-zvyraznena={zvyraznena ? '' : undefined}
 >
 	<button
 		class="telo"
 		title={bublina}
-		aria-label={bublina}
+		aria-label={popisCtecky}
+		onpointerenter={onnajeti ? () => onnajeti(true) : undefined}
+		onpointerleave={onnajeti ? () => onnajeti(false) : undefined}
 		style:translate={posun ? `${posun[0]}px ${posun[1]}px` : undefined}
 		use:prehraj={{ trida: efekt ? TRIDY[efekt.druh] : '', id: efekt?.id ?? 0 }}
 		onclick={() => onprirad(false)}
@@ -218,6 +237,34 @@
 		border-color: var(--border-strong);
 		background: transparent;
 		color: var(--text-faint);
+	}
+
+	/* Sdílená klávesa (Fáze 7, Z4 — vlastník: „obě zoranžověly"): celá
+	   čepička oranžově — nádech výplně, obrys 1,75 px a text. Oranžová =
+	   „sdílená", ne chyba (OQ 65). Živé svícení přebije výplň, obrys
+	   zůstane — pravidla níž mají vyšší specificitu. */
+	.cepicka[data-sdilena] .telo {
+		border-color: var(--sdilena);
+		box-shadow: inset 0 0 0 0.75px var(--sdilena);
+		background: color-mix(in srgb, var(--sdilena) 18%, rgba(8, 9, 12, 0.5));
+		color: var(--sdilena);
+	}
+	.cepicka[data-sdilena][data-sviti] .telo {
+		border-color: var(--sdilena);
+		box-shadow: inset 0 0 0 0.75px var(--sdilena);
+	}
+	.cepicka[data-sdilena][data-sviti='hra'] .telo {
+		color: var(--na-barve);
+	}
+	.cepicka[data-sdilena][data-sviti='nahled'] .telo {
+		color: var(--text);
+	}
+	/* Myš na čepičce téže klávesy: tady taky (jen stav najetí, žádný
+	   časovač). */
+	.cepicka[data-sdilena][data-zvyraznena] .telo {
+		box-shadow:
+			inset 0 0 0 0.75px var(--sdilena),
+			0 0 0 2px color-mix(in srgb, var(--sdilena) 55%, transparent);
 	}
 
 	/* Klávesa je dole, ale hra vstup nedostává (vypnutý ovladač, pauza,

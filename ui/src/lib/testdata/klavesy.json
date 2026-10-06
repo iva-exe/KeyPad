@@ -32,6 +32,7 @@
 		"nazev": "Scroll Lock",
 		"kratky": "Scrol"
 	},
+	"zkratka_mimo": false,
 	"vazby": [
 		{
 			"pad": 0,
@@ -156,6 +157,16 @@
 		{
 			"pad": 0,
 			"vstup": "x",
+			"klavesa": {
+				"scan": 33,
+				"e0": false,
+				"nazev": "F",
+				"kratky": "F"
+			}
+		},
+		{
+			"pad": 1,
+			"vstup": "b",
 			"klavesa": {
 				"scan": 33,
 				"e0": false,
@@ -340,6 +351,12 @@
 	"chyby": [],
 	"karty": {
 		"rev": 3,
-		"pady": [0, 1, 3]
+		"pady": [0, 1, 3],
+		"rozbalene": [0, 3]
+	},
+	"nastaveni": {
+		"rev": 2,
+		"zvuk": true,
+		"sdilene_klavesy": true
 	}
 }

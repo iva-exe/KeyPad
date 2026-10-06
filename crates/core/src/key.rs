@@ -94,6 +94,35 @@ impl KeyId {
         )
     }
 
+    /// Smí být klávesa zkratkou pozastavení, kterou uživatel přiřadí
+    /// v okně (Fáze 7, Z6)? Jen **F1–F24 kromě F4, Scroll Lock a Pause**,
+    /// vše bez E0.
+    ///
+    /// Seznam povolených, ne zakázaných: zkratku engine spolkne v každém
+    /// režimu po celou dobu, kdy je hook v systému (zapnutý ovladač nebo
+    /// okno v popředí), a i s drženým Altem — výjimku má jen Win. Se
+    /// zkratkou Tab by v celém systému přestal fungovat Alt+Tab, se
+    /// zkratkou Enter, Backspace, šipkou, Caps Lock nebo Print Screen
+    /// totéž pro ně (princip 1 a 8). Ze stejného důvodu chybí F4: Alt+F4
+    /// by hru nezavřel, jen pozastavil, a za pauzy by v jiném okně
+    /// zachytávání obnovil — psaní by pak mířilo do padu (princip 1,
+    /// nalezeno revizí). Ostatní F-klávesy nic celosystémového nemají.
+    ///
+    /// Platí jen pro přiřazování z okna: zkratka mimo seznam ručně
+    /// zapsaná v `config.json` platí dál ([`crate::Mapping::new`] ji kvůli
+    /// starším souborům brát nepřestane; okno ji jen označí — OQ 69).
+    /// Pause v LL hooku: scan 0x45 bez E0 (Num Lock je 0x45 s E0, Ctrl+Pause
+    /// = Break 0x46 s E0 — v seznamu nejsou); ověří vlastník (OQ 69).
+    pub const fn is_toggle_candidate(self) -> bool {
+        !self.extended
+            && matches!(
+                self.scan,
+                // F1–F3, F5–F10 (bez F4 0x3E), Pause, Scroll Lock, F11,
+                // F12, F13–F23, F24
+                0x3B..=0x3D | 0x3F..=0x44 | 0x45 | 0x46 | 0x57 | 0x58 | 0x64..=0x6E | 0x76
+            )
+    }
+
     /// Index do tabulek o [`KEY_TABLE_SIZE`] položkách: nízkých 7 bitů je
     /// scan kód, horní bit prefix E0. `None` pro nemapovatelné klávesy.
     ///
@@ -149,6 +178,18 @@ impl KeyId {
     /// nepůjde Alt+Tab (Fáze 6).
     pub const LEFT_ALT: KeyId = KeyId::new(0x38);
     pub const SPACE: KeyId = KeyId::new(0x39);
+    pub const TAB: KeyId = KeyId::new(0x0F);
+    pub const F1: KeyId = KeyId::new(0x3B);
+    /// F4 — zkratkou pozastavení být nesmí: s ní by Alt+F4 nezavřel okno
+    /// (OQ 69).
+    pub const F4: KeyId = KeyId::new(0x3E);
+    pub const F5: KeyId = KeyId::new(0x3F);
+    /// F12 — jde za zkratku pozastavení, okno ale varuje: Steam jím fotí
+    /// snímek obrazovky a se zapnutým ovladačem by ho nedostal.
+    pub const F12: KeyId = KeyId::new(0x58);
+    pub const F24: KeyId = KeyId::new(0x76);
+    /// Pause/Break bez Ctrl (Num Lock má týž scan kód s E0).
+    pub const PAUSE: KeyId = KeyId::new(0x45);
     pub const SCROLL_LOCK: KeyId = KeyId::new(0x46);
     /// 8 na numerické klávesnici — stejný scan kód jako šipka nahoru,
     /// jen bez E0. Testy s ním hlídají, že se `extended` nezanedbává.
@@ -272,6 +313,65 @@ mod tests {
         assert!(cekane.iter().all(|k| k.is_mappable()));
         assert!(!KeyId::ALTGR_FAKE_CTRL.is_modifier());
         assert!(!KeyId::LEFT_WIN.is_modifier());
+    }
+
+    /// Celá tabulka (i nemapovatelné kódy a E0) proti ručnímu výčtu
+    /// z ROADMAP (Z6, OQ 69): F1–F10 0x3B–0x44 bez F4 0x3E, F11 0x57,
+    /// F12 0x58, F13–F23 0x64–0x6E, F24 0x76, Scroll Lock 0x46, Pause
+    /// 0x45 — vše bez E0.
+    #[test]
+    fn zkratka_jen_f_klavesy_scroll_lock_a_pause() {
+        let mut cekane: Vec<KeyId> = Vec::new();
+        for s in 0x3Bu16..=0x44 {
+            if s != 0x3E {
+                cekane.push(KeyId::new(s));
+            }
+        }
+        cekane.extend([KeyId::new(0x57), KeyId::new(0x58)]);
+        for s in 0x64u16..=0x6E {
+            cekane.push(KeyId::new(s));
+        }
+        cekane.extend([KeyId::new(0x76), KeyId::SCROLL_LOCK, KeyId::PAUSE]);
+        cekane.sort();
+        assert_eq!(
+            cekane.len(),
+            23 + 2,
+            "23 F-kláves (bez F4), Scroll Lock a Pause"
+        );
+        let mut nalezene = Vec::new();
+        for scan in 0..=0x300u16 {
+            for extended in [false, true] {
+                let k = KeyId { scan, extended };
+                if k.is_toggle_candidate() {
+                    assert!(k.is_mappable(), "{k} musí jít sledovat");
+                    nalezene.push(k);
+                }
+            }
+        }
+        assert_eq!(nalezene, cekane);
+        // Klávesy, které by zkratka vzala celému systému, v seznamu nejsou.
+        for k in [
+            KeyId::TAB,
+            KeyId::ENTER,
+            KeyId::BACKSPACE,
+            KeyId::ESC,
+            KeyId::W,
+            KeyId::LEFT_SHIFT,
+            KeyId::LEFT_ALT,
+            KeyId::LEFT_CTRL,
+            KeyId::ARROW_UP,
+            KeyId::new(0x3A), // Caps Lock
+            KeyId::ext(0x45), // Num Lock
+            KeyId::ext(0x46), // Break (Ctrl+Pause)
+            KeyId::ext(0x37), // Print Screen
+            KeyId::LEFT_WIN,
+            KeyId::F4, // Alt+F4 musí dál zavírat okna (OQ 69)
+        ] {
+            assert!(!k.is_toggle_candidate(), "{k}");
+        }
+        for k in [KeyId::F1, KeyId::F5, KeyId::F12, KeyId::F24] {
+            assert!(k.is_toggle_candidate(), "{k}");
+        }
     }
 
     #[test]

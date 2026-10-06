@@ -6,7 +6,7 @@
 	import OAplikaci from './OAplikaci.svelte';
 	import { hlavniOkno } from './tauri';
 
-	// Titulek: jméno, „O aplikaci", minimalizovat, zavřít. Stav
+	// Titulek: jméno, ⓘ (nastavení a o aplikaci), minimalizovat, zavřít. Stav
 	// ovladače je v jeho kartě — dvakrát na jedné obrazovce by jen
 	// přidával text.
 
@@ -38,8 +38,8 @@
 		<button
 			class="wc"
 			class:aktivni={oAplikaci}
-			title="O aplikaci"
-			aria-label="O aplikaci"
+			title="Nastavení a o aplikaci"
+			aria-label="Nastavení a o aplikaci"
 			aria-expanded={oAplikaci}
 			bind:this={tlacitkoInfo}
 			onclick={() => (oAplikaci = !oAplikaci)}

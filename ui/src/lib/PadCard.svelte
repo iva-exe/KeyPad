@@ -3,21 +3,24 @@
 	import RotateCcw from 'lucide-svelte/icons/rotate-ccw';
 	import RotateCw from 'lucide-svelte/icons/rotate-cw';
 	import Trash2 from 'lucide-svelte/icons/trash-2';
+	import { untrack } from 'svelte';
 	import { prefersReducedMotion } from 'svelte/motion';
 	import { slide } from 'svelte/transition';
 	import {
 		cilPrirazeni,
 		klavesy,
 		napovedaKarty,
-		odeberOvladac,
+		novaKarta,
 		odznaky,
 		PRIRAZENI_MS,
 		prirazovani,
 		pulzPrepinacu,
 		rezim,
-		vychozi,
-		zpet
+		rozbalKartu,
+		zpet,
+		zvyraznene
 	} from './klavesy.svelte';
+	import { otevriPotvrzeni } from './dialog.svelte';
 	import { prehraj, trvani, zpomaleni } from './motion';
 	import Ovladac from './Ovladac.svelte';
 	import {
@@ -30,23 +33,24 @@
 		zkusZnovu
 	} from './pady.svelte';
 	import Prepinac from './Prepinac.svelte';
-	import { maVsechnyKlavesy, pocetKlaves, procNeodebrat } from './vstupy';
+	import { klicKlavesy, maVsechnyKlavesy, pocetKlaves, procNeodebrat } from './vstupy';
 	import { zive } from './zive.svelte';
 
-	// Karta ovladače jako akordeon: hlavička (pruh a číslo = identita,
-	// tečka a přepínač = stav) a u rozbalené karty schéma s klávesami
-	// a jeden řádek nápovědy. Kódy chyb a vysvětlivky patří do bubliny
-	// a logu, ne do okna. Nic se nepředstírá: „zapnutý" až po potvrzení
-	// z ovladače.
+	// Karta ovladače: hlavička (barva rámečku a číslo = identita, tečka
+	// a přepínač = stav) a u rozbalené karty schéma s klávesami a jeden
+	// řádek nápovědy. Rozbalit jde každou zvlášť, víc i všechny (Fáze 7,
+	// Z2). Kódy chyb a vysvětlivky patří do bubliny a logu, ne do okna.
+	// Nic se nepředstírá: „zapnutý" až po potvrzení z ovladače.
 
 	interface Props {
 		/** Ovladač 0–3. */
 		pad: number;
 		rozbalena: boolean;
-		onrozbal: () => void;
 	}
 
-	let { pad, rozbalena, onrozbal }: Props = $props();
+	let { pad, rozbalena }: Props = $props();
+
+	let karta: HTMLElement | undefined = $state();
 
 	const p = $derived(pady[pad]!);
 	const cislo = $derived(pad + 1);
@@ -106,23 +110,36 @@
 	// Bez kláves to řekne tečka; důvod chyby ale schovat nesmí.
 	const bublina = $derived(pocet === 0 ? `Nemá klávesy\n${bublinaStavu}` : bublinaStavu);
 
-	// ── pruh: rozjasní se při stisku kterékoli klávesy ovladače ──
-	const BLIK_MS = 120;
-	let blik = $state(false);
-	let predchozi = 0;
-	let casovacBliku: ReturnType<typeof setTimeout> | undefined;
+	// ── záře: svítí, dokud je držený kterýkoli vstup ovladače (Fáze 7, Z5) ──
+	// Vlastník: „nechci, aby jen bliknul, ale zůstal rozsvícený, dokud držím".
+	// Rozsvítí se hned, po puštění posledního vstupu pohasne přechodem
+	// v CSS (žádný časovač ani animace v nečinnosti, princip 10). Ťuknutí
+	// kratší než snímek by vidět nebylo — svítí aspoň ZARE_MIN_MS; časovač
+	// jen na tenhle zbytek.
+	const ZARE_MIN_MS = 120;
+	let zare = $state(false);
+	let rozsviceno = 0;
+	let casovacZare: ReturnType<typeof setTimeout> | undefined;
 	$effect(() => {
-		const drzi = zive.pady[pad]?.drzi ?? 0;
-		// Jen nový stisk (nový bit) a jen záblesk (spec 1.2): co je drženo,
-		// ukazují čepičky — trvale rozjasněný pruh by při držené páčce nic neříkal.
-		if (drzi & ~predchozi) {
-			blik = true;
-			clearTimeout(casovacBliku);
-			casovacBliku = setTimeout(() => (blik = false), BLIK_MS);
+		const drzi = (zive.pady[pad]?.drzi ?? 0) !== 0;
+		clearTimeout(casovacZare);
+		if (drzi) {
+			if (!untrack(() => zare)) rozsviceno = performance.now();
+			zare = true;
+			return;
 		}
-		predchozi = drzi;
+		const zbyva = rozsviceno + ZARE_MIN_MS - performance.now();
+		if (zbyva <= 0) zare = false;
+		else casovacZare = setTimeout(() => (zare = false), zbyva);
 	});
-	$effect(() => () => clearTimeout(casovacBliku));
+	$effect(() => () => clearTimeout(casovacZare));
+
+	// Najetí myší na sdílenou čepičku zvýrazní i odznak karty, které ta
+	// klávesa patří taky (hlavně u sbalené karty, Z4).
+	const odznakZvyrazneny = $derived(
+		zvyraznene.klice.length > 0 &&
+			klavesy.vazby.some((v) => v.pad === pad && zvyraznene.klice.includes(klicKlavesy(v.klavesa)))
+	);
 
 	// ── nápověda (jediný řádek) ──
 	const cil = $derived(cilPrirazeni());
@@ -145,56 +162,60 @@
 		return () => clearInterval(t);
 	});
 
-	// ── patička: akce na dva kliky ──
-	const POTVRZENI_MS = 3000;
-	let potvrzuje = $state<'vychozi' | 'odebrat' | null>(null);
-	let casovacPotvrzeni: ReturnType<typeof setTimeout> | undefined;
-	$effect(() => () => clearTimeout(casovacPotvrzeni));
-
-	/** Druhý klik do 3 s potvrdí; první jen zčervená ikonu. */
-	function dvaKliky(co: 'vychozi' | 'odebrat', akce: () => Promise<unknown>): void {
-		clearTimeout(casovacPotvrzeni);
-		if (potvrzuje === co) {
-			potvrzuje = null;
-			void akce();
-			return;
-		}
-		potvrzuje = co;
-		casovacPotvrzeni = setTimeout(() => (potvrzuje = null), POTVRZENI_MS);
-	}
-
+	// ── patička: ↺ a 🗑 jedním klikem a otázkou (Fáze 7, Z3) ──
 	// Bublina neaktivního 🗑, nebo '' — odebrat jde jen vypnutý ovladač.
 	const neodebrat = $derived(procNeodebrat(p.state, maVsechnyKlavesy(klavesy.vazby, pad)));
 
-	// Klávesy i kartu odebere backend (karta se ukládá, OQ 52).
-	async function odebrat(): Promise<void> {
-		await odeberOvladac(pad);
+	// ── rozbalení: každá karta zvlášť (Z2) ──
+	function prepniRozbaleni(): void {
+		void rozbalKartu(pad, !rozbalena);
 	}
+
+	/**
+	 * Rozbalená karta se posune do zorného pole — až po dojetí rozbalení,
+	 * jinak by se počítalo s poloviční výškou. S „Omezit pohyb" bez animace.
+	 */
+	function ukazCelou(): void {
+		karta?.scrollIntoView({ block: 'nearest', behavior: omezit ? 'auto' : 'smooth' });
+	}
+
+	// Karta z „+ Ovladač" vzniká rovnou rozbalená — přechod rozbalení (a po
+	// něm `ukazCelou`) se u ní nepřehraje. Posunout po vykreslení, jen jednou
+	// a jen po akci uživatele (karty načtené se startem okna ne).
+	$effect(() => {
+		if (novaKarta.pad !== pad || !karta) return;
+		novaKarta.pad = -1;
+		ukazCelou();
+	});
 </script>
 
 <!-- data-*: stav karty pro styly i pro test okna na skryté ploše
-     (data-seq = poslední převzatá změna padu, ne jen odpověď). -->
+     (data-seq = poslední převzatá změna padu, ne jen odpověď; data-zare =
+     záře svítí — držený vstup ovladače, Z5). -->
 <section
 	class="karta"
 	class:rozbalena
-	class:stisk={blik}
 	data-pad={cislo}
 	data-stav={p.state}
 	data-rezim={rezim.rezim}
 	data-seq={p.seq}
 	data-rozbalena={rozbalena}
+	data-zare={zare ? '' : undefined}
 	aria-label="Ovladač {cislo}"
+	bind:this={karta}
 >
-	<span class="pruh" aria-hidden="true"></span>
-
 	<div class="hlava">
 		<button
 			class="rozbal"
 			aria-expanded={rozbalena}
-			title={rozbalena ? undefined : 'Ukázat klávesy'}
-			onclick={onrozbal}
+			title={rozbalena ? 'Skrýt klávesy' : 'Ukázat klávesy'}
+			onclick={prepniRozbaleni}
 		>
-			<span class="odznak" use:prehraj={{ trida: 'kp-zablesk-odznak', id: odznaky[pad] ?? 0 }}>{cislo}</span>
+			<span
+				class="odznak"
+				data-zvyrazneny={odznakZvyrazneny ? '' : undefined}
+				use:prehraj={{ trida: 'kp-zablesk-odznak', id: odznaky[pad] ?? 0 }}>{cislo}</span
+			>
 			<span class="jmeno">Ovladač {cislo}</span>
 			<span class="veta" title={bublina}>{veta}</span>
 		</button>
@@ -217,7 +238,7 @@
 	{/if}
 
 	{#if rozbalena}
-		<div class="obsah" transition:slide={{ duration: trvani(160), easing: zpomaleni }}>
+		<div class="obsah" transition:slide={{ duration: trvani(160), easing: zpomaleni }} onintroend={ukazCelou}>
 			<Ovladac {pad} />
 
 			<div class="pata">
@@ -261,22 +282,23 @@
 					{#if pad === 0}
 						<button
 							class="ikona"
-							class:potvrdit={potvrzuje === 'vychozi'}
-							title={potvrzuje === 'vychozi' ? 'Znovu = potvrdit' : 'Výchozí klávesy'}
+							title="Výchozí klávesy"
 							aria-label="Výchozí klávesy"
-							onclick={() => dvaKliky('vychozi', vychozi)}
+							aria-haspopup="dialog"
+							onclick={(e) => otevriPotvrzeni('vychozi', pad, pocet > 0, e.currentTarget)}
 						>
 							<RotateCcw size={14} strokeWidth={1.9} />
 						</button>
 					{:else}
+						<!-- Neaktivní 🗑 dialog neotevře, jen bublina (OQ 6). -->
 						<button
 							class="ikona"
-							class:potvrdit={potvrzuje === 'odebrat'}
-							title={neodebrat || (potvrzuje === 'odebrat' ? 'Znovu = potvrdit' : 'Odebrat ovladač')}
+							title={neodebrat || 'Odebrat ovladač'}
 							aria-label="Odebrat ovladač"
+							aria-haspopup="dialog"
 							aria-disabled={!!neodebrat}
-							onclick={() => {
-								if (!neodebrat) dvaKliky('odebrat', odebrat);
+							onclick={(e) => {
+								if (!neodebrat) otevriPotvrzeni('odebrat', pad, pocet > 0, e.currentTarget);
 							}}
 						>
 							<Trash2 size={14} strokeWidth={1.9} />
@@ -302,29 +324,70 @@
 </section>
 
 <style>
+	/* Fáze 7, Z5 (vlastník chtěl vyzkoušet): tenký rámeček v barvě ovladače
+	   kolem celé karty místo levého pruhu a lehká záře téže barvy, která
+	   svítí, dokud je držený kterýkoli vstup ovladače (i u sbalené karty —
+	   hráč pozná, kterému ovladači klávesa patří). Bez overflow: hidden —
+	   záře je vně karty a ořez by ji usekl (rozbalení si ořez dělá samo). */
 	.karta {
 		position: relative;
 		flex-shrink: 0;
 		display: flex;
 		flex-direction: column;
 		background: var(--surface);
-		border: 1px solid var(--border);
+		border: 1px solid color-mix(in srgb, var(--barva) 40%, var(--border));
 		border-radius: var(--radius-lg);
-		overflow: hidden;
-		transition: border-color var(--t-fast) var(--ease);
+		/* Pohasnutí po puštění; rozsvícení jde hned (níž). */
+		transition: border-color 250ms ease-out;
 	}
-	/* Barva okraje jen podle významu: porucha červeně, „klávesy nejdou"
-	   jantarově. Identitu nese pruh a odznak, ne okraj. */
+	/* Záře na ::after s PEVNÝM stínem — mění se jen průhlednost, a tu dělá
+	   kompozitor. Přechod samotného box-shadow by kartu překresloval každý
+	   snímek (za hry čtyři karty a živý stav 60 Hz, princip 10). Dosah 8 px:
+	   tolik místa má karta k hraně panelu (padding v App.svelte). */
+	.karta::after {
+		content: '';
+		position: absolute;
+		inset: -1px;
+		border-radius: inherit;
+		box-shadow: 0 0 8px color-mix(in srgb, var(--barva) 40%, transparent);
+		opacity: 0;
+		pointer-events: none;
+		transition: opacity 250ms ease-out;
+	}
+	.karta[data-zare] {
+		border-color: var(--barva);
+		transition-duration: 40ms;
+	}
+	.karta[data-zare]::after {
+		opacity: 1;
+		transition-duration: 40ms;
+	}
+	/* Stav má přednost před identitou: porucha červeně, „klávesy nejdou"
+	   jantarově (záře zůstává v barvě ovladače, číslo nese odznak). */
 	.karta[data-stav='error'] {
-		border-color: color-mix(in srgb, var(--danger) 32%, var(--border));
+		border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
 	}
 	.karta[data-stav='on'][data-rezim='no_hook'] {
-		border-color: color-mix(in srgb, var(--warn) 32%, var(--border));
+		border-color: color-mix(in srgb, var(--warn) 45%, var(--border));
 	}
 
-	/* Pruh v barvě ovladače; při stisku jeho klávesy se rozjasní (i u
-	   sbalené karty — hráč pozná, kterému ovladači klávesa patří). */
-	.pruh {
+	/* Dřívější vzhled (levý pruh) jde vrátit jedním přepnutím v CSS:
+	   data-vzhled-karty="pruh" na kořeni okna (vlastník srovná snímky). */
+	:global(:root[data-vzhled-karty='pruh']) .karta {
+		border-color: var(--border);
+		overflow: hidden;
+	}
+	:global(:root[data-vzhled-karty='pruh']) .karta[data-stav='error'] {
+		border-color: color-mix(in srgb, var(--danger) 32%, var(--border));
+	}
+	:global(:root[data-vzhled-karty='pruh']) .karta[data-stav='on'][data-rezim='no_hook'] {
+		border-color: color-mix(in srgb, var(--warn) 32%, var(--border));
+	}
+	:global(:root[data-vzhled-karty='pruh']) .karta::after {
+		display: none;
+	}
+	:global(:root[data-vzhled-karty='pruh']) .karta::before {
+		content: '';
 		position: absolute;
 		top: 0;
 		bottom: 0;
@@ -334,7 +397,7 @@
 		opacity: 0.5;
 		transition: opacity 120ms var(--ease);
 	}
-	.karta.stisk .pruh {
+	:global(:root[data-vzhled-karty='pruh']) .karta[data-zare]::before {
 		opacity: 1;
 		transition: none;
 	}
@@ -357,9 +420,6 @@
 		text-align: left;
 		cursor: pointer;
 	}
-	.karta.rozbalena .rozbal {
-		cursor: default;
-	}
 	.odznak {
 		flex: none;
 		display: grid;
@@ -373,6 +433,10 @@
 		font-size: 0.7rem;
 		font-weight: 500;
 		line-height: 1;
+	}
+	/* Najetí myší na sdílenou čepičku: i tahle karta má tu klávesu (Z4). */
+	.odznak[data-zvyrazneny] {
+		box-shadow: 0 0 0 2px var(--sdilena);
 	}
 	.jmeno {
 		flex: none;
@@ -556,12 +620,6 @@
 	.ikona[aria-disabled='true'] {
 		opacity: 0.35;
 		cursor: default;
-	}
-	/* První klik akce na dva kliky: ikona zčervená, druhý potvrdí. */
-	.ikona.potvrdit,
-	.ikona.potvrdit:hover {
-		background: color-mix(in srgb, var(--danger) 16%, transparent);
-		color: var(--danger);
 	}
 
 	.odpocet {

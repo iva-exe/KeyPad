@@ -1,9 +1,11 @@
 //! Uložení kláves: `%APPDATA%\KeyPad\config.json` (`updater::config_path`).
 //!
-//! Soubor nese mapování všech ovladačů, zkratku, zapnutý zvuk a karty
-//! ovladačů v okně ([`Karty`], OQ 52). Stav zapnutí ovladače v něm **není
-//! a nikdy nebude**: ovladač se připojuje jen na povel uživatele
-//! (princip 11), takže po startu nemá co obnovovat.
+//! Soubor nese mapování všech ovladačů, zkratku, zapnutý zvuk, volbu
+//! „Jedna klávesa pro víc vstupů“ (Fáze 7), karty ovladačů v okně
+//! ([`Karty`], OQ 52) a které z nich jsou rozbalené ([`Rozbalene`],
+//! OQ 70). Stav zapnutí ovladače v něm **není a nikdy nebude**: ovladač
+//! se připojuje jen na povel uživatele (princip 11), takže po startu nemá
+//! co obnovovat.
 //!
 //! Proč JSON, a ne TOML, a proč takhle (princip 10, hranice +50 kB ze
 //! specifikace Fáze 6; naměřeno release buildem přes Tauri CLI a mapou
@@ -25,7 +27,7 @@
 //! | platný | načte se (BOM se odstřihne, neznámé klíče se ignorují) | ano |
 //! | nevalidní | přejmenuje se na `config.invalid.json`, platí výchozí | ano |
 //! | nevalidní a zálohu nejde vytvořit | výchozí v paměti, soubor nedotčený, stav jako nečitelný | ne |
-//! | `verze` > 1 | výchozí jen v paměti, soubor nedotčený | ne |
+//! | `verze` > 2 | výchozí jen v paměti, soubor nedotčený | ne |
 //! | nejde číst | výchozí v paměti | ne |
 //!
 //! Proč se soubor z novější verze, nečitelný ani neodložený nevalidní
@@ -33,6 +35,12 @@
 //! zpátky (návrat ke starší verzi KeyPadu, soubor zrovna drží jiný
 //! program, překlep v ruční úpravě). Výchozí klávesy v paměti stačí na
 //! hraní a o nic se nepřijde — okno jen ukáže, že se klávesy neukládají.
+//!
+//! `verze` 2 (Fáze 7) píše KeyPad jen tehdy, když soubor nese sdílenou
+//! klávesu (tatáž klávesa u víc vstupů): KeyPad do vydání …2007 by ji
+//! vzal za duplicitu, soubor by odložil do zálohy a načetl výchozí
+//! klávesy. Vyšší verzi naopak nechá být a jen neukládá — nic se neztratí
+//! (OQ 61). Bez sdílené klávesy zůstává `verze` 1.
 //!
 //! Zápis ([`uloz`]) je atomický — `.tmp`, `sync_all`, `rename` — takže
 //! výpadek proudu uprostřed nenechá napůl zapsaný soubor, který by příští
@@ -55,12 +63,22 @@ use keypad_core::{Action, KeyId, Mapping, MappingError, PadAction, PadId, MAX_PA
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-/// Verze formátu, kterou tahle aplikace píše a umí číst.
+/// Nejvyšší verze formátu, kterou tahle aplikace umí číst (a píše se
+/// sdílenou klávesou).
 ///
 /// `verze` zůstane ve všech budoucích formátech celé číslo na nejvyšší
 /// úrovni objektu — jen podle ní starší KeyPad pozná soubor, kterému
 /// nerozumí, a nechá ho být.
-pub const VERZE: i64 = 1;
+///
+/// Nepřepisuje se až verze > 2 (ROADMAP otázka 61). Řádek CLAUDE.md
+/// „`verze` > 1 se nepřepisuje“ je z Fáze 6 a čeká na úpravu — kdyby se
+/// podle něj verze 2 brala za novější, klávesy se sdílenou klávesou by
+/// se přestaly ukládat.
+pub const VERZE: i64 = 2;
+
+/// Verze souboru bez sdílené klávesy — tu přečte i KeyPad do vydání
+/// …2007 (Fáze 6), který jinou neumí.
+pub const VERZE_ZAKLAD: i64 = 1;
 
 /// Záloha nevalidního souboru, vedle `config.json`. Název je v updateru:
 /// odinstalace ji podle něj nechává uživateli stejně jako konfiguraci.
@@ -87,10 +105,16 @@ const MAX_CHYB_V_LOGU: usize = 10;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Konfigurace {
     pub mapovani: Mapping,
-    /// Zvuk pozastavení a pokračování (✓ Zvuk v nabídce ikony).
+    /// Zvuk pozastavení a pokračování (✓ Zvuk v nabídce ikony i v ⓘ).
     pub zvuk: bool,
+    /// Volba „Jedna klávesa pro víc vstupů“ (Fáze 7): přiřazení klávesy,
+    /// která už patří jinam, ji sdílí místo přesunu. Platnost vazeb na ní
+    /// nezávisí — řídí jen nová přiřazení.
+    pub sdilene_klavesy: bool,
     /// Ovladače s kartou v okně (OQ 52).
     pub karty: Karty,
+    /// Rozbalené karty (OQ 70). Zapisují se jen ty, které mají kartu.
+    pub rozbalene: Rozbalene,
 }
 
 impl Default for Konfigurace {
@@ -98,7 +122,9 @@ impl Default for Konfigurace {
         Konfigurace {
             mapovani: Mapping::default(),
             zvuk: true,
+            sdilene_klavesy: false,
             karty: Karty::PRVNI,
+            rozbalene: Rozbalene::PRVNI,
         }
     }
 }
@@ -153,6 +179,51 @@ impl Karty {
 impl Default for Karty {
     fn default() -> Self {
         Karty::PRVNI
+    }
+}
+
+/// Které karty ovladačů jsou v okně rozbalené (Fáze 7 Z2, OQ 70) —
+/// rozbalit jde víc i všechny, sbalit i kartu ovladače 1. Bitová maska
+/// podle `PadId::index` jako [`Karty`]; jen pro okno, na klávesy nemá vliv.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rozbalene(u8);
+
+impl Rozbalene {
+    /// Výchozí (soubor bez `rozbalene`): rozbalený ovladač 1.
+    pub const PRVNI: Rozbalene = Rozbalene(1);
+    /// Vše sbalené (jen testy — aplikace karty sbaluje po jedné).
+    #[cfg(test)]
+    pub const ZADNA: Rozbalene = Rozbalene(0);
+
+    pub fn ma(self, pad: PadId) -> bool {
+        self.0 & 1 << pad.index() != 0
+    }
+
+    /// Rozbalí (`true`) nebo sbalí kartu; `true` = něco se změnilo.
+    pub fn nastav(&mut self, pad: PadId, rozbalena: bool) -> bool {
+        let pred = self.0;
+        if rozbalena {
+            self.0 |= 1 << pad.index();
+        } else {
+            self.0 &= !(1 << pad.index());
+        }
+        self.0 != pred
+    }
+
+    /// Jen karty, které v okně jsou — rozbalit kartu, která není, nejde.
+    pub fn jen(self, karty: Karty) -> Rozbalene {
+        Rozbalene(self.0 & karty.0)
+    }
+
+    /// Rozbalené ovladače, vzestupně.
+    pub fn pady(self) -> impl Iterator<Item = PadId> {
+        PadId::ALL.into_iter().filter(move |&p| self.ma(p))
+    }
+}
+
+impl Default for Rozbalene {
+    fn default() -> Self {
+        Rozbalene::PRVNI
     }
 }
 
@@ -238,7 +309,8 @@ pub enum ChybaObsahu {
     Ovladac { vazba: usize, ovladac: u64 },
     /// Neznámý kód vstupu ([`Action::code`]).
     Vstup { vazba: usize, vstup: String },
-    /// Porušené pravidlo mapování z jádra (duplicita, Win, Esc, prázdné…).
+    /// Porušené pravidlo mapování z jádra (víc než 4 vstupy jedné klávesy,
+    /// Win, Esc, prázdné…).
     Mapovani(MappingError),
 }
 
@@ -368,24 +440,23 @@ impl Cteni<'_> {
     }
 }
 
-/// `karty` ze souboru — čísla ovladačů 1–4. Karty nejsou kritické:
-/// chybná položka (0, 5, text, duplicita) se jen vynechá s varováním do
-/// logu a soubor kvůli ní nevalidní není (klávesy v něm platí dál).
-/// Chybějící klíč (soubor ze starší verze) = jen ovladač 1; ovladače
-/// s klávesami doplní volající.
-fn karty_z(o: &Map<String, Value>, varovani: &mut Vec<String>) -> Karty {
-    let mut karty = Karty::PRVNI;
-    let polozky = match klic(o, "karty") {
-        None => return karty,
+/// Seznam čísel ovladačů 1–4 ze souboru (`karty`, `rozbalene`) jako
+/// bitová maska. Není kritický: chybná položka (0, 5, text, duplicita)
+/// se jen vynechá s varováním do logu a soubor kvůli ní nevalidní není
+/// (klávesy v něm platí dál). `None` = klíč chybí (soubor ze starší
+/// verze) nebo nemá tvar seznamu (s varováním).
+fn pady_z(o: &Map<String, Value>, jmeno: &str, varovani: &mut Vec<String>) -> Option<u8> {
+    let polozky = match klic(o, jmeno) {
+        None => return None,
         Some(Value::Array(v)) => v,
         Some(_) => {
             varovani.push(format!(
-                "„karty“ musí být seznam čísel 1–{MAX_PADS} — vynecháno"
+                "„{jmeno}“ musí být seznam čísel 1–{MAX_PADS} — vynecháno"
             ));
-            return karty;
+            return None;
         }
     };
-    let mut videno = Karty(0);
+    let mut maska = 0u8;
     for (i, x) in polozky.iter().enumerate() {
         let pad = x
             .as_u64()
@@ -398,22 +469,56 @@ fn karty_z(o: &Map<String, Value>, varovani: &mut Vec<String>) -> Karty {
                 let text = x.to_string();
                 let konec = text.char_indices().nth(16).map_or(text.len(), |(j, _)| j);
                 varovani.push(format!(
-                    "karty, položka č. {}: {} není ovladač 1–{MAX_PADS} — vynechána",
+                    "{jmeno}, položka č. {}: {} není ovladač 1–{MAX_PADS} — vynechána",
                     i + 1,
                     &text[..konec]
                 ));
             }
-            Some(p) if !videno.pridej(p) => varovani.push(format!(
-                "karty, položka č. {}: ovladač {} podruhé — vynechána",
+            Some(p) if maska & 1 << p.index() != 0 => varovani.push(format!(
+                "{jmeno}, položka č. {}: ovladač {} podruhé — vynechána",
                 i + 1,
                 p.index() + 1
             )),
-            Some(p) => {
-                karty.pridej(p);
-            }
+            Some(p) => maska |= 1 << p.index(),
         }
     }
-    karty
+    Some(maska)
+}
+
+/// `karty` ze souboru (viz [`pady_z`]). Chybějící klíč = jen ovladač 1;
+/// ovladač 1 a ovladače s klávesami doplní volající.
+fn karty_z(o: &Map<String, Value>, varovani: &mut Vec<String>) -> Karty {
+    Karty(pady_z(o, "karty", varovani).unwrap_or(0) | Karty::PRVNI.0)
+}
+
+/// `rozbalene` ze souboru (viz [`pady_z`]) — jen ovladače s kartou;
+/// rozbalený ovladač bez karty se vynechá s varováním. Chybějící klíč =
+/// rozbalený ovladač 1, `[]` = vše sbalené.
+fn rozbalene_z(o: &Map<String, Value>, karty: Karty, varovani: &mut Vec<String>) -> Rozbalene {
+    let Some(maska) = pady_z(o, "rozbalene", varovani) else {
+        return Rozbalene::PRVNI;
+    };
+    let r = Rozbalene(maska);
+    for p in r.pady().filter(|&p| !karty.ma(p)) {
+        varovani.push(format!(
+            "rozbalene: ovladač {} nemá kartu — vynechán",
+            p.index() + 1
+        ));
+    }
+    r.jen(karty)
+}
+
+/// `sdilene_klavesy` ze souboru. Jiný typ než `true`/`false` soubor
+/// nevalidním nedělá (volba platnost vazeb neovlivňuje): platí výchozí
+/// `false` a varování jde do logu.
+fn sdilene_z(o: &Map<String, Value>, varovani: &mut Vec<String>) -> bool {
+    match klic(o, "sdilene_klavesy") {
+        None => false,
+        Some(v) => v.as_bool().unwrap_or_else(|| {
+            varovani.push("„sdilene_klavesy“ musí být true nebo false — vypnuto".into());
+            false
+        }),
+    }
 }
 
 /// Text souboru → konfigurace. Čistá funkce; obsah hlídají pravidla jádra
@@ -425,7 +530,7 @@ pub fn z_textu(text: &str) -> Result<Konfigurace, ChybaKonfigurace> {
 }
 
 /// [`z_textu`] i s varováními k položkám, které se vynechaly, aniž by byl
-/// soubor nevalidní (karty) — pro log.
+/// soubor nevalidní (karty, rozbalené karty, volba sdílení) — pro log.
 pub fn z_textu_s_varovanim(text: &str) -> Result<(Konfigurace, Vec<String>), ChybaKonfigurace> {
     // Poznámkový blok starších Windows ukládá UTF-8 s BOM; JSON ho nezná.
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
@@ -462,6 +567,7 @@ pub fn z_textu_s_varovanim(text: &str) -> Result<(Konfigurace, Vec<String>), Chy
     let mut chyby = Vec::new();
     let mut varovani = Vec::new();
     let karty = karty_z(o, &mut varovani);
+    let sdilene_klavesy = sdilene_z(o, &mut varovani);
     let mut c = Cteni {
         chyby: &mut chyby,
         vazba: None,
@@ -544,16 +650,20 @@ pub fn z_textu_s_varovanim(text: &str) -> Result<(Konfigurace, Vec<String>), Chy
         }
     }
 
-    // Se zkratkou, která nejde přečíst, se pravidla jádra (duplicity,
-    // Win…) ověří s výchozí — chyba zkratky už je v seznamu.
+    // Se zkratkou, která nejde přečíst, se pravidla jádra (víc než 4 vstupy
+    // jedné klávesy, Win…) ověří s výchozí — chyba zkratky už je v seznamu.
+    // Tatáž klávesa u víc vstupů je sdílená klávesa (Fáze 7), ne chyba.
     match Mapping::new(zkratka.unwrap_or(KeyId::SCROLL_LOCK), vazby) {
         Ok(mapovani) if chyby.is_empty() => {
             let karty = karty.s_klavesami(&mapovani);
+            let rozbalene = rozbalene_z(o, karty, &mut varovani);
             Ok((
                 Konfigurace {
                     mapovani,
                     zvuk,
+                    sdilene_klavesy,
                     karty,
+                    rozbalene,
                 },
                 varovani,
             ))
@@ -576,7 +686,8 @@ pub fn z_textu_s_varovanim(text: &str) -> Result<(Konfigurace, Vec<String>), Chy
 }
 
 /// Konfigurace → text souboru. Čistá funkce; vazby v pořadí
-/// [`Mapping::bindings`], takže stejný obsah dá vždy stejný text.
+/// [`Mapping::bindings`] (klávesa, pak ovladač a `Action::index` — sdílená
+/// klávesa na víc řádcích), takže stejný obsah dá vždy stejný text.
 ///
 /// Píše se ručně, ne serializérem: tvar je pevný (celá čísla,
 /// `true`/`false`, kódy vstupů z `[a-z0-9_]` a poznámka bez znaků
@@ -587,21 +698,24 @@ pub fn do_textu(k: &Konfigurace) -> String {
     let z = m.toggle_key();
     // Od 1 jako „ovladac" ve vazbách; ovladače s klávesami vždy (stejně
     // jako po načtení), ať stejný obsah dá vždy stejný text.
-    let karty: Vec<String> = k
-        .karty
-        .s_klavesami(m)
-        .pady()
-        .map(|p| (p.index() + 1).to_string())
-        .collect();
+    let karty = k.karty.s_klavesami(m);
+    let cisla = |pady: &mut dyn Iterator<Item = PadId>| -> String {
+        pady.map(|p| (p.index() + 1).to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let karty_text = cisla(&mut karty.pady());
+    let rozbalene_text = cisla(&mut k.rozbalene.jen(karty).pady());
+    // Sdílenou klávesu by KeyPad do …2007 vzal za chybu a soubor odložil;
+    // `verze` 2 ho nechá soubor jen číst a neukládat (OQ 61).
+    let verze = if m.has_shared() { VERZE } else { VERZE_ZAKLAD };
     // Zápis do `String` selhat nemůže.
     let _ = write!(
         s,
-        "{{{NL}  \"poznamka\": \"{POZNAMKA}\",{NL}  \"verze\": {VERZE},{NL}  \"zvuk\": {},{NL}  \
-         \"zkratka\": {{ \"scan\": {}, \"e0\": {} }},{NL}  \"karty\": [{}],{NL}  \"vazby\": [",
-        k.zvuk,
-        z.scan,
-        z.extended,
-        karty.join(", ")
+        "{{{NL}  \"poznamka\": \"{POZNAMKA}\",{NL}  \"verze\": {verze},{NL}  \"zvuk\": {},{NL}  \
+         \"sdilene_klavesy\": {},{NL}  \"zkratka\": {{ \"scan\": {}, \"e0\": {} }},{NL}  \
+         \"karty\": [{karty_text}],{NL}  \"rozbalene\": [{rozbalene_text}],{NL}  \"vazby\": [",
+        k.zvuk, k.sdilene_klavesy, z.scan, z.extended,
     );
     for (i, (klavesa, cil)) in m.bindings().enumerate() {
         let _ = write!(
@@ -654,24 +768,33 @@ pub fn nacti(cesta: &Path) -> Nacteno {
     match vysledek {
         Ok((konfigurace, varovani)) => {
             let n = pocty(&konfigurace.mapovani);
-            let karty: Vec<String> = konfigurace
-                .karty
-                .pady()
-                .map(|p| (p.index() + 1).to_string())
-                .collect();
+            let cisla = |pady: &mut dyn Iterator<Item = PadId>| -> String {
+                pady.map(|p| (p.index() + 1).to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let ano_ne = |b: bool| if b { "ano" } else { "ne" };
             log::info!(
-                "konfigurace: načteno {} vazeb (ovladače 1–4: {}/{}/{}/{}), karty {}, zvuk {}",
+                "konfigurace: načteno {} vazeb (ovladače 1–4: {}/{}/{}/{}, sdílené klávesy {}), \
+                 karty {} (rozbalené {}), zvuk {}, jedna klávesa pro víc vstupů {}",
                 konfigurace.mapovani.len(),
                 n[0],
                 n[1],
                 n[2],
                 n[3],
-                karty.join(", "),
+                konfigurace
+                    .mapovani
+                    .keys()
+                    .filter(|(_, s)| s.len() > 1)
+                    .count(),
+                cisla(&mut konfigurace.karty.pady()),
+                cisla(&mut konfigurace.rozbalene.pady()),
                 if konfigurace.zvuk {
                     "zapnutý"
                 } else {
                     "vypnutý"
-                }
+                },
+                ano_ne(konfigurace.sdilene_klavesy)
             );
             for v in varovani.iter().take(MAX_CHYB_V_LOGU) {
                 log::warn!("konfigurace: {v}");
@@ -1154,7 +1277,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use keypad_core::{PadButton, StickDir};
+    use keypad_core::{KeyConflict, PadButton, StickDir, Targets};
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -1216,26 +1339,69 @@ mod tests {
     }
 
     /// Ovladač 1 bez W a s F12, ovladač 2 s W a numerickou 8, ovladač 4
-    /// se šipkou (E0), jiná zkratka, vypnutý zvuk.
+    /// se šipkou (E0), jiná zkratka, vypnutý zvuk, zapnutá volba sdílení,
+    /// rozbalené karty 1 a 4.
     fn vice_ovladacu() -> Konfigurace {
         let mut m = Mapping::default();
-        m.bind(KeyId::W, cil(1, Action::LeftStick(StickDir::Up)))
-            .unwrap();
-        m.bind(KeyId::NUMPAD_8, cil(1, Action::Button(PadButton::A)))
-            .unwrap();
-        m.bind(KeyId::ARROW_UP, cil(3, Action::RightTrigger))
-            .unwrap();
-        m.bind(KeyId::new(0x58), cil(0, Action::LeftStick(StickDir::Up)))
-            .unwrap();
+        m.bind(
+            KeyId::W,
+            cil(1, Action::LeftStick(StickDir::Up)),
+            KeyConflict::Move,
+        )
+        .unwrap();
+        m.bind(
+            KeyId::NUMPAD_8,
+            cil(1, Action::Button(PadButton::A)),
+            KeyConflict::Move,
+        )
+        .unwrap();
+        m.bind(
+            KeyId::ARROW_UP,
+            cil(3, Action::RightTrigger),
+            KeyConflict::Move,
+        )
+        .unwrap();
+        m.bind(
+            KeyId::new(0x58),
+            cil(0, Action::LeftStick(StickDir::Up)),
+            KeyConflict::Move,
+        )
+        .unwrap();
         m.set_toggle_key(KeyId::new(0x45)).unwrap();
         // Karta ovladače 3 bez kláves (přidaná „+ Ovladač").
         let mut karty = Karty::PRVNI.s_klavesami(&m);
         karty.pridej(PadId::new(2).unwrap());
+        let mut rozbalene = Rozbalene::PRVNI;
+        rozbalene.nastav(PadId::new(3).unwrap(), true);
         Konfigurace {
             mapovani: m,
             zvuk: false,
+            sdilene_klavesy: true,
             karty,
+            rozbalene,
         }
+    }
+
+    /// [`vice_ovladacu`] se sdílenými klávesami: W i jako levá páčka
+    /// nahoru ovladače 3 a mezerník za čtyři vstupy (strop).
+    fn sdilene() -> Konfigurace {
+        let mut k = vice_ovladacu();
+        let m = &mut k.mapovani;
+        m.bind(
+            KeyId::W,
+            cil(2, Action::LeftStick(StickDir::Up)),
+            KeyConflict::Share,
+        )
+        .unwrap();
+        for p in 1..4 {
+            m.bind(
+                KeyId::SPACE,
+                cil(p, Action::Button(PadButton::A)),
+                KeyConflict::Share,
+            )
+            .unwrap();
+        }
+        k
     }
 
     fn neplatna(text: &str) -> Vec<ChybaObsahu> {
@@ -1274,6 +1440,8 @@ mod tests {
         let v: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["verze"], 1);
         assert_eq!(v["zvuk"], true);
+        assert_eq!(v["sdilene_klavesy"], false);
+        assert_eq!(v["rozbalene"], json!([1]));
         assert_eq!(v["zkratka"], json!({ "scan": 70, "e0": false }));
         assert_eq!(v["poznamka"], POZNAMKA);
         assert_eq!(v["vazby"].as_array().unwrap().len(), 24);
@@ -1295,8 +1463,14 @@ mod tests {
         let text = do_textu(&k);
         assert_eq!(z_textu(&text), Ok(k));
         assert!(text.contains("\"zvuk\": false"));
+        assert!(text.contains("\"sdilene_klavesy\": true,"));
         assert!(text.contains("\"zkratka\": { \"scan\": 69, \"e0\": false }"));
         assert!(text.contains("\"karty\": [1, 2, 3, 4],"));
+        assert!(text.contains("\"rozbalene\": [1, 4],"));
+        assert!(
+            text.contains("\"verze\": 1,"),
+            "bez sdílené klávesy verze 1"
+        );
         assert!(text.contains("{ \"ovladac\": 4, \"vstup\": \"rt\", \"scan\": 72, \"e0\": true }"));
         assert!(text.contains("{ \"ovladac\": 2, \"vstup\": \"a\", \"scan\": 72, \"e0\": false }"));
     }
@@ -1356,7 +1530,7 @@ mod tests {
         assert!(varovani[1].contains("\"3\""), "{varovani:?}");
         assert!(varovani[3].contains("ovladač 2 podruhé"), "{varovani:?}");
         assert_eq!(
-            k.mapovani.target(KeyId::SPACE),
+            k.mapovani.targets(KeyId::SPACE).first(),
             Some(cil(0, Action::Button(PadButton::A)))
         );
         // Úplně špatný tvar: jedno varování, platí ovladač 1.
@@ -1395,10 +1569,16 @@ mod tests {
         // dostane i bez zápisu v `karty`.
         let mut karty = Karty::PRVNI;
         karty.pridej(PadId::new(1).unwrap());
+        // Rozbalené: 1 a 3; 4 karta nemá, a tak se nezapíše.
+        let mut rozbalene = Rozbalene::PRVNI;
+        rozbalene.nastav(PadId::new(2).unwrap(), true);
+        rozbalene.nastav(PadId::new(3).unwrap(), true);
         let text = do_textu(&Konfigurace {
             mapovani: m,
             zvuk: true,
+            sdilene_klavesy: false,
             karty,
+            rozbalene,
         });
         let cekam = [
             "{",
@@ -1406,8 +1586,10 @@ mod tests {
              nevalidní se přejmenuje na config.invalid.json a platí výchozí klávesy.\",",
             "  \"verze\": 1,",
             "  \"zvuk\": true,",
+            "  \"sdilene_klavesy\": false,",
             "  \"zkratka\": { \"scan\": 70, \"e0\": false },",
             "  \"karty\": [1, 2, 3],",
+            "  \"rozbalene\": [1, 3],",
             "  \"vazby\": [",
             "    { \"ovladac\": 3, \"vstup\": \"ls_up\", \"scan\": 17, \"e0\": false },",
             "    { \"ovladac\": 1, \"vstup\": \"rs_up\", \"scan\": 72, \"e0\": true }",
@@ -1417,6 +1599,164 @@ mod tests {
         ]
         .join("\r\n");
         assert_eq!(text, cekam);
+    }
+
+    /// Sdílená klávesa (Fáze 7): platná, zapíše se jako víc vazeb téže
+    /// klávesy v kanonickém pořadí (ovladač, pak `Action::index`) a soubor
+    /// dostane `verze` 2 — KeyPad do …2007 by ji vzal za duplicitu a soubor
+    /// odložil (OQ 61). Bez sdílené klávesy zase `verze` 1.
+    #[test]
+    fn sdilena_klavesa_je_platna_a_pise_verzi_2() {
+        let k = sdilene();
+        let text = do_textu(&k);
+        assert!(text.contains("\"verze\": 2,"), "{text}");
+        assert_eq!(z_textu(&text), Ok(k.clone()));
+        assert_eq!(
+            k.mapovani.targets(KeyId::SPACE).len(),
+            4,
+            "mezerník za čtyři vstupy"
+        );
+        let mezernik = [
+            "    { \"ovladac\": 1, \"vstup\": \"a\", \"scan\": 57, \"e0\": false },",
+            "    { \"ovladac\": 2, \"vstup\": \"a\", \"scan\": 57, \"e0\": false },",
+            "    { \"ovladac\": 3, \"vstup\": \"a\", \"scan\": 57, \"e0\": false },",
+            "    { \"ovladac\": 4, \"vstup\": \"a\", \"scan\": 57, \"e0\": false }",
+        ]
+        .join("\r\n");
+        assert!(text.contains(&mezernik), "{text}");
+        // Sdílení zmizí → verze 1.
+        let mut bez = k.clone();
+        for p in 1..4 {
+            bez.mapovani
+                .unbind_target(cil(p, Action::Button(PadButton::A)))
+                .unwrap();
+        }
+        bez.mapovani
+            .unbind_target(cil(2, Action::LeftStick(StickDir::Up)))
+            .unwrap();
+        assert!(!bez.mapovani.has_shared());
+        assert!(do_textu(&bez).contains("\"verze\": 1,"));
+        // Verze 1 se sdílenou klávesou (ruční úprava) se přečte taky.
+        let v1 = text.replace("\"verze\": 2,", "\"verze\": 1,");
+        assert_eq!(z_textu(&v1), Ok(k));
+    }
+
+    /// Tatáž množina vazeb v jiném pořadí dá stejné mapování i stejný
+    /// text souboru (kanonické pořadí `Targets`).
+    #[test]
+    fn stejna_mnozina_vazeb_v_jinem_poradi_da_stejny_text() {
+        let k = sdilene();
+        let text = do_textu(&k);
+        let mut v: Value = serde_json::from_str(&text).unwrap();
+        let vazby = v["vazby"].as_array_mut().unwrap();
+        vazby.reverse();
+        vazby.rotate_left(3);
+        let prehazeny = serde_json::to_string(&v).unwrap();
+        let zpet = z_textu(&prehazeny).unwrap();
+        assert_eq!(zpet, k);
+        assert_eq!(do_textu(&zpet), text);
+    }
+
+    /// Víc než 4 různé vstupy jedné klávesy = nevalidní soubor; tentýž
+    /// vstup dvakrát se jen sloučí.
+    #[test]
+    fn pet_vstupu_jedne_klavesy_je_nevalidni() {
+        let c = neplatna(&s_vazbami(&[
+            (1, "a", 0x39, false),
+            (2, "a", 0x39, false),
+            (3, "a", 0x39, false),
+            (4, "a", 0x39, false),
+            (1, "b", 0x39, false),
+        ]));
+        assert_eq!(
+            c,
+            vec![ChybaObsahu::Mapovani(MappingError::TooManyTargets {
+                key: KeyId::SPACE
+            })]
+        );
+        assert!(c[0].to_string().contains("víc než 4"), "{}", c[0]);
+        let k = z_textu(&s_vazbami(&[
+            (1, "a", 0x39, false),
+            (2, "a", 0x39, false),
+            (1, "a", 0x39, false),
+        ]))
+        .unwrap();
+        assert_eq!(k.mapovani.targets(KeyId::SPACE).len(), 2);
+    }
+
+    /// `sdilene_klavesy`: chybí → vypnuto; jiný typ → vypnuto s varováním,
+    /// soubor zůstává platný (volba vazby neovlivňuje).
+    #[test]
+    fn volba_sdilenych_klaves() {
+        let mut v: Value = serde_json::from_str(&s_vazbami(&[(1, "a", 57, false)])).unwrap();
+        let (k, varovani) = z_textu_s_varovanim(&v.to_string()).unwrap();
+        assert!(!k.sdilene_klavesy);
+        assert!(varovani.is_empty(), "{varovani:?}");
+        v["sdilene_klavesy"] = json!(true);
+        assert!(z_textu(&v.to_string()).unwrap().sdilene_klavesy);
+        for spatne in [json!("ano"), json!(1), json!([true])] {
+            v["sdilene_klavesy"] = spatne.clone();
+            let (k, varovani) = z_textu_s_varovanim(&v.to_string()).unwrap();
+            assert!(!k.sdilene_klavesy, "{spatne}");
+            assert_eq!(varovani.len(), 1, "{spatne}: {varovani:?}");
+            assert!(varovani[0].contains("sdilene_klavesy"), "{varovani:?}");
+        }
+        v["sdilene_klavesy"] = Value::Null;
+        assert!(!z_textu(&v.to_string()).unwrap().sdilene_klavesy);
+        // Tam a zpět.
+        let k = Konfigurace {
+            sdilene_klavesy: true,
+            ..Konfigurace::default()
+        };
+        assert_eq!(z_textu(&do_textu(&k)), Ok(k));
+    }
+
+    /// `rozbalene` (OQ 70): chybí → rozbalený ovladač 1; `[]` → vše
+    /// sbalené; chybná položka, duplicita i ovladač bez karty se vynechají
+    /// s varováním, soubor zůstává platný.
+    #[test]
+    fn rozbalene_karty() {
+        let p = |i| PadId::new(i).unwrap();
+        let mut v: Value =
+            serde_json::from_str(&s_vazbami(&[(1, "a", 57, false), (3, "b", 46, false)])).unwrap();
+        let k = z_textu(&v.to_string()).unwrap();
+        assert_eq!(k.rozbalene, Rozbalene::PRVNI, "chybí → ovladač 1");
+        v["rozbalene"] = json!([]);
+        let k = z_textu(&v.to_string()).unwrap();
+        assert_eq!(k.rozbalene, Rozbalene::ZADNA);
+        assert!(do_textu(&k).contains("\"rozbalene\": [],"));
+        v["rozbalene"] = json!([3, 1, "2", 0, 3, 2, 9]);
+        let (k, varovani) = z_textu_s_varovanim(&v.to_string()).unwrap();
+        assert_eq!(
+            k.rozbalene.pady().map(PadId::index).collect::<Vec<_>>(),
+            [0, 2]
+        );
+        // "2", 0, 9 nejsou ovladač; 3 podruhé; 2 nemá kartu.
+        assert_eq!(varovani.len(), 5, "{varovani:?}");
+        assert!(
+            varovani.iter().any(|w| w.contains("ovladač 2 nemá kartu")),
+            "{varovani:?}"
+        );
+        assert!(
+            varovani.iter().any(|w| w.contains("ovladač 3 podruhé")),
+            "{varovani:?}"
+        );
+        v["rozbalene"] = json!("vse");
+        let (k, varovani) = z_textu_s_varovanim(&v.to_string()).unwrap();
+        assert_eq!(k.rozbalene, Rozbalene::PRVNI);
+        assert_eq!(varovani.len(), 1);
+        // Tam a zpět se všemi čtyřmi kartami rozbalenými.
+        let mut k = vice_ovladacu();
+        for i in 0..4 {
+            k.rozbalene.nastav(p(i), true);
+        }
+        let text = do_textu(&k);
+        assert!(text.contains("\"rozbalene\": [1, 2, 3, 4],"), "{text}");
+        assert_eq!(z_textu(&text), Ok(k));
+        // Sbalit i ovladač 1 jde.
+        let mut r = Rozbalene::PRVNI;
+        assert!(r.nastav(PadId::FIRST, false) && !r.nastav(PadId::FIRST, false));
+        assert_eq!(r, Rozbalene::ZADNA);
     }
 
     #[test]
@@ -1445,7 +1785,7 @@ mod tests {
         assert!(k.zvuk);
         assert_eq!(k.mapovani.toggle_key(), KeyId::SCROLL_LOCK);
         assert_eq!(
-            k.mapovani.target(KeyId::SPACE),
+            k.mapovani.targets(KeyId::SPACE).first(),
             Some(cil(0, Action::Button(PadButton::A)))
         );
         // e0 chybí = běžná klávesa; null = chybí.
@@ -1453,7 +1793,7 @@ mod tests {
             "vazby":[{"ovladac":1,"vstup":"b","scan":46,"e0":null}]}"#;
         let k = z_textu(bez_e0).unwrap();
         assert_eq!(
-            k.mapovani.target(KeyId::C),
+            k.mapovani.targets(KeyId::C).first(),
             Some(cil(0, Action::Button(PadButton::B)))
         );
         assert_eq!(k.mapovani.toggle_key(), KeyId::SCROLL_LOCK);
@@ -1510,12 +1850,17 @@ mod tests {
                 }]
             );
         }
-        // Duplicita: jedna klávesa na dvou vstupech.
-        let c = neplatna(&s_vazbami(&[(1, "a", 0x39, false), (2, "b", 0x39, false)]));
-        assert!(matches!(
-            c[..],
-            [ChybaObsahu::Mapovani(MappingError::DuplicateKey { .. })]
-        ));
+        // Jedna klávesa na dvou vstupech je sdílená klávesa (Fáze 7) —
+        // platná; nevalidní je až pátý vstup.
+        let k = z_textu(&s_vazbami(&[(1, "a", 0x39, false), (2, "b", 0x39, false)])).unwrap();
+        assert_eq!(
+            k.mapovani.targets(KeyId::SPACE),
+            Targets::from_targets([
+                cil(0, Action::Button(PadButton::A)),
+                cil(1, Action::Button(PadButton::B))
+            ])
+            .unwrap()
+        );
         // Neznámý vstup — a „prázdné" se k němu nepřidá.
         let c = neplatna(&s_vazbami(&[(1, "ls_upp", 0x11, false)]));
         assert_eq!(
@@ -1625,8 +1970,11 @@ mod tests {
     fn novejsi_verze_se_pozna_pred_obsahem() {
         // Soubor z budoucnosti smí mít úplně jiný tvar — nesmí skončit
         // jako nevalidní (to by ho zálohovalo a přepsalo).
-        let t = r#"{"verze":2,"vazby":"jinak","zvuk":3}"#;
-        assert_eq!(z_textu(t), Err(ChybaKonfigurace::Novejsi { verze: 2 }));
+        let t = r#"{"verze":3,"vazby":"jinak","zvuk":3}"#;
+        assert_eq!(z_textu(t), Err(ChybaKonfigurace::Novejsi { verze: 3 }));
+        // Verze 2 (sdílené klávesy, Fáze 7) se čte.
+        let v2 = s_vazbami(&[(1, "a", 57, false)]).replace("\"verze\":1", "\"verze\":2");
+        assert!(z_textu(&v2).is_ok(), "{v2}");
     }
 
     #[test]
@@ -1647,8 +1995,14 @@ mod tests {
             ("win", s_vazbami(&[(1, "a", 0x5B, true)])),
             ("ovladac5", s_vazbami(&[(5, "a", 0x39, false)])),
             (
-                "duplicita",
-                s_vazbami(&[(1, "a", 0x39, false), (1, "b", 0x39, false)]),
+                "pet-vstupu",
+                s_vazbami(&[
+                    (1, "a", 0x39, false),
+                    (1, "b", 0x39, false),
+                    (1, "x", 0x39, false),
+                    (1, "y", 0x39, false),
+                    (2, "a", 0x39, false),
+                ]),
             ),
             ("vstup", s_vazbami(&[(1, "skok", 0x39, false)])),
             (
@@ -1806,7 +2160,7 @@ mod tests {
     #[test]
     fn novejsi_soubor_zustane_nedotceny() {
         let s = Slozka::nova("novejsi");
-        let obsah = br#"{"verze": 2, "zvuk": true, "vazby": [{"ovladac": "P1"}]}"#;
+        let obsah = br#"{"verze": 3, "zvuk": true, "vazby": [{"ovladac": "P1"}]}"#;
         std::fs::write(s.konfigurace(), obsah).unwrap();
         let n = nacti(&s.konfigurace());
         assert_eq!(n.stav, StavKonfigurace::Novejsi);

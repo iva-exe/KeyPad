@@ -17,10 +17,11 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use keypad_core::{
-    Action, ActionSet, BindingCancel, Decision, DisabledReason, ForceReason, LiveInputs, Mapping,
-    Mode, ModeCause, PadId, UiEvent, MAX_PADS,
+    Action, ActionSet, BindTarget, BindingCancel, Decision, DisabledReason, ForceReason,
+    LiveInputs, Mapping, Mode, ModeCause, PadId, UiEvent, MAX_PADS,
 };
-use serde::Serialize;
+use serde::ser::SerializeMap;
+use serde::{Serialize, Serializer};
 
 use super::hook::{Udalost, Vystup};
 use super::slot::{Budik, StavSlot};
@@ -61,6 +62,28 @@ impl CilInfo {
     }
 }
 
+/// Co se právě přiřazuje — pro okno (`RezimInfo::cil`): vstup ovladače
+/// (`{ pad, vstup }`), nebo zkratka pozastavení (`{ "zkratka": true }`,
+/// Fáze 7 Z6 — čepička „Pauza“ v ⓘ).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CilRezimu {
+    Vstup(CilInfo),
+    Zkratka,
+}
+
+impl Serialize for CilRezimu {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            CilRezimu::Vstup(c) => c.serialize(s),
+            CilRezimu::Zkratka => {
+                let mut m = s.serialize_map(Some(1))?;
+                m.serialize_entry("zkratka", &true)?;
+                m.end()
+            }
+        }
+    }
+}
+
 /// Režim pro okno s pořadovým číslem změny: odpověď příkazu `rezim`
 /// a událost se můžou předběhnout — okno si nechá novější.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -68,7 +91,7 @@ pub struct RezimInfo {
     pub rezim: Rezim,
     pub seq: u64,
     /// Co se právě přiřazuje (jen v `binding`).
-    pub cil: Option<CilInfo>,
+    pub cil: Option<CilRezimu>,
     /// Windows nedovolily hook klávesnice. I bez zapnutého ovladače:
     /// okno v popředí pak neukáže živé klávesy a musí říct proč.
     pub hook_chyba: bool,
@@ -130,6 +153,11 @@ pub enum Pricina {
     OvladacChyba,
     /// Konec přiřazování klávesy (uloženo, Esc, časový limit, okno).
     Prirazovani,
+    /// Zachytávání spustil přepínač ovladače v okně (Fáze 7) — na rozdíl
+    /// od „Pokračovat“ v nabídce ikony (`Okno`) nikdy nepípá. Engine
+    /// o zdroji neví (oba posílají `capture()`); příčinu dodá hook vlákno
+    /// podle `HookPrikaz::Zachytavej { zdroj }`.
+    Prepinac,
     /// Pojistka (watchdog, zamčení, UAC, spánek…).
     Vynuceno(ForceReason),
 }
@@ -181,6 +209,7 @@ impl Pricina {
             Pricina::Ovladac => 3,
             Pricina::Prirazovani => 4,
             Pricina::OvladacChyba => 5,
+            Pricina::Prepinac => 6,
             Pricina::Vynuceno(r) => 8 + r.index() as u64,
         }
     }
@@ -193,6 +222,7 @@ impl Pricina {
             3 => Pricina::Ovladac,
             4 => Pricina::Prirazovani,
             5 => Pricina::OvladacChyba,
+            6 => Pricina::Prepinac,
             _ => k
                 .checked_sub(8)
                 .and_then(|i| ForceReason::ALL.get(i as usize))
@@ -218,25 +248,41 @@ const SEQ_POSUN: u32 = 20;
 /// vidět, i když režim zůstal „přiřazuji".
 const OBSAH: u64 = REZIM | CHYBA | CIL;
 
+/// Kód „akce“ zkratky pozastavení v poli cíle (Fáze 7, Z6): pole je plně
+/// obsazené (ovladač 2 bity, akce 5 bitů), akcí je 24 — 31 nikdy není
+/// vstup (hlídá test).
+const KOD_ZKRATKY: u64 = 31;
+
 /// Cíl přiřazování do bitů 12–19 atomiku `stav`; mimo přiřazování 0.
 fn kod_cile(m: Mode) -> u64 {
     match m {
-        Mode::Binding { target, .. } => {
-            (1 | (target.pad.index() as u64) << 1 | (target.action.index() as u64) << 3)
-                << CIL_POSUN
-        }
+        Mode::Binding {
+            target: BindTarget::Input(t),
+            ..
+        } => (1 | (t.pad.index() as u64) << 1 | (t.action.index() as u64) << 3) << CIL_POSUN,
+        Mode::Binding {
+            target: BindTarget::Toggle,
+            ..
+        } => (1 | KOD_ZKRATKY << 3) << CIL_POSUN,
         _ => 0,
     }
 }
 
-fn cil_z_kodu(s: u64) -> Option<CilInfo> {
+fn cil_z_kodu(s: u64) -> Option<CilRezimu> {
     let c = (s & CIL) >> CIL_POSUN;
     if c & 1 == 0 {
         return None;
     }
-    let pad = PadId::new((c >> 1 & 0b11) as usize)?;
-    let action = Action::from_index((c >> 3) as usize)?;
-    Some(CilInfo::z(keypad_core::PadAction::new(pad, action)))
+    let pad = c >> 1 & 0b11;
+    let akce = c >> 3;
+    if akce == KOD_ZKRATKY {
+        return (pad == 0).then_some(CilRezimu::Zkratka);
+    }
+    let pad = PadId::new(pad as usize)?;
+    let action = Action::from_index(akce as usize)?;
+    Some(CilRezimu::Vstup(CilInfo::z(keypad_core::PadAction::new(
+        pad, action,
+    ))))
 }
 
 // Schránka oznámení: 0–47 `UiEvent::pack` | 48–63 pořadí (přetéká).
@@ -372,21 +418,38 @@ impl HookVystup {
     }
 }
 
-impl Vystup for HookVystup {
-    fn rozhodnuti(&self, _u: Option<&Udalost>, d: &Decision, rezim: Mode) {
+impl HookVystup {
+    /// Rozhodnutí enginu → sloty padů, stav (s příčinou) a oznámení.
+    fn zapis(&self, d: &Decision, rezim: Mode, pricina: Pricina) {
         for (pad, stav) in d.pads.iter() {
             if let Some(slot) = self.sloty.get(pad.index()) {
                 slot.zapis(stav);
             }
         }
         let kod = Rezim::z(rezim).kod() | kod_cile(rezim);
-        self.zmen(Pricina::z_udalosti(d.ui), |s| s & CHYBA | kod);
+        self.zmen(pricina, |s| s & CHYBA | kod);
         // Až po režimu: vlákno okna čte oznámení dřív než režim, takže
         // kdo vidí nové oznámení, vidí i režim, který k němu patří, a
         // okno dostane `rezim` vždy před `oznameni` (spec B4).
         if let Some(obsah) = d.ui.and_then(|u| u.pack()) {
             self.oznam(obsah);
         }
+    }
+}
+
+impl Vystup for HookVystup {
+    fn rozhodnuti(&self, _u: Option<&Udalost>, d: &Decision, rezim: Mode) {
+        self.zapis(d, rezim, Pricina::z_udalosti(d.ui));
+    }
+
+    /// Změna režimu od přepínače dostane příčinu `Prepinac` (nepípá);
+    /// cokoli jiného, co by příkaz přepínače vydal (nic), jako obvykle.
+    fn rozhodnuti_prepinace(&self, d: &Decision, rezim: Mode) {
+        let pricina = match d.ui {
+            Some(UiEvent::ModeChanged { .. }) => Pricina::Prepinac,
+            ui => Pricina::z_udalosti(ui),
+        };
+        self.zapis(d, rezim, pricina);
     }
 
     fn hook_chyba(&self, chyba: bool) {
@@ -523,7 +586,7 @@ mod tests {
     fn cil_prirazovani_v_atomiku_stav() {
         let (v, _sloty, budik) = vystup();
         let binding = |pad: usize, a: Action| Mode::Binding {
-            target: PadAction::new(PadId::new(pad).unwrap(), a),
+            target: PadAction::new(PadId::new(pad).unwrap(), a).into(),
             started_at_ms: 5,
         };
         v.rozhodnuti(
@@ -533,17 +596,20 @@ mod tests {
         );
         let i = v.info();
         assert_eq!(i.rezim, Rezim::Binding);
-        assert_eq!(i.cil, Some(CilInfo { pad: 1, vstup: "a" }));
+        assert_eq!(
+            i.cil,
+            Some(CilRezimu::Vstup(CilInfo { pad: 1, vstup: "a" }))
+        );
         assert!(budik.cekej(Some(0)));
         // Jiný cíl = nové číslo, i když režim zůstává.
         v.rozhodnuti(None, &Decision::NONE, binding(3, Action::RightTrigger));
         assert_eq!(v.info().seq, i.seq + 1);
         assert_eq!(
             v.info().cil,
-            Some(CilInfo {
+            Some(CilRezimu::Vstup(CilInfo {
                 pad: 3,
                 vstup: "rt"
-            })
+            }))
         );
         // Všechny cíle tam a zpět.
         for pad in PadId::ALL {
@@ -551,10 +617,27 @@ mod tests {
                 v.rozhodnuti(None, &Decision::NONE, binding(pad.index(), a));
                 assert_eq!(
                     v.info().cil,
-                    Some(CilInfo::z(PadAction::new(pad, a))),
+                    Some(CilRezimu::Vstup(CilInfo::z(PadAction::new(pad, a)))),
                     "{pad:?} {a:?}"
                 );
             }
+        }
+        // Zkratka pozastavení (Z6): kód akce 31 s ovladačem 0 — jako vstup
+        // se nikdy nepřečte (akcí je 24), jiný ovladač s 31 není nic.
+        assert!(Action::COUNT < KOD_ZKRATKY as usize);
+        let zkratka = Mode::Binding {
+            target: BindTarget::Toggle,
+            started_at_ms: 5,
+        };
+        v.rozhodnuti(None, &Decision::NONE, zkratka);
+        assert_eq!(v.info().cil, Some(CilRezimu::Zkratka));
+        assert_eq!(
+            serde_json::to_value(v.info().cil).unwrap(),
+            serde_json::json!({ "zkratka": true })
+        );
+        for pad in 1..4u64 {
+            let c = (1 | pad << 1 | KOD_ZKRATKY << 3) << CIL_POSUN;
+            assert_eq!(cil_z_kodu(c), None, "ovladač {pad} se zkratkou");
         }
         v.rozhodnuti(None, &Decision::NONE, Mode::Keyboard);
         assert_eq!(v.info().cil, None);
@@ -579,13 +662,17 @@ mod tests {
         let mut udalosti = vec![
             UiEvent::BindingSaved {
                 key: KeyId::W,
-                target: a,
+                target: a.into(),
                 moved_from: None,
+                moved_more: 0,
+                shared: 0,
             },
             UiEvent::BindingSaved {
                 key: KeyId::ext(0x48),
-                target: a,
+                target: a.into(),
                 moved_from: Some(PadAction::first(Action::Button(PadButton::Y))),
+                moved_more: 0,
+                shared: 0,
             },
             UiEvent::ToggleRejected {
                 reason: ToggleReject::Binding,
@@ -736,8 +823,10 @@ mod tests {
         let ulozeno = Decision {
             ui: Some(UiEvent::BindingSaved {
                 key: KeyId::W,
-                target: PadAction::first(Action::Button(PadButton::A)),
+                target: PadAction::first(Action::Button(PadButton::A)).into(),
                 moved_from: Some(PadAction::first(Action::Button(PadButton::B))),
+                moved_more: 0,
+                shared: 0,
             }),
             ..d
         };
@@ -745,7 +834,7 @@ mod tests {
         set.insert(Action::Button(PadButton::A));
         let zive = [LiveInputs::new(set, (1, -1), (0, 1)); MAX_PADS];
         let binding = Mode::Binding {
-            target: PadAction::first(Action::Button(PadButton::X)),
+            target: PadAction::first(Action::Button(PadButton::X)).into(),
             started_at_ms: 0,
         };
         let pred = crate::testy_alokace::pocet();
@@ -769,6 +858,7 @@ mod tests {
             Pricina::Ovladac,
             Pricina::OvladacChyba,
             Pricina::Prirazovani,
+            Pricina::Prepinac,
         ];
         v.extend(ForceReason::ALL.map(Pricina::Vynuceno));
         v
@@ -787,7 +877,7 @@ mod tests {
         kody.sort_unstable();
         kody.dedup();
         assert_eq!(kody.len(), vsechny.len(), "kódy se nesmí překrývat");
-        for k in [6, 7, 17, 0xFF] {
+        for k in [7, 17, 0xFF] {
             assert_eq!(Pricina::z_kodu(k), Pricina::Nic);
         }
     }
@@ -835,8 +925,10 @@ mod tests {
         pripady.push((
             UiEvent::BindingSaved {
                 key: KeyId::W,
-                target: a,
+                target: a.into(),
                 moved_from: None,
+                moved_more: 0,
+                shared: 0,
             },
             Pricina::Prirazovani,
         ));
@@ -931,14 +1023,50 @@ mod tests {
 
     /// Přiřazování z enginu: cíl i oznámení přijdou oknu přes atomiky,
     /// uložení nese příčinu „přiřazování“.
+    /// Zapnutí dalšího ovladače z pauzy přepínačem (Fáze 7, Z1): změna
+    /// režimu přes `rozhodnuti_prepinace` nese příčinu `Prepinac` (okno
+    /// nepípne), tentýž přechod jako běžné rozhodnutí („Pokračovat“
+    /// z nabídky ikony) `Okno`. Bez změny režimu se příčina nepřepíše.
+    #[test]
+    fn zachytavani_z_prepinace_ma_vlastni_pricinu() {
+        let (v, _sloty, _budik) = vystup();
+        let mut e = Engine::new(Mapping::default());
+        let d = e.enable(PadId::FIRST);
+        v.rozhodnuti(None, &d, e.mode());
+        assert_eq!(v.info_s_pricinou().1, Pricina::Ovladac);
+        let d = e.capture(0);
+        v.rozhodnuti_prepinace(&d, e.mode());
+        let (r, p) = v.info_s_pricinou();
+        assert_eq!((r.rezim, p), (Rezim::Capturing, Pricina::Prepinac));
+        // Druhý ovladač při hře: capture nic nemění, příčina zůstává.
+        let _ = e.enable(PadId::new(1).unwrap());
+        let d = e.capture(0);
+        v.rozhodnuti_prepinace(&d, e.mode());
+        assert_eq!(v.info_s_pricinou(), (r, Pricina::Prepinac));
+        let d = e.toggle(0);
+        v.rozhodnuti(None, &d, e.mode());
+        assert_eq!(v.info_s_pricinou().1, Pricina::Okno);
+        let d = e.capture(0);
+        v.rozhodnuti(None, &d, e.mode());
+        assert_eq!(v.info_s_pricinou().1, Pricina::Okno, "nabídka ikony");
+        let d = e.toggle(0);
+        v.rozhodnuti(None, &d, e.mode());
+        let d = e.capture(0);
+        v.rozhodnuti_prepinace(&d, e.mode());
+        assert_eq!(v.info_s_pricinou().1, Pricina::Prepinac, "přepínač z pauzy");
+    }
+
     #[test]
     fn prirazovani_z_enginu_pres_atomiky() {
         let (v, _sloty, _budik) = vystup();
         let mut e = Engine::new(Mapping::default());
         let cil = PadAction::first(Action::Button(PadButton::Y));
-        let d = e.start_binding(cil, BindKind::Replace, 0);
+        let d = e.start_binding(cil, BindKind::Replace, keypad_core::KeyConflict::Move, 0);
         v.rozhodnuti(None, &d, e.mode());
-        assert_eq!(v.info().cil, Some(CilInfo { pad: 0, vstup: "y" }));
+        assert_eq!(
+            v.info().cil,
+            Some(CilRezimu::Vstup(CilInfo { pad: 0, vstup: "y" }))
+        );
         let d = e.on_key(KeyId::F, true, 1);
         v.rozhodnuti(None, &d, e.mode());
         let (r, p) = v.info_s_pricinou();
@@ -950,8 +1078,10 @@ mod tests {
             UiEvent::unpack(v.oznameni() & OZNAMENI_OBSAH),
             Some(UiEvent::BindingSaved {
                 key: KeyId::F,
-                target: cil,
+                target: cil.into(),
                 moved_from: Some(PadAction::first(Action::Button(PadButton::X))),
+                moved_more: 0,
+                shared: 0
             })
         );
     }

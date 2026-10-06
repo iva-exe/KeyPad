@@ -1,6 +1,6 @@
 // Schéma ovladače a čisté výpočty okna — bez Svelte a bez Tauri, aby
 // je šlo testovat holým `bun test` (vstupy.test.ts).
-import type { Cil, Klavesa, PadStav, Vazba, Vstup } from './smlouva';
+import type { Cil, DuvodOdmitnuti, Klavesa, KlavesaOznameni, PadStav, Vazba, Vstup } from './smlouva';
 
 /**
  * Všech 24 vstupů v pořadí jádra (`Action::ALL`): páčky, tlačítka, D-pad,
@@ -302,25 +302,126 @@ export function dalsiKarta(viditelne: readonly number[]): number | null {
 }
 
 /** Bublina čepičky: „Levá páčka ↑ · W", u víc kláves „· také Šipka nahoru". */
-export function bublinaVstupu(vstup: Vstup, klavesy: readonly Klavesa[]): string {
-	const [prvni, ...dalsi] = klavesy;
+//
+// Sdílená klávesa (Fáze 7, Z4): s volbou „Jedna klávesa pro víc vstupů"
+// patří klávesa až 4 vstupům. Backend posílá jen seznam vazeb (tatáž
+// klávesa víckrát), sdílenost si okno spočítá samo.
+export function bublinaVstupu(
+	vstup: Vstup,
+	klavesy: readonly Klavesa[],
+	dalsi?: (k: Klavesa) => readonly Cil[]
+): string {
+	const [prvni, ...ostatni] = klavesy;
 	if (!prvni) return `${NAZVY[vstup]} · bez klávesy`;
 	let t = `${NAZVY[vstup]} · ${prvni.nazev}`;
-	if (dalsi.length > 0) t += ` · také ${dalsi.map((k) => k.nazev).join(', ')}`;
+	if (ostatni.length > 0) t += ` · také ${ostatni.map((k) => k.nazev).join(', ')}`;
+	// Řádek za každou klávesu, která patří i jinam: „F — také: Ovladač 2 · A".
+	for (const k of klavesy) {
+		const d = dalsi?.(k) ?? [];
+		if (d.length > 0) t += `\n${k.nazev} — také: ${d.map(textCile).join(', ')}`;
+	}
 	if (klavesy.some(jeAlt)) t += '\nPři hraní nepůjde Alt+Tab';
 	return t;
 }
 
+/** Klíč klávesy (pozice: scan kód a E0) pro mapy a porovnání. */
+export function klicKlavesy(k: { scan: number; e0: boolean }): string {
+	return `${k.scan}:${k.e0 ? 1 : 0}`;
+}
+
+/**
+ * Kam všude patří každá klávesa — sdílená klávesa (Fáze 7, Z4) má víc
+ * vstupů, nejvýš 4. Pořadí cílů jako ve `vazby` (ovladač, pak pořadí vstupů).
+ */
+export function cileKlaves(vazby: readonly Vazba[]): Map<string, Cil[]> {
+	const m = new Map<string, Cil[]>();
+	for (const v of vazby) {
+		const k = klicKlavesy(v.klavesa);
+		const cil = { pad: v.pad, vstup: v.vstup };
+		const c = m.get(k);
+		if (c) c.push(cil);
+		else m.set(k, [cil]);
+	}
+	return m;
+}
+
+/** Další vstupy, kterým klávesa patří, kromě vstupu `pad`/`vstup`. */
+export function dalsiCile(
+	cile: ReadonlyMap<string, readonly Cil[]>,
+	k: KlavesaOznameni,
+	pad: number,
+	vstup: Vstup
+): Cil[] {
+	return (cile.get(klicKlavesy(k)) ?? []).filter((c) => c.pad !== pad || c.vstup !== vstup);
+}
+
+/** Vstup ovladače do bubliny: „Ovladač 2 · A", „Ovladač 1 · Levá páčka ↑". */
+export function textCile(c: Cil): string {
+	return `Ovladač ${c.pad + 1} · ${jeVstup(c.vstup) ? NAZVY[c.vstup] : c.vstup}`;
+}
+
+/** Krátce do nápovědy: „A" u téhož ovladače, jinak „ovladače 2 · A". */
+function kratceCil(c: Cil, pad: number): string {
+	const kde = jeVstup(c.vstup) ? KRATKE[c.vstup] : c.vstup;
+	return c.pad === pad ? kde : `ovladače ${c.pad + 1} · ${kde}`;
+}
+
+/** S čím se klávesa po uložení sdílí: „Sdíleno s ovladačem 2 · A", víc: „Sdíleno se 2 vstupy". */
+export function textSdileni(dalsi: readonly Cil[], pad: number): string {
+	const [jediny] = dalsi;
+	if (dalsi.length === 1 && jediny) {
+		const kde = jeVstup(jediny.vstup) ? KRATKE[jediny.vstup] : jediny.vstup;
+		return jediny.pad === pad ? `Sdíleno s ${kde}` : `Sdíleno s ovladačem ${jediny.pad + 1} · ${kde}`;
+	}
+	return `Sdíleno se ${dalsi.length} vstupy`;
+}
+
+/** Co ještě nápověda o odmítnuté klávese potřebuje vědět. */
+export interface KontextOdmitnuti {
+	/** Název zkratky pauzy („Scroll Lock"). */
+	zkratka?: string;
+	/** Název odmítnuté klávesy („F5"). */
+	klavesa?: string;
+	/** Kam klávesa patří (zkratka nesmí být namapovaná). */
+	kam?: Cil | null;
+}
+
 /** Nápověda k odmítnuté klávese (přiřazování běží dál). */
-export function textOdmitnuti(duvod: 'zkratka' | 'win' | 'nejde', zkratka?: string): string {
+export function textOdmitnuti(duvod: DuvodOdmitnuti, kontext: KontextOdmitnuti | string = {}): string {
+	const k = typeof kontext === 'string' ? { zkratka: kontext } : kontext;
 	switch (duvod) {
 		case 'zkratka':
-			return `${zkratka || 'Zkratka'} je pauza`;
+			return `${k.zkratka || 'Zkratka'} je pauza`;
 		case 'win':
 			return 'Win patří Windows';
 		case 'nejde':
 			return 'Tuhle klávesu nejde použít';
+		case 'plno':
+			// Fáze 7: sdílená klávesa už ovládá 4 vstupy (strop, OQ 64).
+			return `${k.klavesa || 'Klávesa'} už ovládá 4 vstupy`;
+		case 'namapovana':
+			// Zkratka pauzy nesmí ovládat vstup — stisk by vždy jen přepínal.
+			if (!k.kam) return `${k.klavesa || 'Klávesa'} už ovládá vstup`;
+			return `${k.klavesa || 'Klávesa'} patří ovladači ${k.kam.pad + 1} · ${jeVstup(k.kam.vstup) ? KRATKE[k.kam.vstup] : k.kam.vstup}`;
+		case 'nevhodna':
+			// Každou jinou klávesu by KeyPad se zapnutým ovladačem bral celému
+			// systému (se zkratkou Tab by nešel Alt+Tab, s F4 Alt+F4 — Z6, OQ 69).
+			return 'Pauza jde jen na F1–F24 (ne F4), Scroll Lock nebo Pause';
 	}
+}
+
+/**
+ * Varování k zkratce pauzy (jantarová tečka u čepičky „Pauza" v ⓘ), nebo
+ * ''. Zkratku hook spolkne v celém systému, dokud je zapnutý ovladač.
+ */
+export function varovaniZkratky(k: { scan: number; e0: boolean } | null, mimo: boolean): string {
+	if (!k) return '';
+	// F4 z okna přiřadit nejde, ručně v config.json ano (OQ 69) — řeknout,
+	// co přesně přestane fungovat.
+	if (k.scan === 0x3e && !k.e0) return 'Alt+F4 nezavře okno, dokud je zapnutý ovladač';
+	if (mimo) return 'Tuhle klávesu Windows nedostanou, dokud je zapnutý ovladač';
+	if (k.scan === 0x58 && !k.e0) return 'F12 ve Steamu fotí snímek obrazovky — se zapnutým ovladačem ho Steam nedostane';
+	return '';
 }
 
 /**
@@ -333,8 +434,13 @@ export function bublinaChyb(chyby: readonly string[]): string {
 	return ['Co je v souboru špatně:', ...chyby.map((c) => `· ${c}`), 'Podrobnosti jsou v logu.'].join('\n');
 }
 
-/** Nápověda k přesunuté klávese: „Přesunuto z LB", z jiného ovladače i s jeho číslem. */
-export function textPresunu(odkud: Cil, pad: number): string {
-	const kde = jeVstup(odkud.vstup) ? KRATKE[odkud.vstup] : odkud.vstup;
-	return odkud.pad === pad ? `Přesunuto z ${kde}` : `Přesunuto z ovladače ${odkud.pad + 1} · ${kde}`;
+/**
+ * Nápověda k přesunuté klávese: „Přesunuto z LB", z jiného ovladače i s jeho
+ * číslem; ze sdílené klávesy (Fáze 7) „… a 1 dalšího" (`dalsi` = kolik
+ * dalších vstupů o ni přišlo).
+ */
+export function textPresunu(odkud: Cil, pad: number, dalsi = 0): string {
+	const t = `Přesunuto z ${kratceCil(odkud, pad)}`;
+	if (dalsi <= 0) return t;
+	return `${t} a ${dalsi} ${dalsi === 1 ? 'dalšího' : 'dalších'}`;
 }

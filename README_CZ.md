@@ -13,7 +13,8 @@ Ovladač zapneš **přepínačem v okně** — od té chvíle jdou namapované
 klávesy (WASD, šipky…) do ovladače, všechno ostatní funguje dál
 normálně: Alt+Tab, Win, Alt+F4. Klávesou **Scroll Lock** převádění
 **pozastavíš** (třeba kvůli psaní do chatu) — ovladač zůstane
-připojený, jen stojí; dalším Scroll Lockem ho zase pustíš.
+připojený, jen stojí; dalším Scroll Lockem ho zase pustíš. Jinou
+klávesu pro pauzu (F1–F24 kromě F4, nebo Pause) si vybereš pod ⓘ.
 
 Klávesy si nastavíš přímo v okně, jako v menu kláves ve hře, a z jedné
 klávesnice můžou hrát až **čtyři ovladače** — každý má svoje klávesy
@@ -102,16 +103,20 @@ Ruční cesta, kdyby cokoli selhalo: <https://github.com/nefarius/ViGEmBus/relea
 KeyPad sedí v oznamovací oblasti vedle hodin (jako WinSent). Zavřením
 okna se KeyPad **neukončí** — jen se schová a přestane zatěžovat
 počítač. Okno otevřeš kliknutím na ikonu, **ukončíš** ho pravým
-tlačítkem na ikoně → **Ukončit**. Verzi, autora ovladače ViGEmBus
-a log najdeš pod ⓘ v liště okna.
+tlačítkem na ikoně → **Ukončit**. Pod ⓘ v liště okna je **nastavení**
+(zvuk, jedna klávesa pro víc vstupů, klávesa pauzy) a verze, autor
+ovladače ViGEmBus a log.
 
 Při hraní je okno schované, a tak stav ukazuje **ikona**: zelená tečka
 = hraje, dvě bílé čárky = pozastaveno (Scroll Lock), šedá = vypnuto,
 jantarový vykřičník = klávesy nejdou nebo ovladač hlásí chybu. Při
-pozastavení a pokračování KeyPad krátce **pípne** (klesající a stoupající
-tón; vypneš ho v nabídce ikony odškrtnutím **Zvuk**). V nabídce ikony je
-i **Pozastavit / Pokračovat**. Přes hru KeyPad nikdy žádné okno ani
-upozornění neukazuje.
+pozastavení KeyPad zahraje **měkký nižší tón**, při pokračování
+**stoupající trojici tónů** — dva zvuky se nikdy nepřekryjí, rychlé
+přepnutí zahraje jen ten poslední. Zapnutí a vypnutí ovladače přepínačem
+KeyPad nepípá (to ohlásí Windows svým zvukem připojení). Zvuk vypneš pod
+ⓘ (přepínač **Zvuk**, ▷ zahraje ukázku) nebo v nabídce ikony odškrtnutím
+**Zvuk** — obojí ukazuje totéž. V nabídce ikony je i **Pozastavit /
+Pokračovat**. Přes hru KeyPad nikdy žádné okno ani upozornění neukazuje.
 
 > **Tip:** Windows nové ikony schovávají do přetečení (šipka **^** vedle
 > hodin), kde při hře přes celou obrazovku nejsou vidět. Chyť ikonu
@@ -137,10 +142,13 @@ vypne a KeyPad skončí.
 
 ## Klávesy a víc ovladačů
 
-Každý ovladač má v okně svou **kartu**: barevný pruh a číslo (1 modrá,
-2 růžová, 3 fialová, 4 azurová), jedno slovo stavu a přepínač. Rozbalená
-karta ukazuje ovladač ve tvaru Xboxu a na každém tlačítku, páčce
-a spoušti je klávesa, která ho ovládá.
+Každý ovladač má v okně svou **kartu**: tenký rámeček v barvě ovladače
+a číslo (1 modrá, 2 růžová, 3 fialová, 4 azurová), jedno slovo stavu
+a přepínač. Kliknutím na hlavičku kartu rozbalíš nebo sbalíš — rozbalených
+může být víc i všechny, okno si to pamatuje i po restartu. Rozbalená karta
+ukazuje ovladač ve tvaru Xboxu a na každém tlačítku, páčce a spoušti je
+klávesa, která ho ovládá. Dokud držíš kteroukoli klávesu ovladače, jeho
+karta **svítí** (i sbalená) — hned poznáš, kterému hráči klávesa patří.
 
 - **Změnit klávesu:** klikni na tlačítko a stiskni klávesu — nahradí tu
   dosavadní, jako v menu kláves ve hře. Esc, klik jinam nebo 10 s bez
@@ -150,13 +158,27 @@ a spoušti je klávesa, která ho ovládá.
 - Když stiskneš klávesu, kterou už má jiné tlačítko (nebo jiný ovladač),
   **přesune se** — okno to napíše („Přesunuto z ovladače 2 · A“)
   a pár vteřin nabízí **Zpět**.
+- **Jedna klávesa pro víc vstupů** (zapneš pod ⓘ, výchozí vypnuto): pak
+  se klávesa místo přesunu **sdílí** — patří starému i novému tlačítku
+  (i jiného ovladače) a ve hře zmáčkne všechna naráz, nejvýš čtyři.
+  Čepičky sdílené klávesy jsou **oranžové** a bublina napíše, kam
+  všude ještě patří („F — také: Ovladač 2 · X“); najetí myší zvýrazní
+  i ostatní. Vypnutí volby sdílené klávesy nezruší, jen nová přiřazení
+  zase přesouvají.
 - **Win** přiřadit nejde (patří Windows, Win+D a spol. musí fungovat
-  i ve hře), Scroll Lock taky ne (to je pauza).
-- **↺** na kartě ovladače 1 vrátí jeho výchozí klávesy (dva kliky); klávesy,
-  které mezitím dostal jiný ovladač, mu nebere.
+  i ve hře), klávesu pauzy taky ne.
+- **↺** na kartě ovladače 1 vrátí jeho výchozí klávesy; klávesy, které
+  mezitím dostal jiný ovladač, mu nebere. KeyPad se nejdřív zeptá
+  (Esc nebo **Zrušit** nic nezmění) a pár vteřin pak nabízí **Zpět**.
 - **+ Ovladač** přidá kartu dalšího hráče (až 4) — začíná bez kláves,
   přiřaď mu je stejně jako prvnímu a zapni ho jeho přepínačem. **🗑**
-  odebere vypnutý ovladač i s klávesami (dva kliky).
+  odebere vypnutý ovladač i s klávesami (po otázce „Odebrat ovladač 2?“).
+- **Klávesa pauzy:** ⓘ → **Pauza** → stiskni novou klávesu. Jde jen
+  **F1–F24 (kromě F4), Scroll Lock nebo Pause** — každou jinou klávesu by KeyPad
+  se zapnutým ovladačem bral celému Windows (s Tabem by nešel Alt+Tab,
+  s F4 Alt+F4).
+  F12 jde, ale Steam jím fotí snímky obrazovky a se zapnutým ovladačem
+  ho nedostane (jantarová tečka).
 - Stisknutá klávesa se na kartě **rozsvítí**, i když ovladač neběží —
   obrysem, co držíš, plnou barvou, co hra opravdu dostává (A+D: svítí
   obě, plně ta, která vyhrála). Bez zapnutého ovladače se to ukazuje
@@ -214,7 +236,7 @@ odebereš ho v Nastavení → Aplikace → „ViGEm Bus Driver“.
 |---|---|
 | Program | `%LOCALAPPDATA%\Programs\KeyPad` (`KeyPad.exe`, `KeyPadSetup.exe`, `version.txt`) |
 | Log | `keypad.log` vedle `KeyPad.exe` (když tam nejde zapisovat, tak `%APPDATA%\KeyPad`) |
-| Klávesy a zvuk | `%APPDATA%\KeyPad\config.json` — vznikne při první změně; nevalidní se odloží jako `config.invalid.json` |
+| Klávesy a nastavení | `%APPDATA%\KeyPad\config.json` (klávesy, karty a jejich rozbalení, zvuk, volby) — vznikne při první změně; nevalidní se odloží jako `config.invalid.json` |
 | Data okna (WebView2) | `%LOCALAPPDATA%\cz.hexel.keypad` — cache a data, která si okno ukládá samo (desítky MB) |
 | Stažený instalátor | `%TEMP%\keypad-update` — `KeyPadSetup-….exe` z tlačítka Aktualizovat |
 | Log instalátoru | `%TEMP%\KeyPadSetup.log` — podrobnosti instalace včetně kódů chyb |
@@ -370,8 +392,9 @@ Skripty se spouštějí `powershell -ExecutionPolicy Bypass -File tools\…`.
 | `tools\check-imports.ps1 [-RequireDependentLoadFlag] <exe>` | nepotřebuje binárka DLL, která na čistém PC chybí? Nevolá funkci novější než Windows 10 1507? (a s přepínačem: hledá DLL jen v System32?) |
 | `cargo run -p keypad --release --example pad_selftest -- vse` | virtuální pad bez okna: připojení, stav přes XInput, odpojení, pád procesu. Když je v popředí hra nebo celoobrazovková aplikace, nic nepřipojí (exit 3). |
 | `cargo run -p keypad --release --example hook_selftest` | hook klávesnice bez okna na 60 s: vypisuje stisknuté klávesy se scan kódy **jen do konzole** (nic neukládá); Scroll Lock přepne na Gamepad a WASD, šipky… se potlačí. Virtuální ovladač nepřipojuje. `-- instalace` jen ověří instalaci a odebrání hooku; `-- mereni` změří cenu jedné klávesy (hook se neinstaluje), `-- mereni-instalace` cenu instalace a odebrání hooku (na vlastní skryté ploše). |
+| `cargo run -p keypad --release --example zvuk_selftest -- ticho` | celá cesta zvuku (WASAPI, předehřátí, plnění po periodách, doběh rozehraného zvuku) s **nulovými** vzorky — nic není slyšet; exit 4 = fronta zařízení podtekla. Slyšitelné `-- pauza`, `-- hra`, `-- pauza-glis`, `-- ukazka` a `-- rychle` (Scroll Lock 5× za 0,5 s) spouští jen vlastník. |
 | `$env:KEYPAD_BEZ_VIGEM = "1"` | aplikace se chová, jako by ViGEmBus chyběl (`vypnuty` = nainstalovaný a vypnutý, `zbytek` = pozůstatek bez zařízení; `pad` = simulovaný připojený ovladač, jen debug build) — na PC, kde se pad objevit nemá |
-| `tools\okno-test.ps1` | okno naostro, ale na **skryté ploše**: debug build, simulovaný ovladač, izolované `APPDATA`/`LOCALAPPDATA`, klávesy jen testovacím příkazem (žádný `SendInput`), přes DevTools projde editor kláves (přiřadit, přidat, vyprázdnit, výchozí, odebrat ovladač, přesun a „Zpět“, Win, Win+klávesa, AltGr, klik jinam, 10 s, minimalizace), klávesy psané do okna (mezerník, Enter, šipky, F5, Ctrl+R, Ctrl+P — jen do okna testu, ne do systému), živé svícení, 380/440 px, restart a poškozenou konfiguraci, prázdnou kartu ovladače 2 po ukončení procesu, přiřazení a Esc s podvrhem „Windows drží všechno“, Esc do okna, který hook nevidí, a v logu řádky „přiřazování skončilo“ (bez kláves) a „raw input klávesnice: ne“ (KeyPad nesmí mít klávesnici v Raw Input, jinak by jeho hook s oknem v popředí podle všeho nic nedostal) a uloží snímky okna (`-Snimky`). Nic neukáže na tvé ploše a nesáhne na nainstalovaný KeyPad. |
+| `tools\okno-test.ps1` | okno naostro, ale na **skryté ploše**: debug build, simulovaný ovladač, izolované `APPDATA`/`LOCALAPPDATA`, klávesy jen testovacím příkazem (žádný `SendInput`), přes DevTools projde editor kláves (přiřadit, přidat, vyprázdnit, výchozí, odebrat ovladač, přesun a „Zpět“, Win, Win+klávesa, AltGr, klik jinam, 10 s, minimalizace), karty rozbalené naráz i po restartu, potvrzovací dialog ↺ a 🗑, jednu klávesu pro víc vstupů (oranžové čepičky, oba ovladače ve hře), záři karty po dobu držení, zvuk v logu (přepínač nepípá) a nastavení pod ⓘ (zvuk, klávesa pauzy), klávesy psané do okna (mezerník, Enter, šipky, F5, Ctrl+R, Ctrl+P — jen do okna testu, ne do systému), živé svícení, 380/440 px, restart a poškozenou konfiguraci, prázdnou kartu ovladače 2 po ukončení procesu, přiřazení a Esc s podvrhem „Windows drží všechno“, Esc do okna, který hook nevidí, a v logu řádky „přiřazování skončilo“ (bez kláves) a „raw input klávesnice: ne“ (KeyPad nesmí mít klávesnici v Raw Input, jinak by jeho hook s oknem v popředí podle všeho nic nedostal) a uloží snímky okna (`-Snimky`). Nic neukáže na tvé ploše a nesáhne na nainstalovaný KeyPad. |
 
 **Instalátor — režimy.** `KeyPadSetup.exe` (okno) · `/quiet`
 (z aplikace; chybějící nebo starší ovladač nainstaluje či aktualizuje taky) · `/headless` · `/uninstall`

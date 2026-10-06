@@ -6,7 +6,9 @@
 		"pad": 0,
 		"vstup": "x",
 		"klavesa": { "scan": 33, "e0": false },
-		"odkud": null
+		"odkud": null,
+		"odkud_dalsi": 0,
+		"sdileno": 0
 	},
 	{
 		"seq": 102,
@@ -15,7 +17,9 @@
 		"pad": 1,
 		"vstup": "ls_up",
 		"klavesa": { "scan": 17, "e0": false },
-		"odkud": { "pad": 0, "vstup": "ls_up" }
+		"odkud": { "pad": 0, "vstup": "ls_up" },
+		"odkud_dalsi": 0,
+		"sdileno": 0
 	},
 	{ "seq": 103, "mezera": true, "typ": "odmitnuto", "duvod": "win", "klavesa": { "scan": 91, "e0": true } },
 	{ "seq": 104, "mezera": false, "typ": "odmitnuto", "duvod": "zkratka", "klavesa": { "scan": 70, "e0": false } },
@@ -24,5 +28,31 @@
 	{ "seq": 107, "mezera": false, "typ": "zruseno", "duvod": "cas" },
 	{ "seq": 108, "mezera": false, "typ": "zruseno", "duvod": "okno" },
 	{ "seq": 109, "mezera": false, "typ": "zruseno", "duvod": "vynuceno" },
+	{
+		"seq": 110,
+		"mezera": false,
+		"typ": "ulozeno",
+		"pad": 2,
+		"vstup": "rt",
+		"klavesa": { "scan": 33, "e0": false },
+		"odkud": { "pad": 0, "vstup": "x" },
+		"odkud_dalsi": 1,
+		"sdileno": 0
+	},
+	{
+		"seq": 111,
+		"mezera": false,
+		"typ": "ulozeno",
+		"pad": 1,
+		"vstup": "a",
+		"klavesa": { "scan": 57, "e0": false },
+		"odkud": null,
+		"odkud_dalsi": 0,
+		"sdileno": 2
+	},
+	{ "seq": 112, "mezera": false, "typ": "odmitnuto", "duvod": "plno", "klavesa": { "scan": 17, "e0": false } },
+	{ "seq": 113, "mezera": false, "typ": "ulozeno", "zkratka": true, "klavesa": { "scan": 67, "e0": false } },
+	{ "seq": 114, "mezera": false, "typ": "odmitnuto", "duvod": "namapovana", "klavesa": { "scan": 63, "e0": false } },
+	{ "seq": 115, "mezera": false, "typ": "odmitnuto", "duvod": "nevhodna", "klavesa": { "scan": 15, "e0": false } },
 	{ "seq": 65535, "mezera": false, "typ": "zapni_ovladac" }
 ]

@@ -35,15 +35,15 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use keypad_core::{
-    Action, BindKind, DisabledReason, ForceReason, Mapping, MappingError, PadAction, PadId,
-    UiEvent, MAX_PADS,
+    Action, BindKind, BindTarget, DisabledReason, ForceReason, KeyConflict, KeyId, Mapping,
+    MappingError, PadAction, PadId, UiEvent, MAX_PADS,
 };
 use serde::Deserialize;
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::config::{self, Karty, Konfigurace, StavKonfigurace, Ukladac};
+use crate::config::{self, Karty, Konfigurace, Rozbalene, StavKonfigurace, Ukladac};
 use crate::platform::windows::hook::{
-    ChybaUpravy, Hook, HookOdesilatel, HookPrikaz, Vystup, Zmena, WATCHDOG_MS,
+    ChybaUpravy, Hook, HookOdesilatel, HookPrikaz, Vystup, ZdrojZachytavani, Zmena, WATCHDOG_MS,
 };
 use crate::platform::windows::pad::{Oznam, PadInfo, PadPrikaz, PadStav, Pady, UDALOST};
 use crate::platform::windows::slot::Budik;
@@ -51,7 +51,8 @@ use crate::platform::windows::vystup::{HookVystup, Rezim, RezimInfo, OZNAMENI_OB
 use crate::platform::windows::{klavesy, power, shell, zvuk};
 use crate::tray::TrayStav;
 use smlouva::{
-    KartyInfo, KlavesyInfo, KonfiguraceInfo, Oznameni, RevizeInfo, ZivaInfo, ZivyPad, ZmenaOkna,
+    KartyInfo, KlavesyInfo, KonfiguraceInfo, NastaveniInfo, Oznameni, RevizeInfo, Volba, ZivaInfo,
+    ZivyPad, ZmenaOkna,
 };
 
 /// Tauri událost se změnou režimu (payload [`RezimInfo`]).
@@ -65,6 +66,14 @@ const UDALOST_ZIVE: &str = "zive";
 const UDALOST_KLAVESY: &str = "klavesy-zmena";
 /// Stav uložení kláves (payload [`KonfiguraceInfo`]).
 const UDALOST_KONFIGURACE: &str = "konfigurace";
+/// Volby z ⓘ se změnily — z okna i z nabídky ikony (payload
+/// [`NastaveniInfo`]).
+const UDALOST_NASTAVENI: &str = "nastaveni";
+/// Hlavní okno přestalo (`false`), nebo začalo (`true`) být vidět —
+/// schované i minimalizované (payload `bool`). Okno podle toho zruší
+/// potvrzovací dialog (Fáze 7, Z3): minimalizace WebView2 neuspí a
+/// `visibilitychange` by nepřišlo.
+const UDALOST_OKNO: &str = "okno-videt";
 
 /// Jak často vlákno okna během hraní kontroluje tep ovladačů (Fáze 5).
 /// Callback hooku to kontroluje u každé klávesy; tohle pokryje chvíli,
@@ -83,6 +92,11 @@ const LIMIT_KONCE: Duration = Duration::from_millis(1_500);
 /// Jak dlouho při konci čekat na zápis kláves na disk. Zápis je
 /// atomický, takže nestihnutý zápis nechá na disku celý starší soubor.
 const LIMIT_ULOZENI: Duration = Duration::from_millis(500);
+
+/// Jak dlouho při konci čekat, než rozehraný zvuk dohasne (`zvuk::zastav`):
+/// doběh 15 ms za daty, která už jsou ve frontě zařízení (předstih 50 ms).
+/// Proces ukončený uprostřed tónu by ho usekl a reproduktor by lupl.
+const LIMIT_ZVUKU: Duration = Duration::from_millis(100);
 
 /// Jak dlouho před spuštěním instalátoru ViGEmBus čekat, než pad
 /// vlákna ovladače vypnou. Normálně milisekundy; zdrží je jen rozjeté
@@ -111,9 +125,14 @@ pub struct Zrcadlo {
     predchozi: Option<(u64, Arc<Mapping>)>,
     /// Ovladače s kartou v okně (OQ 52) — ukládají se s klávesami.
     karty: Karty,
+    /// Rozbalené karty (Fáze 7, OQ 70) — ukládají se taky.
+    rozbalene: Rozbalene,
     /// Pořadí změny karet: odpověď příkazu a načtení kláves se můžou
     /// předběhnout, starší seznam okno zahodí.
     karty_rev: u64,
+    /// Pořadí změny voleb z ⓘ (`NastaveniInfo::rev`) — mění se pod tímhle
+    /// zámkem spolu s uložením, takže poslední událost nese poslední stav.
+    nastaveni_rev: u64,
     konfigurace: StavKonfigurace,
     zaloha: Option<PathBuf>,
     /// Chyby nevalidního config.json ze startu — pro bublinu pruhu.
@@ -124,6 +143,7 @@ impl Zrcadlo {
     fn novy(
         m: Mapping,
         karty: Karty,
+        rozbalene: Rozbalene,
         konfigurace: StavKonfigurace,
         zaloha: Option<PathBuf>,
         chyby: Vec<String>,
@@ -133,33 +153,44 @@ impl Zrcadlo {
             mapovani: Arc::new(m),
             predchozi: None,
             karty,
+            rozbalene,
             karty_rev: 0,
+            nastaveni_rev: 0,
             konfigurace,
             zaloha,
             chyby,
         }
     }
 
-    /// Karty po změně: `zmen` vrátí, jestli se něco změnilo — pak roste
-    /// pořadí. Vrací, jestli je co ukládat.
-    fn zmen_karty(&mut self, zmen: impl FnOnce(&mut Karty) -> bool) -> bool {
-        let zmeneno = zmen(&mut self.karty);
+    /// Karty (a jejich rozbalení) po změně: `zmen` vrátí, jestli se něco
+    /// změnilo — pak roste pořadí. Vrací, jestli je co ukládat.
+    fn zmen_karty(&mut self, zmen: impl FnOnce(&mut Karty, &mut Rozbalene) -> bool) -> bool {
+        let zmeneno = zmen(&mut self.karty, &mut self.rozbalene);
         if zmeneno {
             self.karty_rev += 1;
         }
         zmeneno
     }
 
-    fn karty_info(&self) -> KartyInfo {
-        KartyInfo::z(self.karty_rev, self.karty)
+    /// Karty v okně: uložené a ovladače s klávesami (ty kartu mají vždy,
+    /// stejně jako po načtení), rozbalené jen z nich.
+    fn vsechny_karty(&self) -> Karty {
+        self.karty.s_klavesami(&self.mapovani)
     }
 
-    /// Co se uloží: mapování a karty ze zrcadla, zvuk podle nabídky.
-    fn konfigurace(&self, zvuk: bool) -> Konfigurace {
+    fn karty_info(&self) -> KartyInfo {
+        KartyInfo::z(self.karty_rev, self.vsechny_karty(), self.rozbalene)
+    }
+
+    /// Co se uloží: mapování a karty ze zrcadla, volby z atomiků (zvuk,
+    /// jedna klávesa pro víc vstupů).
+    fn konfigurace(&self, zvuk: bool, sdilene_klavesy: bool) -> Konfigurace {
         Konfigurace {
             mapovani: (*self.mapovani).clone(),
             zvuk,
+            sdilene_klavesy,
             karty: self.karty,
+            rozbalene: self.rozbalene,
         }
     }
 
@@ -201,8 +232,12 @@ pub struct Ovladani {
     /// Příkazy hooku z okna a nabídky ikony — bez zámku `hook`, který
     /// drží konec.
     prikazy: HookOdesilatel,
-    /// ✓ Zvuk v nabídce ikony.
+    /// ✓ Zvuk v nabídce ikony i v ⓘ.
     zvuk: Arc<AtomicBool>,
+    /// Volba „Jedna klávesa pro víc vstupů“ z ⓘ (Fáze 7). Zdroj pravdy je
+    /// tenhle atomik: `prirad` podle něj pošle hooku `KeyConflict` — okno
+    /// ho nikdy neposílá.
+    sdilene: Arc<AtomicBool>,
     /// Aplikace končí: vlákno okna už nepípá (konec vynutí Klávesnici
     /// a to by jinak znělo jako pozastavení).
     konci: Arc<AtomicBool>,
@@ -257,7 +292,8 @@ pub fn spust(app: &tauri::App, nacteno: config::Nacteno) -> Result<(), String> {
     let mapovani = nacteno.konfigurace.mapovani.clone();
     // Název zkratky pro bublinu ikony — tady, na hlavním vlákně, podle
     // rozložení, se kterým aplikace startovala.
-    let zkratka = klavesy::nazev(mapovani.toggle_key());
+    let zkratka_klavesa = mapovani.toggle_key();
+    let zkratka = klavesy::nazev(zkratka_klavesa);
     let hook = Hook::spust(mapovani.clone(), Arc::clone(&vystup) as Arc<dyn Vystup>)?;
     let _ = hook_tx.set(hook.odesilatel());
 
@@ -280,6 +316,7 @@ pub fn spust(app: &tauri::App, nacteno: config::Nacteno) -> Result<(), String> {
     let klavesy_zrcadlo = Arc::new(Mutex::new(Zrcadlo::novy(
         mapovani,
         nacteno.konfigurace.karty,
+        nacteno.konfigurace.rozbalene,
         nacteno.stav,
         nacteno.zaloha.clone(),
         nacteno.chyby.clone(),
@@ -302,6 +339,7 @@ pub fn spust(app: &tauri::App, nacteno: config::Nacteno) -> Result<(), String> {
     // událost (princip 3); tohle vlákno spí, dokud nepřijde — jen během
     // hraní se budí i samo a hlídá tep ovladačů (watchdog).
     let zvuk = Arc::new(AtomicBool::new(nacteno.konfigurace.zvuk));
+    let sdilene = Arc::new(AtomicBool::new(nacteno.konfigurace.sdilene_klavesy));
     let konci = Arc::new(AtomicBool::new(false));
     let okno_vidi = Arc::new(AtomicBool::new(false));
     let zive_seq = Arc::new(AtomicU64::new(0));
@@ -315,7 +353,10 @@ pub fn spust(app: &tauri::App, nacteno: config::Nacteno) -> Result<(), String> {
         hook: hook.odesilatel(),
         budik: Arc::clone(&budik),
         zkratka,
+        zkratka_klavesa,
+        predehrato: false,
         zvuk: Arc::clone(&zvuk),
+        sdilene: Arc::clone(&sdilene),
         konci: Arc::clone(&konci),
         zamek,
         oblast: None,
@@ -339,6 +380,7 @@ pub fn spust(app: &tauri::App, nacteno: config::Nacteno) -> Result<(), String> {
         vystup,
         konec: Mutex::new(()),
         zvuk,
+        sdilene,
         konci,
         klavesy: klavesy_zrcadlo,
         okno_vidi,
@@ -451,7 +493,13 @@ struct VlaknoOkna {
     budik: Arc<Budik>,
     /// Název zkratky pozastavení pro bublinu.
     zkratka: String,
+    /// Klávesa, ke které patří `zkratka` (mění ji ⓘ → Pauza, Z6).
+    zkratka_klavesa: KeyId,
+    /// Zvuk už je předehřátý (`zvuk::priprav`, jednou za běh).
+    predehrato: bool,
     zvuk: Arc<AtomicBool>,
+    /// Jedna klávesa pro víc vstupů — jen kvůli uložení s klávesami.
+    sdilene: Arc<AtomicBool>,
     konci: Arc<AtomicBool>,
     /// Kdy se relace naposledy zamkla (`GetTickCount64`, 0 = zatím ne).
     zamek: Arc<AtomicU64>,
@@ -510,14 +558,28 @@ impl VlaknoOkna {
             let _ = self.app.emit(UDALOST_REZIM, r);
             zmena = Some((r.rezim, pricina));
         }
-        let smi = znameni::smi_znit(
-            self.zvuk.load(Ordering::Acquire),
-            self.konci.load(Ordering::Acquire),
-            self.pady.simulace(),
-        );
+        let zvuk_zapnuty = self.zvuk.load(Ordering::Acquire);
+        let simulace = self.pady.simulace();
+        let umlceni = znameni::umlceni(zvuk_zapnuty, self.konci.load(Ordering::Acquire), simulace);
         let zamek = self.zamek.load(Ordering::Acquire);
-        if let Some(z) = self.znameni.obratka(zmena, ted_ms(), zamek, smi) {
-            zvuk::prehraj(z);
+        if let Some(rozhodnuti) = self.znameni.rozhodni(zmena, ted_ms(), zamek, umlceni) {
+            // V debug buildu každé rozhodnutí, i umlčené: test okna běží
+            // v simulaci, kde se všechno umlčí, a cesta okno → znamení →
+            // zvuk by se jinak end-to-end nikdy neprověřila (Z1).
+            if cfg!(debug_assertions) {
+                log::info!("{}", rozhodnuti.popis());
+            }
+            if let Some(z) = rozhodnuti.prehrat() {
+                zvuk::prehraj(z);
+            }
+        }
+        // Předehřátí zvuku s prvním zapnutým ovladačem (a se zapnutím
+        // ✓ Zvuk, když už některý běží): první Scroll Lock pak nečeká na
+        // načítání knihoven (dřív 0,4 s, Z1). Kdo ovladač nezapne,
+        // nezaplatí nic.
+        if !self.predehrato && zvuk_zapnuty && !simulace && pady.contains(&Some(PadStav::On)) {
+            self.predehrato = true;
+            zvuk::priprav();
         }
         let oblast = znameni::stav_oblasti(r.rezim, &pady, &self.zkratka);
         if self.oblast.as_ref() != Some(&oblast) {
@@ -542,10 +604,34 @@ impl VlaknoOkna {
         let Some((o, u)) = self.oznameni.prijmi(schranka) else {
             return;
         };
-        // Bez klávesy (soukromí, spec 1.5): jen kam se ukládalo.
-        if let UiEvent::BindingSaved { target, .. } = u {
+        // Bez klávesy (soukromí, spec 1.5): jen kam se ukládalo a kolika
+        // vstupům klávesa patří (sdílená klávesa, Fáze 7).
+        if let UiEvent::BindingSaved {
+            target: BindTarget::Toggle,
+            ..
+        } = u
+        {
+            log::info!("klávesy: zkratka pozastavení uložena");
+        }
+        if let UiEvent::BindingSaved {
+            target: BindTarget::Input(target),
+            moved_from,
+            moved_more,
+            shared,
+            ..
+        } = u
+        {
+            let presun = match moved_from {
+                Some(_) => format!(", přesunuta z {} vstupů", u16::from(moved_more) + 1),
+                None => String::new(),
+            };
+            let sdileni = if shared > 0 {
+                format!(", sdílená s {shared} dalšími")
+            } else {
+                String::new()
+            };
             log::info!(
-                "klávesy: vazba uložena (ovladač {}, {})",
+                "klávesy: vazba uložena (ovladač {}, {}{presun}{sdileni})",
                 target.pad.index() + 1,
                 target.action.code()
             );
@@ -566,13 +652,24 @@ impl VlaknoOkna {
             return;
         };
         let mut z = zamkni(&self.zrcadlo);
+        let zkratka = m.toggle_key();
         if !z.prevezmi(rev, m) {
             return;
         }
-        // Pod zámkem zrcadla: „✓ Zvuk" a karty ukládají taky pod ním,
-        // takže poslední uložení má vždy nejnovější mapování, karty i zvuk.
-        self.ukladac
-            .uloz(z.konfigurace(self.zvuk.load(Ordering::Acquire)));
+        // Nová zkratka pozastavení (Z6) i v bublině ikony — název podle
+        // rozložení tohohle vlákna (výchozí rozložení, jako hlavní vlákno
+        // při startu).
+        if zkratka != self.zkratka_klavesa {
+            self.zkratka_klavesa = zkratka;
+            self.zkratka = klavesy::nazev(zkratka);
+            self.budik.probud();
+        }
+        // Pod zámkem zrcadla: volby a karty ukládají taky pod ním, takže
+        // poslední uložení má vždy nejnovější mapování, karty i volby.
+        self.ukladac.uloz(z.konfigurace(
+            self.zvuk.load(Ordering::Acquire),
+            self.sdilene.load(Ordering::Acquire),
+        ));
         drop(z);
         let _ = self.app.emit(UDALOST_KLAVESY, RevizeInfo { rev });
     }
@@ -607,7 +704,12 @@ pub fn prepni_z_nabidky(app: &AppHandle) {
     };
     let (prikaz, co) = match o.vystup.info().rezim {
         Rezim::Capturing => (HookPrikaz::Prepni, "pozastavit"),
-        Rezim::Paused => (HookPrikaz::Zachytavej, "pokračovat"),
+        Rezim::Paused => (
+            HookPrikaz::Zachytavej {
+                zdroj: ZdrojZachytavani::Nabidka,
+            },
+            "pokračovat",
+        ),
         // Položka je mimo hru a pauzu zakázaná; tohle je jen souběh.
         _ => return,
     };
@@ -615,14 +717,57 @@ pub fn prepni_z_nabidky(app: &AppHandle) {
     o.prikazy.posli(prikaz);
 }
 
-/// „✓ Zvuk“ z nabídky ikony — platí hned a uloží se s klávesami.
+/// „✓ Zvuk“ z nabídky ikony — platí hned, uloží se s klávesami a okno
+/// dostane událost `nastaveni` (přepínač v ⓘ ukazuje totéž).
 pub fn zvuk_z_nabidky(app: &AppHandle, zapnuto: bool) {
     if let Some(o) = app.try_state::<Ovladani>() {
-        o.zvuk.store(zapnuto, Ordering::Release);
-        log::info!("zvuk {}", if zapnuto { "zapnutý" } else { "vypnutý" });
-        let z = zamkni(&o.klavesy);
-        o.ukladac.uloz(z.konfigurace(zapnuto));
+        if o.zvuk.swap(zapnuto, Ordering::AcqRel) != zapnuto {
+            log::info!(
+                "zvuk {} (nabídka ikony)",
+                if zapnuto { "zapnutý" } else { "vypnutý" }
+            );
+            if !zapnuto {
+                // I rozehraný zvuk (Hra z ukázky ▷ po Pauze) — vypnuto = ticho.
+                zvuk::zastav();
+            }
+            zmena_nastaveni(app, &o);
+        }
     }
+}
+
+impl Ovladani {
+    /// Volby pro okno — pod zámkem zrcadla, ať pořadí sedí s hodnotami.
+    fn nastaveni_info(&self, z: &Zrcadlo) -> NastaveniInfo {
+        NastaveniInfo {
+            rev: z.nastaveni_rev,
+            zvuk: self.zvuk.load(Ordering::Acquire),
+            sdilene_klavesy: self.sdilene.load(Ordering::Acquire),
+        }
+    }
+
+    /// Co se uloží — pod zámkem zrcadla (viz [`VlaknoOkna::zrcadli`]).
+    fn konfigurace(&self, z: &Zrcadlo) -> Konfigurace {
+        z.konfigurace(
+            self.zvuk.load(Ordering::Acquire),
+            self.sdilene.load(Ordering::Acquire),
+        )
+    }
+}
+
+/// Volba se změnila (atomik už má novou hodnotu): nové pořadí, uložit
+/// a ohlásit oknu. Pod zámkem zrcadla — souběžné změny z okna a z nabídky
+/// ikony tak uloží i ohlásí vždy obě nejnovější hodnoty.
+fn zmena_nastaveni(app: &AppHandle, o: &Ovladani) -> NastaveniInfo {
+    let mut z = zamkni(&o.klavesy);
+    z.nastaveni_rev += 1;
+    o.ukladac.uloz(o.konfigurace(&z));
+    let info = o.nastaveni_info(&z);
+    drop(z);
+    let _ = app.emit(UDALOST_NASTAVENI, info);
+    // Vlákno okna předehřeje zvuk, když ✓ Zvuk zapnutý s běžícím
+    // ovladačem (Z1) — rozhoduje samo při příští obrátce.
+    o.budik.probud();
+    info
 }
 
 /// Hlavní okno je vidět (ukázané, ne minimalizované) — nebo už ne.
@@ -647,6 +792,7 @@ pub fn okno_videt(app: &AppHandle, videt: bool) {
     log::debug!("okno {}", if videt { "je vidět" } else { "není vidět" });
     o.prikazy.posli(HookPrikaz::Okno(hwnd));
     o.budik.probud();
+    let _ = app.emit(UDALOST_OKNO, videt);
 }
 
 /// Běží simulace ViGEmBus (test okna)? Pak se nesmí hlídat pojmenovaná
@@ -683,7 +829,13 @@ fn prikazy_hooku(pad: PadId, pred: Option<PadStav>, ted: PadStav) -> Vec<HookPri
         return Vec::new();
     }
     match ted {
-        PadStav::On => vec![HookPrikaz::Povol(pad), HookPrikaz::Zachytavej],
+        // Přepínač nepípá (Fáze 7, Z1) — Windows hrají zvuk připojení.
+        PadStav::On => vec![
+            HookPrikaz::Povol(pad),
+            HookPrikaz::Zachytavej {
+                zdroj: ZdrojZachytavani::Prepinac,
+            },
+        ],
         PadStav::BusMissing => vec![HookPrikaz::Zakaz(pad, DisabledReason::ViGEmMissing)],
         PadStav::Error => vec![HookPrikaz::Zakaz(pad, DisabledReason::PadError)],
         PadStav::Off | PadStav::Connecting | PadStav::BusNotRunning => {
@@ -726,6 +878,9 @@ pub fn ukonci(app: &AppHandle) {
     };
     // První, ještě před vynucenou Klávesnicí: konec nepípá.
     o.konci.store(true, Ordering::Release);
+    // Rozehraný zvuk dohasíná souběžně s koncem hooku a padů; počká se
+    // na něj až nakonec (`pockej_na_ticho`).
+    zvuk::zastav();
     let _konec = o.konec.lock().unwrap_or_else(|e| e.into_inner());
     let hook = o.hook.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(mut h) = hook {
@@ -747,6 +902,11 @@ pub fn ukonci(app: &AppHandle) {
             LIMIT_ULOZENI.as_millis()
         );
     }
+    // Ticho dřív, než proces zmizí — useknutý tón by lupl. Nestihne-li
+    // se, nic se neděje (konec je důležitější), proto bez varování.
+    let _ = zvuk::pockej_na_ticho(LIMIT_ZVUKU);
+    // Podtečení zvuku po prvních zalogovaných zvucích jen souhrnem (Z1).
+    zvuk::souhrn_pri_konci();
 }
 
 /// Číslo ovladače z okna (bez čísla = první).
@@ -839,13 +999,14 @@ pub fn rezim(o: tauri::State<'_, Ovladani>) -> RezimInfo {
 /// má rozložení okna (přepnutí jazyka v okně se tak projeví).
 #[tauri::command]
 pub fn klavesy(o: tauri::State<'_, Ovladani>) -> KlavesyInfo {
-    let (rev, m, zpet, karty, konfigurace, zaloha, chyby) = {
+    let (rev, m, zpet, karty, nastaveni, konfigurace, zaloha, chyby) = {
         let z = zamkni(&o.klavesy);
         (
             z.rev,
             Arc::clone(&z.mapovani),
             z.lze_vratit().is_some(),
             z.karty_info(),
+            o.nastaveni_info(&z),
             z.konfigurace,
             z.zaloha.clone(),
             z.chyby.clone(),
@@ -856,11 +1017,49 @@ pub fn klavesy(o: tauri::State<'_, Ovladani>) -> KlavesyInfo {
         &m,
         zpet,
         karty,
+        nastaveni,
         konfigurace,
         zaloha.as_deref(),
         &chyby,
         klavesy::nazev,
     )
+}
+
+/// Volby z ⓘ (při startu okna; změny chodí událostí `nastaveni`).
+#[tauri::command]
+pub fn nastaveni(o: tauri::State<'_, Ovladani>) -> NastaveniInfo {
+    o.nastaveni_info(&zamkni(&o.klavesy))
+}
+
+/// Přepínač volby v ⓘ (Fáze 7 Z6): platí hned, uloží se s klávesami
+/// a okno i nabídka ikony se srovnají (událost `nastaveni`, zaškrtnutí
+/// „✓ Zvuk“). Stejná hodnota znovu nic nemění.
+#[tauri::command]
+pub fn nastav(
+    app: AppHandle,
+    o: tauri::State<'_, Ovladani>,
+    volba: Volba,
+    zapnuto: bool,
+) -> NastaveniInfo {
+    let (atomik, co) = match volba {
+        Volba::Zvuk => (&o.zvuk, "zvuk"),
+        Volba::SdileneKlavesy => (&o.sdilene, "jedna klávesa pro víc vstupů"),
+    };
+    if atomik.swap(zapnuto, Ordering::AcqRel) == zapnuto {
+        return o.nastaveni_info(&zamkni(&o.klavesy));
+    }
+    log::info!(
+        "{co}: {} (okno)",
+        if zapnuto { "zapnuto" } else { "vypnuto" }
+    );
+    if volba == Volba::Zvuk {
+        crate::tray::zaskrtni_zvuk(&app, zapnuto);
+        if !zapnuto {
+            // I rozehraný zvuk (Hra z ukázky ▷ po Pauze) — vypnuto = ticho.
+            zvuk::zastav();
+        }
+    }
+    zmena_nastaveni(&app, &o)
 }
 
 /// Ovladač 2–4 z okna (karty ovladače 1 se nikdo netýkají).
@@ -874,21 +1073,54 @@ fn druhy_az_ctvrty(pad: u8) -> Result<PadId, String> {
 /// Karty se změnily: uložit (pod zámkem zrcadla, ať poslední uložení má
 /// nejnovější mapování i karty) a vrátit nový seznam oknu.
 fn uloz_karty(o: &Ovladani, z: &Zrcadlo) -> KartyInfo {
-    o.ukladac
-        .uloz(z.konfigurace(o.zvuk.load(Ordering::Acquire)));
+    o.ukladac.uloz(o.konfigurace(z));
     z.karty_info()
 }
 
-/// „+ Ovladač": karta ovladače 2–4 i bez kláves. Uloží se (OQ 52 —
-/// karta zůstane i po restartu, zmizí jen 🗑). Nic nepřipojí (princip 11).
+/// „+ Ovladač": karta ovladače 2–4 i bez kláves, rozbalená (ostatní
+/// karty se nemění). Uloží se (OQ 52 — karta zůstane i po restartu,
+/// zmizí jen 🗑). Nic nepřipojí (princip 11).
 #[tauri::command]
 pub fn pridej_kartu(o: tauri::State<'_, Ovladani>, pad: u8) -> Result<KartyInfo, String> {
     let id = druhy_az_ctvrty(pad)?;
     let mut z = zamkni(&o.klavesy);
-    if !z.zmen_karty(|k| k.pridej(id)) {
+    let nova = z.zmen_karty(|k, r| {
+        let nova = k.pridej(id);
+        if nova {
+            r.nastav(id, true);
+        }
+        nova
+    });
+    if !nova {
         return Ok(z.karty_info());
     }
     log::info!("karty: ovladač {} přidán", pad + 1);
+    Ok(uloz_karty(&o, &z))
+}
+
+/// Klik na hlavičku karty (Fáze 7 Z2): rozbalit, nebo sbalit — každou
+/// zvlášť, rozbalit jde víc i všechny. Pamatuje se v config.json (OQ 70,
+/// zapisuje vlákno `keypad-konfig` 0,5 s po poslední změně). Ovladač bez
+/// karty → chyba (okno ho nejdřív přidá „+ Ovladač“).
+#[tauri::command]
+pub fn rozbal_kartu(
+    o: tauri::State<'_, Ovladani>,
+    pad: u8,
+    rozbalena: bool,
+) -> Result<KartyInfo, String> {
+    let id = PadId::new(usize::from(pad)).ok_or(NENI_OVLADAC)?;
+    let mut z = zamkni(&o.klavesy);
+    if !z.vsechny_karty().ma(id) {
+        return Err("Ovladač nemá kartu.".into());
+    }
+    if !z.zmen_karty(|_, r| r.nastav(id, rozbalena)) {
+        return Ok(z.karty_info());
+    }
+    log::debug!(
+        "karty: ovladač {} {}",
+        pad + 1,
+        if rozbalena { "rozbalen" } else { "sbalen" }
+    );
     Ok(uloz_karty(&o, &z))
 }
 
@@ -906,6 +1138,11 @@ pub fn zive(o: tauri::State<'_, Ovladani>) -> ZivaInfo {
 /// Klik na čepičku (`pridat = false`: klávesa vstup převezme) nebo na
 /// `+` (přidá se). Hook kliknutí přijme, jen když je okno v popředí;
 /// výsledek přijde událostmi `rezim` a `oznameni`.
+///
+/// Jestli se klávesa, která už patří jinam, přesune, nebo sdílí, řídí
+/// uložená volba „Jedna klávesa pro víc vstupů“ (Fáze 7) — přidá ji
+/// backend, okno ji neposílá: okno s jinou představou o volbě by jinak
+/// mohlo sdílet, i když ji uživatel vypnul.
 #[tauri::command]
 pub fn prirad(
     o: tauri::State<'_, Ovladani>,
@@ -919,7 +1156,52 @@ pub fn prirad(
     } else {
         BindKind::Replace
     };
-    posli_hooku(&o, HookPrikaz::Prirad { cil, druh })
+    let konflikt = if o.sdilene.load(Ordering::Acquire) {
+        KeyConflict::Share
+    } else {
+        KeyConflict::Move
+    };
+    posli_hooku(
+        &o,
+        HookPrikaz::Prirad {
+            cil: cil.into(),
+            druh,
+            konflikt,
+        },
+    )
+}
+
+/// Klik na čepičku „Pauza“ v ⓘ (Fáze 7, Z6): přiřazovat zkratku
+/// pozastavení. Jako `prirad` — jen s oknem v popředí, výsledek přijde
+/// událostmi `rezim` a `oznameni`, ruší ho `zrus_prirazeni`. Které
+/// klávesy smí být zkratkou, hlídá engine (`KeyId::is_toggle_candidate`).
+#[tauri::command]
+pub fn prirad_zkratku(o: tauri::State<'_, Ovladani>) -> Result<(), String> {
+    posli_hooku(
+        &o,
+        HookPrikaz::Prirad {
+            cil: BindTarget::Toggle,
+            druh: BindKind::Replace,
+            konflikt: KeyConflict::Move,
+        },
+    )
+}
+
+/// ▷ u volby Zvuk v ⓘ (Fáze 7, Z1): Pauza, 0,6 s ticha a Hra jako jedna
+/// položka plánovače — skutečný požadavek ji zruší celou. Slyšitelné
+/// jen na klik uživatele; v simulaci ViGEmBus (testy okna) a s vypnutým
+/// zvukem nic, jen důvod pro bublinu.
+#[tauri::command]
+pub fn ukazka_zvuku(o: tauri::State<'_, Ovladani>) -> Result<(), String> {
+    match znameni::umlceni(o.zvuk.load(Ordering::Acquire), false, o.pady.simulace()) {
+        Some(znameni::Umlceni::Simulace) => Err("Simulace — zvuk se nepřehrává.".into()),
+        Some(_) => Err("Zvuk je vypnutý.".into()),
+        None => {
+            log::info!("zvuk: ukázka (okno)");
+            zvuk::prehraj_ukazku();
+            Ok(())
+        }
+    }
 }
 
 /// Esc nebo klik jinam: přiřazování skončí beze změny.
@@ -939,7 +1221,7 @@ pub fn uprav_klavesy(o: tauri::State<'_, Ovladani>, zmena: ZmenaOkna) -> Result<
             // nezmizí — schová ji jen 🗑 (OQ 52). Dřív, než se změní
             // klávesy: okno si je po změně načte i s kartami.
             let mut zr = zamkni(&o.klavesy);
-            if zr.zmen_karty(|k| k.pridej(cil.pad)) {
+            if zr.zmen_karty(|k, _| k.pridej(cil.pad)) {
                 let _ = uloz_karty(&o, &zr);
             }
             drop(zr);
@@ -993,8 +1275,14 @@ pub fn odeber_ovladac(o: tauri::State<'_, Ovladani>, pad: u8) -> Result<KartyInf
         }
         r => {
             text_upravy(r)?;
+            // Karta i její rozbalení pryč (nová karta téhož ovladače
+            // přijde zase rozbalená).
             let mut z = zamkni(&o.klavesy);
-            let karty = if z.zmen_karty(|k| k.odeber(id)) {
+            let karty = if z.zmen_karty(|k, r| {
+                let karta = k.odeber(id);
+                let rozbalena = r.nastav(id, false);
+                karta || rozbalena
+            }) {
                 uloz_karty(&o, &z)
             } else {
                 z.karty_info()
@@ -1213,7 +1501,15 @@ mod tests {
         for pred in [None, Some(PadStav::Off), Some(PadStav::Connecting)] {
             let v = prikazy_hooku(p, pred, PadStav::On);
             assert!(
-                matches!(v[..], [HookPrikaz::Povol(x), HookPrikaz::Zachytavej] if x == p),
+                matches!(
+                    v[..],
+                    [
+                        HookPrikaz::Povol(x),
+                        HookPrikaz::Zachytavej {
+                            zdroj: ZdrojZachytavani::Prepinac
+                        }
+                    ] if x == p
+                ),
                 "{v:?}"
             );
         }
@@ -1345,6 +1641,7 @@ mod tests {
         let mut z = Zrcadlo::novy(
             m0.clone(),
             Karty::PRVNI,
+            Rozbalene::PRVNI,
             StavKonfigurace::Ok,
             None,
             Vec::new(),
@@ -1363,30 +1660,57 @@ mod tests {
         assert_eq!(z.rev, 4);
     }
 
-    /// Karty v zrcadle (OQ 52): pořadí roste jen se skutečnou změnou
-    /// (okno podle něj zahodí starší seznam), ovladač 1 se neodebere
-    /// a uložená konfigurace nese karty s mapováním ze zrcadla.
+    /// Karty v zrcadle (OQ 52, 70): pořadí roste jen se skutečnou změnou
+    /// (okno podle něj zahodí starší seznam), ovladač 1 se neodebere,
+    /// rozbalené jen z karet v okně a uložená konfigurace nese karty,
+    /// rozbalení i volby s mapováním ze zrcadla.
     #[test]
     fn karty_v_zrcadle() {
         let p = |i| PadId::new(i).unwrap();
         let mut z = Zrcadlo::novy(
             Mapping::default(),
             Karty::PRVNI,
+            Rozbalene::PRVNI,
             StavKonfigurace::Ok,
             None,
             Vec::new(),
         );
         assert_eq!(z.karty_info().pady, vec![0]);
-        assert!(z.zmen_karty(|k| k.pridej(p(2))));
-        assert!(!z.zmen_karty(|k| k.pridej(p(2))), "už tam je");
-        assert!(!z.zmen_karty(|k| k.odeber(PadId::FIRST)), "ovladač 1 vždy");
+        assert_eq!(z.karty_info().rozbalene, vec![0]);
+        assert!(z.zmen_karty(|k, _| k.pridej(p(2))));
+        assert!(!z.zmen_karty(|k, _| k.pridej(p(2))), "už tam je");
+        assert!(
+            !z.zmen_karty(|k, _| k.odeber(PadId::FIRST)),
+            "ovladač 1 vždy"
+        );
         let i = z.karty_info();
         assert_eq!((i.rev, i.pady), (1, vec![0, 2]));
-        let k = z.konfigurace(false);
-        assert_eq!((k.karty, k.zvuk), (z.karty, false));
+        assert!(z.zmen_karty(|_, r| r.nastav(p(2), true)));
+        assert!(z.zmen_karty(|_, r| r.nastav(PadId::FIRST, false)));
+        assert!(!z.zmen_karty(|_, r| r.nastav(PadId::FIRST, false)));
+        assert_eq!(z.karty_info().rozbalene, vec![2]);
+        assert_eq!(z.karty_info().rev, 3);
+        // Rozbalení ovladače bez karty se oknu neukáže.
+        assert!(z.zmen_karty(|_, r| r.nastav(p(3), true)));
+        assert_eq!(z.karty_info().rozbalene, vec![2]);
+        let k = z.konfigurace(false, true);
+        assert_eq!(
+            (k.karty, k.rozbalene, k.zvuk, k.sdilene_klavesy),
+            (z.karty, z.rozbalene, false, true)
+        );
         assert_eq!(k.mapovani, Mapping::default());
-        assert!(z.zmen_karty(|k| k.odeber(p(2))));
-        assert_eq!(z.karty_info().rev, 2);
+        assert!(z.zmen_karty(|k, _| k.odeber(p(2))));
+        assert_eq!(z.karty_info().rev, 5);
+        // Ovladač s klávesami má kartu vždy (i bez uložené).
+        let mut m = Mapping::default();
+        m.bind(
+            KeyId::X,
+            PadAction::new(p(1), Action::Button(PadButton::A)),
+            keypad_core::KeyConflict::Move,
+        )
+        .unwrap();
+        assert!(z.prevezmi(1, Arc::new(m)));
+        assert_eq!(z.karty_info().pady, vec![0, 1]);
         assert_eq!(
             druhy_az_ctvrty(0).map(PadId::index),
             Err("Ovladač 1 má kartu vždy.".into())

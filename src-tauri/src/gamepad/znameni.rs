@@ -1,14 +1,17 @@
-//! Znamení pozastavení mimo okno (Fáze 4b): kdy pípnout a co ukázat
-//! v oznamovací oblasti. Čisté funkce — rozhodování se testuje celou
-//! tabulkou, bez zvuku a bez ikony; vlákno okna je jen volá.
+//! Znamení pozastavení mimo okno (Fáze 4b, pravidla zvuku Fáze 7): kdy
+//! pípnout a co ukázat v oznamovací oblasti. Čisté funkce — rozhodování
+//! se testuje celou tabulkou, bez zvuku a bez ikony; vlákno okna je jen
+//! volá.
 //!
 //! Zvuk nese hlavní zprávu (ikonu hra přes celou obrazovku skryje),
 //! proto pípá jen tam, kde hráč změnu sám nezpůsobil nebo ji nevidí:
-//! pozastavení zkratkou, nabídkou a pojistkou, návrat do hry. Zapnutí
-//! a vypnutí přepínačem v okně nepípá — uživatel se právě dívá do okna
-//! a Windows hrají svůj zvuk připojení a odpojení zařízení. Zamčení
-//! počítače taky ne; Windows ho ale ohlásí až po přepnutí plochy, a tak
-//! tón k přepnutí plochy (výzva UAC) chvíli čeká ([`ODKLAD_PLOCHY_MS`]).
+//! pozastavení zkratkou, nabídkou a pojistkou, návrat do hry. Přepínač
+//! ovladače v okně nepípá NIKDY (Fáze 7) — uživatel se právě dívá do
+//! okna a Windows hrají svůj zvuk připojení a odpojení zařízení; pípnutí
+//! KeyPadu k tomu vlastník slyšel jako „náhodně vyšší a nižší tón,
+//! nezávisle na zapnutí a vypnutí“. Zamčení počítače taky ne; Windows ho
+//! ale ohlásí až po přepnutí plochy, a tak tón k přepnutí plochy (výzva
+//! UAC) chvíli čeká ([`ODKLAD_PLOCHY_MS`]).
 
 use keypad_core::{ForceReason, MAX_PADS};
 
@@ -17,12 +20,18 @@ use crate::platform::windows::vystup::{Pricina, Rezim};
 use crate::platform::windows::zvuk::Zvuk;
 use crate::tray::{DruhIkony, TrayStav};
 
-/// Zvuk k přechodu režimu `pred` → `ted` (tabulka „Pravidla zvuku“
-/// ve specifikaci Fáze 6, OQ 45). Ticho při konci aplikace, vypnutém
-/// zvuku a simulaci řeší [`smi_znit`], odklad tónu k přepnutí plochy
+/// Zvuk k přechodu režimu `pred` → `ted` (tabulka „Pravidla zvuku“ ve
+/// specifikaci Fáze 7, Z1). Ticho při konci aplikace, vypnutém zvuku
+/// a simulaci řeší [`umlceni`], odklad tónu k přepnutí plochy
 /// [`Znameni`].
 pub fn zvuk_pro(pred: Rezim, ted: Rezim, pricina: Pricina) -> Option<Zvuk> {
     use Rezim::{Binding, Capturing, Disabled, NoHook, Paused};
+    // Přepínač nepípá v žádném řádku — ani když zapnutím dalšího
+    // ovladače zruší pauzu, ani když zároveň obnoví hook („klávesy
+    // nejdou“ → hra).
+    if pricina == Pricina::Prepinac {
+        return None;
+    }
     match (pred, ted) {
         // Přiřazování klávesy začíná i končí v okně, na které se hráč
         // právě dívá.
@@ -39,22 +48,95 @@ pub fn zvuk_pro(pred: Rezim, ted: Rezim, pricina: Pricina) -> Option<Zvuk> {
             // Watchdog, chyba padu, panika, UAC, přeinstalace hooku, změna
             // mapování: hráč jinak nepozná, proč klávesy přestaly hrát.
             Pricina::Vynuceno(_) => Some(Zvuk::Pauza),
-            Pricina::Nic | Pricina::Ovladac | Pricina::OvladacChyba | Pricina::Prirazovani => None,
+            Pricina::Nic
+            | Pricina::Ovladac
+            | Pricina::OvladacChyba
+            | Pricina::Prirazovani
+            | Pricina::Prepinac => None,
         },
         (Capturing, NoHook) => Some(Zvuk::Pauza),
         // Jen výpadek chybou: vypnutí přepínačem a spánek (`Ovladac`)
-        // doprovodí zvuk odpojení od Windows.
+        // doprovodí zvuk odpojení od Windows. Chyba, která virtuální
+        // ovladač odebere, může zaznít spolu se zvukem odpojení (otázka
+        // 73) — hráč se ale musí dozvědět, že klávesy přestaly hrát.
         (Capturing, Disabled) if pricina == Pricina::OvladacChyba => Some(Zvuk::Pauza),
+        // Zkratka, „Pokračovat“ v nabídce ikony, obnova hooku
+        // přeinstalací. Přepínač odfiltrovaný výš.
         (Paused | NoHook, Capturing) => Some(Zvuk::Hra),
         _ => None,
     }
 }
 
+/// Proč zvuk nezazní, i když ho změna režimu chce (debug log
+/// rozhodnutí: „zvuk: Hra (ztlumeno: simulace)“).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Umlceni {
+    /// Aplikace končí — konec vynucuje Klávesnici a zněl by jako
+    /// pozastavení.
+    Konec,
+    /// Simulace ViGEmBus — testy okna nesmí pípat vlastníkovi.
+    Simulace,
+    /// ✓ Zvuk je odškrtnutý.
+    VypnutyZvuk,
+}
+
+impl Umlceni {
+    pub fn popis(self) -> &'static str {
+        match self {
+            Umlceni::Konec => "konec aplikace",
+            Umlceni::Simulace => "simulace",
+            Umlceni::VypnutyZvuk => "vypnutý zvuk",
+        }
+    }
+}
+
+/// Proč by vlákno okna teď nepíplo (`None` = smí). Pořadí: konec
+/// aplikace, simulace, vypnutý zvuk — v simulaci se tak debug log
+/// i příkaz ukázky odvolávají na simulaci, ať je zvuk zapnutý, nebo ne.
+pub fn umlceni(zvuk_zapnuty: bool, konci: bool, simulace: bool) -> Option<Umlceni> {
+    if konci {
+        Some(Umlceni::Konec)
+    } else if simulace {
+        Some(Umlceni::Simulace)
+    } else if !zvuk_zapnuty {
+        Some(Umlceni::VypnutyZvuk)
+    } else {
+        None
+    }
+}
+
 /// Smí vlákno okna pípnout: ✓ Zvuk je zaškrtnutý, aplikace nekončí
-/// (konec vynucuje Klávesnici a zněl by jako pozastavení) a nejde
-/// o simulaci ViGEmBus (testy okna nesmí pípat vlastníkovi).
+/// a nejde o simulaci ViGEmBus ([`umlceni`]). Jen pro testy posloupností —
+/// vlákno okna bere důvod ([`umlceni`]) kvůli debug logu.
+#[cfg(test)]
 pub fn smi_znit(zvuk_zapnuty: bool, konci: bool, simulace: bool) -> bool {
-    zvuk_zapnuty && !konci && !simulace
+    umlceni(zvuk_zapnuty, konci, simulace).is_none()
+}
+
+/// Rozhodnutí o zvuku jedné obrátky vlákna okna.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rozhodnuti {
+    pub zvuk: Zvuk,
+    /// `Some` = nezazní (a proč).
+    pub umlceno: Option<Umlceni>,
+}
+
+impl Rozhodnuti {
+    /// Řádek do logu: „zvuk: Pauza“, „zvuk: Hra (ztlumeno: simulace)“.
+    /// Vlákno okna ho píše jen v debug buildu — `okno-test` běží
+    /// v simulaci, kde se všechno umlčí, a cesta okno → znamení → zvuk by
+    /// se jinak end-to-end nikdy neprověřila.
+    pub fn popis(self) -> String {
+        match self.umlceno {
+            None => format!("zvuk: {:?}", self.zvuk),
+            Some(u) => format!("zvuk: {:?} (ztlumeno: {})", self.zvuk, u.popis()),
+        }
+    }
+
+    /// Zvuk, který se má opravdu přehrát.
+    pub fn prehrat(self) -> Option<Zvuk> {
+        self.umlceno.is_none().then_some(self.zvuk)
+    }
 }
 
 /// Jak dlouho tón k přepnutí plochy čeká, jestli nejde o zamčení.
@@ -90,10 +172,12 @@ impl Znameni {
     }
 
     /// Jedna obrátka vlákna okna; vrátí tón, který se má přehrát teď.
+    /// Jako [`Znameni::rozhodni`], jen bez důvodu umlčení.
     ///
     /// `zmena` = nový režim a příčina, když se od minulé obrátky změnilo
     /// číslo změny. `ted` = `GetTickCount64`. `zamek` = kdy se naposledy
     /// zamkla relace (0 = zatím ne). `smi` = [`smi_znit`].
+    #[cfg(test)]
     pub fn obratka(
         &mut self,
         zmena: Option<(Rezim, Pricina)>,
@@ -101,6 +185,24 @@ impl Znameni {
         zamek: u64,
         smi: bool,
     ) -> Option<Zvuk> {
+        // Důvod tu nikoho nezajímá — jen to, že nesmí znít.
+        let umlceno = (!smi).then_some(Umlceni::VypnutyZvuk);
+        self.rozhodni(zmena, ted, zamek, umlceno)
+            .and_then(Rozhodnuti::prehrat)
+    }
+
+    /// Jedna obrátka vlákna okna: zvuk, který si změna žádá teď, i když
+    /// nezazní (`umlceno` — debug log rozhodnutí). `umlceni` =
+    /// [`umlceni`]; umlčená obrátka zahodí i tón čekající na odklad.
+    /// Přehrát jen [`Rozhodnuti::prehrat`].
+    pub fn rozhodni(
+        &mut self,
+        zmena: Option<(Rezim, Pricina)>,
+        ted: u64,
+        zamek: u64,
+        umlceni: Option<Umlceni>,
+    ) -> Option<Rozhodnuti> {
+        let smi = umlceni.is_none();
         let mut zvuk = None;
         // Čekající tón zruší zamčení. Novější změna ho nahradí: ohlašoval
         // stav, který už neplatí (uspání hned po přepnutí plochy je tiché,
@@ -119,18 +221,22 @@ impl Znameni {
             // posune — obráceně by žádná změna nepípla.
             let z = zvuk_pro(self.zaklad, rezim, pricina);
             self.zaklad = zaklad_zvuku(rezim, pricina);
-            if pricina == Pricina::Vynuceno(ForceReason::DesktopSwitch) {
+            if pricina == Pricina::Vynuceno(ForceReason::DesktopSwitch) && smi {
                 self.odlozeny = z.map(|z| (z, ted));
             } else {
+                // Umlčený tón k přepnutí plochy se do logu hlásí hned —
+                // čekat na odklad by nemělo proč.
                 zvuk = z;
             }
         }
         if !smi {
             // I čekající tón: zvuk vypnutý během odkladu, konec aplikace.
             self.odlozeny = None;
-            return None;
         }
-        zvuk
+        zvuk.map(|zvuk| Rozhodnuti {
+            zvuk,
+            umlceno: umlceni,
+        })
     }
 
     /// Za kolik ms se má vlákno okna probudit kvůli čekajícímu tónu;
@@ -275,14 +381,19 @@ mod tests {
             Pricina::Ovladac,
             Pricina::OvladacChyba,
             Pricina::Prirazovani,
+            Pricina::Prepinac,
         ];
         v.extend(VYNUCENI.map(Pricina::Vynuceno));
         v
     }
 
-    /// Nezávislý přepis tabulky „Pravidla zvuku“ řádek po řádku — test
-    /// jím prochází VŠECHNY kombinace, ne jen vybrané.
+    /// Nezávislý přepis tabulky „Pravidla zvuku“ (Fáze 7) řádek po řádku
+    /// — test jím prochází VŠECHNY kombinace, ne jen vybrané.
     fn podle_tabulky(pred: Rezim, ted: Rezim, p: Pricina) -> Option<Zvuk> {
+        // Přepínač nepípá nikdy (každý řádek tabulky).
+        if p == Pricina::Prepinac {
+            return None;
+        }
         if pred == Rezim::Binding || ted == Rezim::Binding {
             return None;
         }
@@ -350,6 +461,37 @@ mod tests {
         assert_eq!(z(Disabled, Capturing, Pricina::Okno), None);
         assert_eq!(z(Capturing, Binding, Pricina::Okno), None);
         assert_eq!(z(Binding, Capturing, Pricina::Prirazovani), None);
+        // „Pokračovat“ z nabídky ikony pípne, přepínač ne — ani z pauzy
+        // (zapnutí dalšího ovladače), ani z „klávesy nejdou“.
+        assert_eq!(z(Paused, Capturing, Pricina::Okno), Some(Zvuk::Hra));
+        assert_eq!(z(NoHook, Capturing, Pricina::Okno), Some(Zvuk::Hra));
+        assert_eq!(z(Paused, Capturing, Pricina::Prepinac), None);
+        assert_eq!(z(NoHook, Capturing, Pricina::Prepinac), None);
+        assert_eq!(z(Disabled, Capturing, Pricina::Prepinac), None);
+    }
+
+    /// Mutant „přepínač pípá“: s příčinou přepínače nezazní nic v žádném
+    /// řádku (všechny dvojice režimů), i když táž změna s jinou příčinou
+    /// pípá.
+    #[test]
+    fn prepinac_nikdy_nepipa() {
+        let mut pipaly_by = 0;
+        for pred in REZIMY {
+            for ted in REZIMY {
+                assert_eq!(
+                    zvuk_pro(pred, ted, Pricina::Prepinac),
+                    None,
+                    "{pred:?} → {ted:?}"
+                );
+                if priciny()
+                    .into_iter()
+                    .any(|p| zvuk_pro(pred, ted, p).is_some())
+                {
+                    pipaly_by += 1;
+                }
+            }
+        }
+        assert!(pipaly_by >= 4, "tabulka jinak pípá");
     }
 
     /// Posloupnost změn, jak ji vidí vlákno okna ([`Znameni`]): po každé
@@ -369,22 +511,46 @@ mod tests {
 
     /// První zapnutí ovladače nepípá, ať vlákno okna mezikrok
     /// „pozastaveno“ stihne vidět, nebo ne; zapnutí dalšího ovladače
-    /// z pozastavení (OQ 34) a zkratka pípají.
+    /// z pozastavení (OQ 34, 66) taky ne; zkratka a „Pokračovat“
+    /// v nabídce ikony pípají.
     #[test]
     fn prvni_zapnuti_nepipa() {
         use Rezim::*;
+        let prep = Pricina::Prepinac;
+        assert!(zvuky(&[(Paused, Pricina::Ovladac), (Capturing, prep)]).is_empty());
+        assert!(zvuky(&[(Capturing, prep)]).is_empty());
+        // I kdyby přepínač nesl příčinu okna (starý hook), první zapnutí
+        // je tiché díky základu `Disabled`.
         assert!(zvuky(&[(Paused, Pricina::Ovladac), (Capturing, Pricina::Okno)]).is_empty());
-        assert!(zvuky(&[(Capturing, Pricina::Okno)]).is_empty());
         assert_eq!(
             zvuky(&[
                 (Paused, Pricina::Ovladac),
-                (Capturing, Pricina::Okno),
+                (Capturing, prep),
                 (Paused, Pricina::Zkratka),
+                // „Pokračovat“ z nabídky ikony.
                 (Capturing, Pricina::Okno),
+                // „Pozastavit“ z nabídky ikony.
                 (Paused, Pricina::Okno),
                 (Capturing, Pricina::Zkratka),
+                (Paused, Pricina::Zkratka),
+                // Zapnutí druhého ovladače z pauzy: hra bez pípnutí.
+                (Capturing, prep),
+                // Vypnutí druhého přepínačem: režim se nemění, nic.
+                (Capturing, Pricina::Ovladac),
+                // Hook vypadl a zapnutí dalšího ovladače ho obnovilo.
+                (NoHook, Pricina::Nic),
+                (Capturing, prep),
+                // Vypnutí posledního přepínačem.
+                (Disabled, Pricina::Ovladac),
             ]),
-            [Zvuk::Pauza, Zvuk::Hra, Zvuk::Pauza, Zvuk::Hra]
+            [
+                Zvuk::Pauza,
+                Zvuk::Hra,
+                Zvuk::Pauza,
+                Zvuk::Hra,
+                Zvuk::Pauza,
+                Zvuk::Pauza
+            ]
         );
         // Mezikrok jen pro zvuk — jinde se režim nemění.
         for r in REZIMY {
@@ -436,6 +602,100 @@ mod tests {
         }
         assert!(smi_znit(true, false, false));
         assert!(!smi_znit(true, true, false), "konec aplikace nepípá");
+    }
+
+    /// Důvod umlčení: konec přebíjí simulaci, simulace vypnutý zvuk.
+    #[test]
+    fn umlceni_celou_tabulkou() {
+        for zapnuty in [false, true] {
+            for konci in [false, true] {
+                for simulace in [false, true] {
+                    let cekano = if konci {
+                        Some(Umlceni::Konec)
+                    } else if simulace {
+                        Some(Umlceni::Simulace)
+                    } else if !zapnuty {
+                        Some(Umlceni::VypnutyZvuk)
+                    } else {
+                        None
+                    };
+                    assert_eq!(umlceni(zapnuty, konci, simulace), cekano);
+                }
+            }
+        }
+    }
+
+    /// Debug log rozhodnutí: umlčený zvuk se ohlásí s důvodem (okno-test
+    /// v simulaci podle toho ověří cestu okno → znamení → zvuk), ale
+    /// nepřehraje se; přepínač nedá ani umlčený řádek.
+    #[test]
+    fn rozhodnuti_i_umlcene() {
+        use Rezim::*;
+        let sim = Some(Umlceni::Simulace);
+        let mut z = Znameni::new(Disabled);
+        assert_eq!(
+            z.rozhodni(Some((Paused, Pricina::Ovladac)), 0, 0, sim),
+            None
+        );
+        assert_eq!(
+            z.rozhodni(Some((Capturing, Pricina::Prepinac)), 0, 0, sim),
+            None
+        );
+        let r = z
+            .rozhodni(Some((Paused, Pricina::Zkratka)), 10, 0, sim)
+            .unwrap();
+        assert_eq!(r.popis(), "zvuk: Pauza (ztlumeno: simulace)");
+        assert_eq!(r.prehrat(), None);
+        let r = z
+            .rozhodni(Some((Capturing, Pricina::Zkratka)), 20, 0, None)
+            .unwrap();
+        assert_eq!(r.popis(), "zvuk: Hra");
+        assert_eq!(r.prehrat(), Some(Zvuk::Hra));
+        let r = z
+            .rozhodni(
+                Some((Paused, Pricina::Zkratka)),
+                30,
+                0,
+                Some(Umlceni::VypnutyZvuk),
+            )
+            .unwrap();
+        assert_eq!(r.popis(), "zvuk: Pauza (ztlumeno: vypnutý zvuk)");
+        assert_eq!(
+            Rozhodnuti {
+                zvuk: Zvuk::Hra,
+                umlceno: Some(Umlceni::Konec)
+            }
+            .popis(),
+            "zvuk: Hra (ztlumeno: konec aplikace)"
+        );
+        // Umlčený tón k přepnutí plochy se ohlásí hned a nic nečeká.
+        let plocha = Pricina::Vynuceno(ForceReason::DesktopSwitch);
+        let mut z = Znameni::new(Capturing);
+        let r = z.rozhodni(Some((Paused, plocha)), 0, 0, sim).unwrap();
+        assert_eq!(r.prehrat(), None);
+        assert_eq!(z.probudit_za(0), None);
+        assert_eq!(z.rozhodni(None, ODKLAD_PLOCHY_MS, 0, None), None);
+        // `obratka` dává totéž jako `rozhodni` + `prehrat`.
+        let mut a = Znameni::new(Capturing);
+        let mut b = Znameni::new(Capturing);
+        for (i, (rezim, p)) in [
+            (Paused, Pricina::Zkratka),
+            (Capturing, Pricina::Okno),
+            (Paused, plocha),
+            (Capturing, Pricina::Prepinac),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let t = i as u64 * 1_000;
+            for (zmena, ted) in [(Some((rezim, p)), t), (None, t + ODKLAD_PLOCHY_MS)] {
+                assert_eq!(
+                    a.obratka(zmena, ted, 0, true),
+                    b.rozhodni(zmena, ted, 0, None)
+                        .and_then(Rozhodnuti::prehrat)
+                );
+            }
+        }
     }
 
     /// Když zvuk nesmí znít (✓ Zvuk odškrtnutý, konec, simulace), nezazní

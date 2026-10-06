@@ -53,9 +53,9 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
 use keypad_core::{
-    BindKind, BindingCancel, BindingReject, Decision, DisabledReason, Engine, ForceReason, HeldKey,
-    KeyId, LiveInputs, Mapping, MappingError, Mode, Owner, PadAction, PadId, PadState, PadUpdates,
-    UiEvent, MAX_PADS,
+    BindKind, BindTarget, BindingCancel, BindingReject, Decision, DisabledReason, Engine,
+    ForceReason, HeldKey, KeyConflict, KeyId, LiveInputs, Mapping, MappingError, Mode, Owner,
+    PadAction, PadId, PadState, PadUpdates, UiEvent, MAX_PADS,
 };
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -208,6 +208,14 @@ pub trait Vystup: Send + Sync {
     /// nevidí.
     fn rozhodnuti(&self, udalost: Option<&Udalost>, d: &Decision, rezim: Mode);
 
+    /// Jako [`Vystup::rozhodnuti`], jen změnu režimu způsobil přepínač
+    /// ovladače v okně (`Zachytavej { zdroj: Prepinac }`): přepínač nikdy
+    /// nepípá (Fáze 7, Z1), a engine o zdroji neví (`capture()` posílá
+    /// i „Pokračovat“ z nabídky ikony). Volá jen smyčka.
+    fn rozhodnuti_prepinace(&self, d: &Decision, rezim: Mode) {
+        self.rozhodnuti(None, d, rezim);
+    }
+
     /// Hook nejde dostat do systému (`true`), nebo zase jde (`false`).
     /// Volá jen smyčka, nikdy callback. Okno pak nesmí tvrdit, že
     /// klávesy ovládají ovladač (princip 8).
@@ -244,10 +252,11 @@ pub enum HookPrikaz {
     Zakaz(PadId, DisabledReason),
     /// Přepnout Klávesnice ↔ Gamepad (nabídka ikony).
     Prepni,
-    /// Uživatel zapnul ovladač přepínačem: zachytávat. Z pozastavení se
-    /// hook předtím nainstaluje znovu — Windows ho mohli potichu odebrat
-    /// a zachytávání by jinak jen předstíralo, že běží.
-    Zachytavej,
+    /// Uživatel zapnul ovladač přepínačem (nebo „Pokračovat“ v nabídce
+    /// ikony): zachytávat. Z pozastavení se hook předtím nainstaluje znovu
+    /// — Windows ho mohli potichu odebrat a zachytávání by jinak jen
+    /// předstíralo, že běží. `zdroj` rozhodne o zvuku (přepínač nepípá).
+    Zachytavej { zdroj: ZdrojZachytavani },
     /// Vynutit Klávesnici (fail-safe).
     Vynut(ForceReason),
     /// Vynutit Klávesnici a zapomenout držené klávesy — key-upy se
@@ -269,8 +278,15 @@ pub enum HookPrikaz {
     Okno(Option<isize>),
     /// Klik na čepičku: přiřazovat klávesu. Přijme se, jen když je okno
     /// V TU CHVÍLI v popředí — klávesu stisknutou jinde (hra, chat) by
-    /// přiřazování spolklo.
-    Prirad { cil: PadAction, druh: BindKind },
+    /// přiřazování spolklo. `konflikt` = přesunout, nebo sdílet klávesu,
+    /// která už patří jinam (volba „Jedna klávesa pro víc vstupů“, Fáze 7;
+    /// přidává ho vlákno příkazu podle uložené volby, ne okno). Cíl
+    /// `Toggle` = čepička zkratky pozastavení v ⓘ (Fáze 7, Z6).
+    Prirad {
+        cil: BindTarget,
+        druh: BindKind,
+        konflikt: KeyConflict,
+    },
     /// Esc, klik jinam v okně: přiřazování skončí beze změny.
     ZrusPrirazeni,
     /// Úprava mapování z editoru, i za hry (bez pozastavení, OQ 43).
@@ -290,6 +306,16 @@ pub enum HookPrikaz {
     /// ([`zpracuj_udalost`]). Jen v debug buildu.
     #[cfg(debug_assertions)]
     TestKlavesa { klavesa: KeyId, vk: u32, dolu: bool },
+}
+
+/// Kdo zapnul zachytávání ([`HookPrikaz::Zachytavej`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ZdrojZachytavani {
+    /// Přepínač ovladače v okně — nepípá (uživatel se dívá do okna
+    /// a Windows hrají zvuk připojení).
+    Prepinac,
+    /// „Pokračovat“ v nabídce ikony — pípne jako zkratka.
+    Nabidka,
 }
 
 /// Co se má s mapováním udělat ([`HookPrikaz::Uprav`]).
@@ -990,6 +1016,13 @@ enum Neprirazeno {
     /// Poslal ji program, ne klávesnice — hook vstříknuté klávesy
     /// propouští a engine je nevidí.
     Vstrcena,
+    /// Klávesa už ovládá 4 vstupy a sdílet ji nejde (Fáze 7).
+    Plno,
+    /// Přiřazuje se zkratka pozastavení a klávesa ovládá vstup (Fáze 7, Z6).
+    Namapovana,
+    /// Přiřazuje se zkratka pozastavení a klávesa není F1–F24 (bez F4), Scroll Lock
+    /// ani Pause (Fáze 7, Z6).
+    Nevhodna,
     /// Klávesa, kterou engine už držel jako klávesu ovladače nebo
     /// spolknutou (stisknutou před přiřazováním, za hry) — její stisk je
     /// pro engine autorepeat.
@@ -999,7 +1032,7 @@ enum Neprirazeno {
 }
 
 impl Neprirazeno {
-    const VSE: [Neprirazeno; 9] = [
+    const VSE: [Neprirazeno; 12] = [
         Neprirazeno::Modifikator,
         Neprirazeno::Win,
         Neprirazeno::SWin,
@@ -1007,6 +1040,9 @@ impl Neprirazeno {
         Neprirazeno::Drzena,
         Neprirazeno::Zkratka,
         Neprirazeno::Vstrcena,
+        Neprirazeno::Plno,
+        Neprirazeno::Namapovana,
+        Neprirazeno::Nevhodna,
         Neprirazeno::UzDrzena,
         Neprirazeno::Jine,
     ];
@@ -1020,6 +1056,9 @@ impl Neprirazeno {
             Neprirazeno::Drzena => "držená Windows",
             Neprirazeno::Zkratka => "zkratka pauzy",
             Neprirazeno::Vstrcena => "vstříknutá",
+            Neprirazeno::Plno => "už 4 vstupy",
+            Neprirazeno::Namapovana => "namapovaná",
+            Neprirazeno::Nevhodna => "nevhodná pro pauzu",
             Neprirazeno::UzDrzena => "už držená",
             Neprirazeno::Jine => "jiné",
         }
@@ -1152,7 +1191,7 @@ impl Doruceni {
 /// Běžící přiřazování z pohledu diagnostiky.
 #[derive(Clone, Copy, Debug)]
 struct Prirazovani {
-    cil: PadAction,
+    cil: BindTarget,
     od_ms: u64,
     pocty: Pocty,
     /// Poslední stisk (VK, scan, E0), dokud ho nepustí — další stisk
@@ -1243,6 +1282,9 @@ fn eviduj_stisk(s: &mut Stav, u: &Udalost, pred: Option<HeldKey>, s_win: bool, d
             BindingReject::Reserved => Neprirazeno::Win,
             BindingReject::Unmappable => Neprirazeno::Nemapovatelna,
             BindingReject::ToggleKey => Neprirazeno::Zkratka,
+            BindingReject::TooManyTargets => Neprirazeno::Plno,
+            BindingReject::Mapped => Neprirazeno::Namapovana,
+            BindingReject::NotToggleKey => Neprirazeno::Nevhodna,
         },
         _ if u.vstrcena() => Neprirazeno::Vstrcena,
         _ if s_win => Neprirazeno::SWin,
@@ -1428,7 +1470,7 @@ fn vlakno(
                         HookPrikaz::Preinstaluj if !hook.is_invalid() => {
                             hook = preinstaluj(hook, &status);
                         }
-                        HookPrikaz::Zachytavej => {
+                        HookPrikaz::Zachytavej { zdroj } => {
                             // Jen z pozastavení: při běžícím zachytávání
                             // (zapnutý druhý ovladač) by přeinstalace
                             // zapomněla klávesy, které hráč 1 právě drží.
@@ -1438,7 +1480,8 @@ fn vlakno(
                             // Bez hooku v systému by zachytávání jen
                             // předstíralo, že běží (princip 8).
                             if !hook.is_invalid() {
-                                s_enginem(|e| e.capture(ted_ms()));
+                                let prepinac = zdroj == ZdrojZachytavani::Prepinac;
+                                s_enginem_s(prepinac, |e| e.capture(ted_ms()));
                             }
                         }
                         HookPrikaz::Povol(pad) => {
@@ -1948,7 +1991,11 @@ fn hlidej_casovac(casovac: usize) -> usize {
 fn proved(p: HookPrikaz) {
     let ted = ted_ms();
     match p {
-        HookPrikaz::Prirad { cil, druh } => match prijmi_prirazovani() {
+        HookPrikaz::Prirad {
+            cil,
+            druh,
+            konflikt,
+        } => match prijmi_prirazovani() {
             Ok(()) => {
                 // Dřív, než se začne čekat na stisk: Raw Input klávesnice
                 // by s oknem KeyPadu v popředí hook podle všeho umlčel
@@ -1960,7 +2007,7 @@ fn proved(p: HookPrikaz) {
                 // Win (key-up, který hook neviděl) by jinak přiřazování
                 // zablokovaly: nic by se nepřiřadilo a Esc by nezrušil.
                 srovnej_pred_prirazovanim();
-                s_enginem(|e| e.start_binding(cil, druh, ted));
+                s_enginem(|e| e.start_binding(cil, druh, konflikt, ted));
             }
             Err(proc) => log::debug!("přiřazování: {proc} — klik se nepřijímá"),
         },
@@ -1999,7 +2046,7 @@ fn prikaz(e: &mut Engine, p: HookPrikaz, ted: u64) -> Decision {
         HookPrikaz::Povol(pad) => e.enable(pad),
         HookPrikaz::Zakaz(pad, duvod) => e.disable(pad, duvod),
         HookPrikaz::Prepni => e.toggle(ted),
-        HookPrikaz::Zachytavej => e.capture(ted),
+        HookPrikaz::Zachytavej { .. } => e.capture(ted),
         HookPrikaz::Vynut(duvod) => e.force_keyboard(duvod),
         HookPrikaz::Zapomen(duvod) => e.reset_held(duvod),
         // Přeinstalaci, okno, přiřazování, úpravy a snímek dělá smyčka
@@ -2056,11 +2103,17 @@ fn zverejni() {
 
 /// Zavolá engine mimo callback a rozhodnutí předá dál.
 fn s_enginem(f: impl FnOnce(&mut Engine) -> Decision) {
+    s_enginem_s(false, f);
+}
+
+/// Jako [`s_enginem`]; `prepinac` = změnu režimu způsobil přepínač
+/// ovladače v okně ([`Vystup::rozhodnuti_prepinace`]).
+fn s_enginem_s(prepinac: bool, f: impl FnOnce(&mut Engine) -> Decision) {
     STAV.with(|s| {
         let mut s = s.borrow_mut();
         if let Some(s) = s.as_mut().filter(|s| !s.rozbity) {
             let d = f(&mut s.engine);
-            predej(s, None, &d);
+            predej_s(s, None, &d, prepinac);
         }
     });
 }
@@ -2071,8 +2124,17 @@ fn s_enginem(f: impl FnOnce(&mut Engine) -> Decision) {
 /// změna přišla. Jen atomiky, `SetEvent` a zápis polí stavu (volá se
 /// z callbacku).
 fn predej(s: &mut Stav, u: Option<&Udalost>, d: &Decision) {
+    predej_s(s, u, d, false);
+}
+
+/// [`predej`]; `prepinac` jen ze smyčky (příkaz `Zachytavej` přepínače).
+fn predej_s(s: &mut Stav, u: Option<&Udalost>, d: &Decision, prepinac: bool) {
     sleduj_prirazovani(s, d);
-    s.vystup.rozhodnuti(u, d, s.engine.mode());
+    if prepinac {
+        s.vystup.rozhodnuti_prepinace(d, s.engine.mode());
+    } else {
+        s.vystup.rozhodnuti(u, d, s.engine.mode());
+    }
     s.vystup.revize(s.engine.mapping_rev());
     if s.okno.is_some() {
         s.vystup.zive(&s.engine.live_inputs(s.okno_aktivni));
@@ -2245,12 +2307,14 @@ fn po_panice() {
 /// Měření pro `hook_selftest -- mereni`: `n` syntetických událostí
 /// (stisky a uvolnění prvních kláves mapování, až šest držených naráz)
 /// TOUŽ funkcí jako callback, na volajícím vlákně a bez hooku v systému
-/// — nic nejde do OS ani do hry. Ovladač 1 zachytává, takže každá
-/// událost projde celou cestou až do slotu padu; `zive` = s viditelným
-/// oknem v popředí (živý stav navíc); `vk` = virtuální klávesa události,
-/// jak by ji nesl skutečný callback (podle ní se sleduje Win). Na stav
-/// klávesnice se callback od opravy OQ 57 neptá vůbec — `os_drzi` je
-/// podvrh, který zpanikaří, kdyby se zeptal. Vrací ns na událost.
+/// — nic nejde do OS ani do hry. Zachytávají všechny ovladače, které
+/// mapování používá (sdílená klávesa tak hraje za všechny své vstupy,
+/// Fáze 7), takže každá událost projde celou cestou až do slotů padů;
+/// `zive` = s viditelným oknem v popředí (živý stav navíc); `vk` =
+/// virtuální klávesa události, jak by ji nesl skutečný callback (podle ní
+/// se sleduje Win). Na stav klávesnice se callback od opravy OQ 57 neptá
+/// vůbec — `os_drzi` je podvrh, který zpanikaří, kdyby se zeptal. Vrací
+/// ns na událost.
 #[doc(hidden)]
 #[allow(dead_code, reason = "měří jen příklad hook_selftest (-- mereni)")]
 pub fn zmer_zpracovani(
@@ -2260,10 +2324,17 @@ pub fn zmer_zpracovani(
     zive: bool,
     vk: fn(KeyId) -> u32,
 ) -> Vec<u64> {
-    let klavesy: Vec<KeyId> = mapovani.bindings().map(|(k, _)| k).take(6).collect();
+    let klavesy: Vec<KeyId> = mapovani.keys().map(|(k, _)| k).take(6).collect();
     let vk: Vec<u32> = klavesy.iter().map(|&k| vk(k)).collect();
+    let pady: Vec<PadId> = PadId::ALL
+        .into_iter()
+        .filter(|&p| mapovani.pad_bindings(p).next().is_some())
+        .collect();
     let mut engine = Engine::new(mapovani);
     let _ = engine.enable(PadId::FIRST);
+    for p in pady {
+        let _ = engine.enable(p);
+    }
     let _ = engine.capture(ted_ms());
     let mut s = Stav::novy(engine, vystup, je_v_popredi);
     // Watchdog se počítá, ale nesmí zachytávání vypnout: tep padu tu
@@ -2361,9 +2432,16 @@ mod tests {
         revize: AtomicU64,
         mapovani: Mutex<Vec<(u64, Mapping)>>,
         hook_chyba: Mutex<Vec<bool>>,
+        /// Režimy po rozhodnutích od přepínače ovladače (Fáze 7, Z1).
+        prepinac: Mutex<Vec<Mode>>,
     }
 
     impl Vystup for Zaznam {
+        fn rozhodnuti_prepinace(&self, d: &Decision, rezim: Mode) {
+            self.prepinac.lock().unwrap().push(rezim);
+            self.rozhodnuti(None, d, rezim);
+        }
+
         fn hook_chyba(&self, chyba: bool) {
             self.hook_chyba.lock().unwrap().push(chyba);
         }
@@ -2677,19 +2755,32 @@ mod tests {
     #[test]
     fn callback_nealokuje() {
         // Scroll Lock (přepnutí / odmítnutí), AltGr, média, vstříknutá,
-        // Alt (ťuknutí při přiřazování), W (uložení při přiřazování),
-        // šipka, Win. (scan, příznaky, VK)
+        // W (sdílená klávesa o 4 cílech na dvou ovladačích — ve hře za oba,
+        // při přiřazování se sdílením odmítnutí „plno“), Alt (ťuknutí při
+        // přiřazování), W, šipka, Win. (scan, příznaky, VK)
         let udalosti = [
             (0x46, 0, 0x91),
             (0x21D, 0, 0xA2),
             (0, 0, 0xB3),
             (0x1E, LLKHF_INJECTED.0, 0x41),
+            (0x11, 0, 0x57),
             (0x38, 0, 0xA4),
             (0x11, 0, 0x57),
             (0x48, LLKHF_EXTENDED.0, 0x26),
             (0x5B, LLKHF_EXTENDED.0, 0x5B),
         ];
         let cil = PadAction::first(Action::Button(PadButton::B));
+        // W za čtyři vstupy dvou ovladačů (Fáze 7, sdílená klávesa).
+        let mut mapovani = Mapping::default();
+        let druhy = PadId::ALL[1];
+        for t in [
+            PadAction::first(Action::Button(PadButton::A)),
+            PadAction::new(druhy, Action::LeftStick(StickDir::Up)),
+            PadAction::new(druhy, Action::Button(PadButton::A)),
+        ] {
+            mapovani.bind(KeyId::W, t, KeyConflict::Share).unwrap();
+        }
+        assert_eq!(mapovani.targets(KeyId::W).len(), 4);
         for s_win in [false, true] {
             for okno in [None, Some(7isize)] {
                 for prirazuje in [false, true] {
@@ -2697,8 +2788,9 @@ mod tests {
                         std::array::from_fn(|_| Arc::new(StavSlot::new().unwrap()));
                     let budik = Arc::new(Budik::new().unwrap());
                     let vystup: Arc<dyn Vystup> = Arc::new(HookVystup::new(sloty, budik));
-                    let mut engine = Engine::new(Mapping::default());
+                    let mut engine = Engine::new(mapovani.clone());
                     let _ = engine.enable(PadId::FIRST);
+                    let _ = engine.enable(druhy);
                     let mut s = Stav::novy(engine, vystup, |_| true);
                     s.os_drzi = |_| panic!("callback se ptal na stav klávesnice");
                     s.okno = okno;
@@ -2706,7 +2798,14 @@ mod tests {
                     STAV.with(|st| *st.borrow_mut() = Some(s));
                     for _ in 0..3 {
                         if prirazuje {
-                            s_enginem(|e| e.start_binding(cil, BindKind::Replace, ted_ms()));
+                            s_enginem(|e| {
+                                e.start_binding(
+                                    cil,
+                                    BindKind::Replace,
+                                    KeyConflict::Share,
+                                    ted_ms(),
+                                )
+                            });
                         }
                         let pred = crate::testy_alokace::pocet();
                         if s_win {
@@ -2749,7 +2848,10 @@ mod tests {
         let z = Arc::new(Zaznam::default());
         priprav_s(&z, Mapping::default());
         let l = KeyId::L;
-        assert!(Mapping::default().target(l).is_some(), "L je namapovaná");
+        assert!(
+            Mapping::default().targets(l).first().is_some(),
+            "L je namapovaná"
+        );
         // Kdyby se callback zeptal Windows, test spadne (OQ 57).
         podvrhni_os(nesmi_se_ptat);
         assert!(!win(false, true), "Win jde do Windows");
@@ -2810,11 +2912,12 @@ mod tests {
         let l = KeyId::L;
         STAV.with(|s| {
             let mut g = s.borrow_mut();
-            let _ = g
-                .as_mut()
-                .unwrap()
-                .engine
-                .start_binding(cil, BindKind::Replace, ted_ms());
+            let _ = g.as_mut().unwrap().engine.start_binding(
+                cil,
+                BindKind::Replace,
+                KeyConflict::Move,
+                ted_ms(),
+            );
         });
         podvrhni_os(nesmi_se_ptat);
         assert!(!win(false, true));
@@ -2822,17 +2925,17 @@ mod tests {
         assert!(!zavolej(0, WM_KEYUP, &kb_l(LLKHF_UP.0)));
         let (_, d, m) = z.posledni();
         assert!(
-            matches!(m, Mode::Binding { target, .. } if target == cil),
+            matches!(m, Mode::Binding { target, .. } if target == cil.into()),
             "{m:?}"
         );
         assert_eq!(d.ui, None, "nic se neuložilo ani neodmítlo");
         let mapovani = STAV.with(|s| s.borrow().as_ref().unwrap().engine.mapping().clone());
-        assert_ne!(mapovani.target(l), Some(cil));
+        assert_ne!(mapovani.targets(l).first(), Some(cil));
         // Bez Win se L přiřadí (stisk přiřazování spolkne).
         assert!(!win(false, false));
         assert!(zavolej(0, WM_KEYDOWN, &kb_l(0)));
         assert!(
-            matches!(z.posledni().1.ui, Some(UiEvent::BindingSaved { key, target, .. }) if key == l && target == cil)
+            matches!(z.posledni().1.ui, Some(UiEvent::BindingSaved { key, target, .. }) if key == l && target == cil.into())
         );
     }
 
@@ -2901,8 +3004,9 @@ mod tests {
         let cil = PadAction::first(Action::Button(PadButton::B));
         let prirad = || {
             proved(HookPrikaz::Prirad {
-                cil,
+                cil: cil.into(),
                 druh: BindKind::Replace,
+                konflikt: KeyConflict::Move,
             });
             assert!(dotazy() > 200, "klik na čepičku srovnal klávesnici");
             DOTAZY.with(|d| d.set(0));
@@ -2959,20 +3063,21 @@ mod tests {
             nastav_popredi(true);
             okno(Some(7), true);
             proved(HookPrikaz::Prirad {
-                cil: b,
+                cil: b.into(),
                 druh: BindKind::Replace,
+                konflikt: KeyConflict::Move,
             });
             podvrhni_os(vse_drzi);
         };
         prirad();
         assert!(klavesa(0x21, true), "F se při přiřazování spolkne");
         assert!(
-            matches!(z.posledni().1.ui, Some(UiEvent::BindingSaved { key, target, .. }) if key == KeyId::F && target == b),
+            matches!(z.posledni().1.ui, Some(UiEvent::BindingSaved { key, target, .. }) if key == KeyId::F && target == b.into()),
             "{:?}",
             z.posledni().1.ui
         );
         assert!(klavesa(0x21, false));
-        assert_eq!(mapovani_enginu().target(KeyId::F), Some(b));
+        assert_eq!(mapovani_enginu().targets(KeyId::F).first(), Some(b));
         // Esc zruší.
         prirad();
         assert!(matches!(rezim(), Mode::Binding { .. }));
@@ -3021,15 +3126,16 @@ mod tests {
         let b = PadAction::first(Action::Button(PadButton::B));
         let prirad = || {
             proved(HookPrikaz::Prirad {
-                cil: b,
+                cil: b.into(),
                 druh: BindKind::Replace,
+                konflikt: KeyConflict::Move,
             });
             assert!(matches!(rezim(), Mode::Binding { .. }));
         };
         prirad();
         assert!(klavesa(0x21, true), "F se při přiřazování spolkne");
         assert!(
-            matches!(z.posledni().1.ui, Some(UiEvent::BindingSaved { key, target, .. }) if key == KeyId::F && target == b),
+            matches!(z.posledni().1.ui, Some(UiEvent::BindingSaved { key, target, .. }) if key == KeyId::F && target == b.into()),
             "{:?}",
             z.posledni().1.ui
         );
@@ -3214,8 +3320,9 @@ mod tests {
         let cil = PadAction::first(Action::Button(PadButton::B));
         let prirad = || {
             proved(HookPrikaz::Prirad {
-                cil,
+                cil: cil.into(),
                 druh: BindKind::Replace,
+                konflikt: KeyConflict::Move,
             })
         };
         prirad();
@@ -3223,7 +3330,7 @@ mod tests {
         podvrhni_os(nesmi_se_ptat);
         assert!(l(true), "L se při přiřazování spolkne");
         assert!(
-            matches!(z.posledni().1.ui, Some(UiEvent::BindingSaved { key, target, .. }) if key == KeyId::L && target == cil),
+            matches!(z.posledni().1.ui, Some(UiEvent::BindingSaved { key, target, .. }) if key == KeyId::L && target == cil.into()),
             "{:?}",
             z.posledni().1.ui
         );
@@ -3287,14 +3394,20 @@ mod tests {
         assert_eq!(s_stavem(|s| s.engine.held_len()), 0, "po AltGr nic nezbylo");
         // Přiřazování (i bez srovnání při kliku) vezme F a Esc ho zruší.
         let cil = PadAction::first(Action::Button(PadButton::B));
-        let _ = s_stavem(|s| s.engine.start_binding(cil, BindKind::Replace, ted_ms()));
+        let _ = s_stavem(|s| {
+            s.engine
+                .start_binding(cil, BindKind::Replace, KeyConflict::Move, ted_ms())
+        });
         assert!(klavesa(0x21, true), "F se přiřadí");
         assert!(matches!(
             z.posledni().1.ui,
             Some(UiEvent::BindingSaved { key, .. }) if key == KeyId::F
         ));
         assert!(klavesa(0x21, false));
-        let _ = s_stavem(|s| s.engine.start_binding(cil, BindKind::Replace, ted_ms()));
+        let _ = s_stavem(|s| {
+            s.engine
+                .start_binding(cil, BindKind::Replace, KeyConflict::Move, ted_ms())
+        });
         assert!(klavesa(0x01, true), "Esc zruší");
         assert_eq!(
             z.posledni().1.ui,
@@ -3346,8 +3459,9 @@ mod tests {
         let prirad = |os: fn(u32) -> bool| {
             podvrhni_os(os);
             proved(HookPrikaz::Prirad {
-                cil,
+                cil: cil.into(),
                 druh: BindKind::Replace,
+                konflikt: KeyConflict::Move,
             });
             podvrhni_os(nesmi_se_ptat);
         };
@@ -3372,7 +3486,7 @@ mod tests {
         );
         assert!(klavesa(0x21, true), "F se přiřadí");
         assert!(
-            matches!(z.posledni().1.ui, Some(UiEvent::BindingSaved { key, target, .. }) if key == KeyId::F && target == cil),
+            matches!(z.posledni().1.ui, Some(UiEvent::BindingSaved { key, target, .. }) if key == KeyId::F && target == cil.into()),
             "{:?}",
             z.posledni().1.ui
         );
@@ -3411,11 +3525,12 @@ mod tests {
         let b = PadAction::first(Action::Button(PadButton::B));
         // Klik na čepičku se Windows ptá (srovnání ve smyčce) — nic
         // nedrží; callback se ptát nesmí.
-        let prirad = |cil| {
+        let prirad = |cil: PadAction| {
             podvrhni_os(nic_nedrzi);
             proved(HookPrikaz::Prirad {
-                cil,
+                cil: cil.into(),
                 druh: BindKind::Replace,
+                konflikt: KeyConflict::Move,
             });
             podvrhni_os(nesmi_se_ptat);
         };
@@ -3424,8 +3539,9 @@ mod tests {
         s_stavem(zapomen_klavesnici);
         dokonci_snimek(true);
         proved(HookPrikaz::Prirad {
-            cil: b,
+            cil: b.into(),
             druh: BindKind::Replace,
+            konflikt: KeyConflict::Move,
         });
         podvrhni_os(nesmi_se_ptat);
         assert!(s_stavem(|s| s.prirazovani.is_some()));
@@ -3536,8 +3652,9 @@ mod tests {
         nastav_popredi(true);
         okno(Some(7), true);
         proved(HookPrikaz::Prirad {
-            cil: PadAction::first(Action::Button(PadButton::B)),
+            cil: PadAction::first(Action::Button(PadButton::B)).into(),
             druh: BindKind::Replace,
+            konflikt: KeyConflict::Move,
         });
         podvrhni_os(nesmi_se_ptat);
         assert!(matches!(rezim(), Mode::Binding { .. }));
@@ -3577,8 +3694,9 @@ mod tests {
         nastav_popredi(true);
         okno(Some(7), true);
         proved(HookPrikaz::Prirad {
-            cil: PadAction::first(Action::Button(PadButton::B)),
+            cil: PadAction::first(Action::Button(PadButton::B)).into(),
             druh: BindKind::Replace,
+            konflikt: KeyConflict::Move,
         });
         podvrhni_os(nesmi_se_ptat);
         assert!(matches!(rezim(), Mode::Binding { .. }));
@@ -3666,8 +3784,9 @@ mod tests {
         s_stavem(|s| s.raw_input = raw_odregistrovano);
         RAW_KONTROLY.with(|k| k.set(0));
         proved(HookPrikaz::Prirad {
-            cil: PadAction::first(Action::Button(PadButton::B)),
+            cil: PadAction::first(Action::Button(PadButton::B)).into(),
             druh: BindKind::Replace,
+            konflikt: KeyConflict::Move,
         });
         assert_eq!(RAW_KONTROLY.with(Cell::get), 1, "klik Raw Input ověřil");
         assert_eq!(
@@ -3744,8 +3863,9 @@ mod tests {
         nastav_popredi(true);
         okno(Some(7), true);
         proved(HookPrikaz::Prirad {
-            cil: PadAction::first(Action::Button(PadButton::B)),
+            cil: PadAction::first(Action::Button(PadButton::B)).into(),
             druh: BindKind::Replace,
+            konflikt: KeyConflict::Move,
         });
         let casovac = hlidej_casovac(0);
         assert_ne!(casovac, 0, "časovač přiřazování běží");
@@ -3799,7 +3919,10 @@ mod tests {
                 okno(Some(7), true);
             }
             if prirazuje {
-                let _ = s_stavem(|s| s.engine.start_binding(cil, BindKind::Replace, ted_ms()));
+                let _ = s_stavem(|s| {
+                    s.engine
+                        .start_binding(cil, BindKind::Replace, KeyConflict::Move, ted_ms())
+                });
             }
             let status = HookStatus::default();
             assert!(hlidej_hook(HHOOK::default(), &status).is_invalid());
@@ -3838,8 +3961,9 @@ mod tests {
         nastav_popredi(true);
         okno(Some(7), true);
         proved(HookPrikaz::Prirad {
-            cil,
+            cil: cil.into(),
             druh: BindKind::Replace,
+            konflikt: KeyConflict::Move,
         });
         assert!(matches!(rezim(), Mode::Binding { .. }));
         let pred = mapovani_enginu();
@@ -3865,8 +3989,9 @@ mod tests {
         nastav_popredi(true);
         zmena_popredi();
         proved(HookPrikaz::Prirad {
-            cil,
+            cil: cil.into(),
             druh: BindKind::Replace,
+            konflikt: KeyConflict::Move,
         });
         assert!(!alt(true));
         assert!(matches!(rezim(), Mode::Binding { .. }));
@@ -3875,11 +4000,16 @@ mod tests {
             z.posledni().1.ui,
             Some(UiEvent::BindingSaved {
                 key: KeyId::LEFT_ALT,
-                target: cil,
-                moved_from: None
+                target: cil.into(),
+                moved_from: None,
+                moved_more: 0,
+                shared: 0
             })
         );
-        assert_eq!(mapovani_enginu().target(KeyId::LEFT_ALT), Some(cil));
+        assert_eq!(
+            mapovani_enginu().targets(KeyId::LEFT_ALT).first(),
+            Some(cil)
+        );
     }
 
     /// Bez hlídaného popředí (WinEvent se nepodařilo zaregistrovat) se
@@ -3892,8 +4022,9 @@ mod tests {
         priprav(&z);
         let prirad = || {
             proved(HookPrikaz::Prirad {
-                cil: PadAction::first(Action::Button(PadButton::Y)),
+                cil: PadAction::first(Action::Button(PadButton::Y)).into(),
                 druh: BindKind::Replace,
+                konflikt: KeyConflict::Move,
             })
         };
         nastav_popredi(true);
@@ -3930,8 +4061,9 @@ mod tests {
         assert!(!s_stavem(|s| s.okno_aktivni));
         nastav_popredi(true);
         proved(HookPrikaz::Prirad {
-            cil,
+            cil: cil.into(),
             druh: BindKind::Replace,
+            konflikt: KeyConflict::Move,
         });
         assert!(matches!(rezim(), Mode::Binding { .. }));
         assert!(s_stavem(|s| s.okno_aktivni), "přijatý klik = aktivní");
@@ -3939,7 +4071,10 @@ mod tests {
         zmena_popredi();
         assert_eq!(rezim(), Mode::Gamepad, "ztráta popředí zrušila");
         // Přiřazování, o jehož popředí smyčka neví (jen pojistka).
-        let _ = s_stavem(|s| s.engine.start_binding(cil, BindKind::Replace, ted_ms()));
+        let _ = s_stavem(|s| {
+            s.engine
+                .start_binding(cil, BindKind::Replace, KeyConflict::Move, ted_ms())
+        });
         assert!(!s_stavem(|s| s.okno_aktivni));
         zmena_popredi();
         assert_eq!(rezim(), Mode::Gamepad, "zrušeno i bez přechodu");
@@ -3957,7 +4092,7 @@ mod tests {
     #[test]
     fn potreba_hooku_tabulkou() {
         let binding = Mode::Binding {
-            target: PadAction::first(Action::Button(PadButton::A)),
+            target: PadAction::first(Action::Button(PadButton::A)).into(),
             started_at_ms: 0,
         };
         for (rezim, bez_okna, s_oknem) in [
@@ -4001,8 +4136,9 @@ mod tests {
         let cil = PadAction::new(PadId::new(1).unwrap(), Action::Button(PadButton::B));
         let prirad = || {
             proved(HookPrikaz::Prirad {
-                cil,
+                cil: cil.into(),
                 druh: BindKind::Add,
+                konflikt: KeyConflict::Move,
             })
         };
         // Okno není vidět.
@@ -4019,7 +4155,7 @@ mod tests {
         nastav_popredi(true);
         prirad();
         assert!(
-            matches!(rezim(), Mode::Binding { target, .. } if target == cil),
+            matches!(rezim(), Mode::Binding { target, .. } if target == cil.into()),
             "{:?}",
             rezim()
         );
@@ -4045,8 +4181,9 @@ mod tests {
         nastav_popredi(true);
         okno(Some(7), true);
         proved(HookPrikaz::Prirad {
-            cil: PadAction::first(Action::Button(PadButton::X)),
+            cil: PadAction::first(Action::Button(PadButton::X)).into(),
             druh: BindKind::Replace,
+            konflikt: KeyConflict::Move,
         });
         assert!(matches!(rezim(), Mode::Binding { .. }));
         let zive_pred = z.zive.lock().unwrap().len();
@@ -4132,8 +4269,9 @@ mod tests {
         let a = z.posledni_zive().unwrap()[0];
         assert!(a.held().contains(Action::Button(PadButton::A)));
         proved(HookPrikaz::Prirad {
-            cil: PadAction::first(Action::Button(PadButton::Y)),
+            cil: PadAction::first(Action::Button(PadButton::Y)).into(),
             druh: BindKind::Replace,
+            konflikt: KeyConflict::Move,
         });
         assert!(matches!(rezim(), Mode::Binding { .. }));
         okno(None, true);
@@ -4184,7 +4322,7 @@ mod tests {
         let num8 = PadAction::new(p2, Action::LeftStick(StickDir::Up));
 
         assert_eq!(uprav_s(Zmena::VyprazdniVstup(x)), Ok(()));
-        assert_eq!(mapovani_enginu().target(KeyId::F), None);
+        assert_eq!(mapovani_enginu().targets(KeyId::F).first(), None);
         assert_eq!((revize_enginu(), rezim()), (1, Mode::Gamepad));
         assert_eq!(z.revize.load(Ordering::Acquire), 1, "revize jde oknu");
         // Prázdný vstup znovu: v pořádku, revize stojí.
@@ -4192,11 +4330,13 @@ mod tests {
         assert_eq!(revize_enginu(), 1);
 
         assert_eq!(uprav_s(Zmena::VychoziPrvni), Ok(()));
-        assert_eq!(mapovani_enginu().target(KeyId::F), Some(x));
+        assert_eq!(mapovani_enginu().targets(KeyId::F).first(), Some(x));
         assert_eq!(revize_enginu(), 2);
 
         let mut s_druhym = mapovani_enginu();
-        s_druhym.bind(KeyId::NUMPAD_8, num8).unwrap();
+        s_druhym
+            .bind(KeyId::NUMPAD_8, num8, KeyConflict::Move)
+            .unwrap();
         assert_eq!(
             uprav_s(Zmena::Obnov {
                 mapovani: Box::new(s_druhym.clone()),
@@ -4208,7 +4348,7 @@ mod tests {
         assert_eq!(revize_enginu(), 3);
 
         assert_eq!(uprav_s(Zmena::VymazOvladac(p2)), Ok(()));
-        assert_eq!(mapovani_enginu().target(KeyId::NUMPAD_8), None);
+        assert_eq!(mapovani_enginu().targets(KeyId::NUMPAD_8).first(), None);
         assert_eq!(revize_enginu(), 4);
 
         // „Zpět" ze staré revize: nic se nemění.
@@ -4220,7 +4360,7 @@ mod tests {
             Err(ChybaUpravy::Zastarale)
         );
         assert_eq!(revize_enginu(), 4);
-        assert_eq!(mapovani_enginu().target(KeyId::NUMPAD_8), None);
+        assert_eq!(mapovani_enginu().targets(KeyId::NUMPAD_8).first(), None);
 
         // Poslední klávesa.
         let jedina = Mapping::new(KeyId::SCROLL_LOCK, [(KeyId::F, x)]).unwrap();
@@ -4246,8 +4386,9 @@ mod tests {
         nastav_popredi(true);
         okno(Some(3), true);
         proved(HookPrikaz::Prirad {
-            cil: x,
+            cil: x.into(),
             druh: BindKind::Replace,
+            konflikt: KeyConflict::Move,
         });
         assert!(matches!(rezim(), Mode::Binding { .. }));
         assert_eq!(uprav_s(Zmena::VychoziPrvni), Ok(()));
@@ -4283,13 +4424,14 @@ mod tests {
         assert_eq!(z.mapovani.lock().unwrap().len(), 1, "úprava snímek nepošle");
         proved(HookPrikaz::Zverejni);
         let (rev, m) = z.mapovani.lock().unwrap().last().cloned().unwrap();
-        assert_eq!((rev, m.target(KeyId::F)), (1, None));
+        assert_eq!((rev, m.targets(KeyId::F).first()), (1, None));
         // Přiřazení klávesy v callbacku: jen revize, snímek ne.
         nastav_popredi(true);
         okno(Some(3), true);
         proved(HookPrikaz::Prirad {
-            cil: x,
+            cil: x.into(),
             druh: BindKind::Replace,
+            konflikt: KeyConflict::Move,
         });
         assert!(zavolej(0, WM_KEYDOWN, &kb(0x21, 0)));
         assert!(zavolej(0, WM_KEYUP, &kb(0x21, LLKHF_UP.0)));
@@ -4385,13 +4527,19 @@ mod tests {
         pockej_na(&|| st.nainstalovan());
         assert_eq!(st.instalaci(), 1);
 
-        // Zapnutí přepínačem z pozastavení: hook znovu a zachytávat.
-        assert!(hook.posli(HookPrikaz::Zachytavej));
+        // Zapnutí přepínačem z pozastavení: hook znovu a zachytávat —
+        // jako rozhodnutí přepínače (okno nepípne, Fáze 7 Z1).
+        assert!(hook.posli(HookPrikaz::Zachytavej {
+            zdroj: ZdrojZachytavani::Prepinac
+        }));
         pockej(&|r| r.2 == Mode::Gamepad);
         pockej_na(&|| st.instalaci() == 2);
+        assert_eq!(*z.prepinac.lock().unwrap(), vec![Mode::Gamepad]);
         // Druhý ovladač při běžícím zachytávání hook nepřeinstaluje.
         assert!(hook.posli(HookPrikaz::Povol(p2)));
-        assert!(hook.posli(HookPrikaz::Zachytavej));
+        assert!(hook.posli(HookPrikaz::Zachytavej {
+            zdroj: ZdrojZachytavani::Prepinac
+        }));
         assert!(hook.posli(HookPrikaz::Preinstaluj));
         pockej(&|r| {
             r.1.ui
@@ -4402,6 +4550,15 @@ mod tests {
         });
         pockej_na(&|| st.instalaci() == 3);
         assert!(st.nainstalovan());
+        // „Pokračovat“ z nabídky ikony je obyčejné rozhodnutí (pípne).
+        assert!(hook.posli(HookPrikaz::Zachytavej {
+            zdroj: ZdrojZachytavani::Nabidka
+        }));
+        pockej(&|r| r.2 == Mode::Gamepad && r.0.is_none());
+        pockej_na(&|| st.instalaci() == 4);
+        assert_eq!(z.prepinac.lock().unwrap().len(), 2, "jen přepínač");
+        assert!(hook.posli(HookPrikaz::Prepni));
+        pockej(&|r| r.2 == Mode::Keyboard);
 
         // Vypnutý jeden ovladač hook nechá, vypnutý poslední ho odebere.
         assert!(hook.posli(HookPrikaz::Zakaz(
@@ -4414,7 +4571,7 @@ mod tests {
         assert!(hook.posli(HookPrikaz::Zakaz(p2, DisabledReason::PadNotConnected)));
         pockej(&|r| matches!(r.2, Mode::Disabled { .. }));
         pockej_na(&|| !st.nainstalovan());
-        assert_eq!(st.instalaci(), 3);
+        assert_eq!(st.instalaci(), 4);
 
         assert!(hook.zastav());
         assert!(!st.nainstalovan());
@@ -4498,7 +4655,9 @@ mod tests {
         .unwrap();
         let st = Arc::clone(hook.status());
         assert!(hook.posli(HookPrikaz::Povol(PadId::FIRST)));
-        assert!(hook.posli(HookPrikaz::Zachytavej));
+        assert!(hook.posli(HookPrikaz::Zachytavej {
+            zdroj: ZdrojZachytavani::Prepinac
+        }));
         pockej_na(&|| {
             z.rozhodnuti
                 .lock()
@@ -4542,7 +4701,9 @@ mod tests {
         )
         .unwrap();
         assert!(hook.posli(HookPrikaz::Povol(PadId::FIRST)));
-        assert!(hook.posli(HookPrikaz::Zachytavej));
+        assert!(hook.posli(HookPrikaz::Zachytavej {
+            zdroj: ZdrojZachytavani::Prepinac
+        }));
         let konec = std::time::Instant::now() + LIMIT;
         while z.rozhodnuti.lock().unwrap().last().map(|r| r.2) != Some(Mode::Gamepad) {
             assert!(std::time::Instant::now() < konec);
@@ -4637,7 +4798,9 @@ mod tests {
         .unwrap();
         let st = Arc::clone(hook.status());
         assert!(hook.posli(HookPrikaz::Povol(PadId::FIRST)));
-        assert!(hook.posli(HookPrikaz::Zachytavej));
+        assert!(hook.posli(HookPrikaz::Zachytavej {
+            zdroj: ZdrojZachytavani::Prepinac
+        }));
         let konec = std::time::Instant::now() + LIMIT;
         while v.0.lock().unwrap().last().map(|r| r.2) != Some(Mode::Gamepad) {
             assert!(std::time::Instant::now() < konec);
@@ -4736,6 +4899,7 @@ mod tests {
             let _ = e.start_binding(
                 PadAction::first(Action::Button(PadButton::B)),
                 BindKind::Replace,
+                KeyConflict::Move,
                 ted_ms(),
             );
         });

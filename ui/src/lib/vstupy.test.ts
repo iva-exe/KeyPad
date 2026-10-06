@@ -4,18 +4,23 @@
 // hodnot: když se tvar změní na jedné straně, spadne test na té druhé.
 import { describe, expect, test } from 'bun:test';
 import klavesyJson from './testdata/klavesy.json';
+import nastaveniJson from './testdata/nastaveni.json';
 import oznameniJson from './testdata/oznameni.json';
 import rezimJson from './testdata/rezim.json';
+import rezimZkratkaJson from './testdata/rezim_zkratka.json';
 import ziveJson from './testdata/zive.json';
 import type { KlavesyInfo, PadStav, Vazba } from './smlouva';
 import {
 	bublinaChyb,
 	bublinaVstupu,
+	cileKlaves,
+	dalsiCile,
 	dalsiKarta,
 	dekoduj,
 	indexy,
 	jeAlt,
 	jedinyVstup,
+	klicKlavesy,
 	KRATKE,
 	maVsechnyKlavesy,
 	NAZVY,
@@ -28,8 +33,11 @@ import {
 	seskup,
 	SLOUPCU,
 	sviti,
+	textCile,
 	textOdmitnuti,
 	textPresunu,
+	textSdileni,
+	varovaniZkratky,
 	viditelneKarty,
 	VSTUPY
 } from './vstupy';
@@ -59,6 +67,15 @@ function jeKlavesa(k: unknown, sNazvy: boolean): void {
 	}
 }
 
+/** Volby z ⓘ (Fáze 7): pořadí změny a dvě volby. */
+function jeNastaveni(n: unknown): void {
+	expect(klice(n)).toEqual(['rev', 'sdilene_klavesy', 'zvuk']);
+	const o = n as Record<string, unknown>;
+	jeCislo(o.rev);
+	expect(typeof o.zvuk).toBe('boolean');
+	expect(typeof o.sdilene_klavesy).toBe('boolean');
+}
+
 function jeCil(c: unknown): void {
 	expect(klice(c)).toEqual(['pad', 'vstup']);
 	const o = c as Record<string, unknown>;
@@ -76,19 +93,26 @@ describe('zlaté soubory smlouvy', () => {
 			'chyby',
 			'karty',
 			'konfigurace',
+			'nastaveni',
 			'rev',
 			'vazby',
 			'vstupy',
 			'zaloha',
 			'zkratka',
+			'zkratka_mimo',
 			'zpet'
 		]);
+		expect(typeof klavesy.zkratka_mimo).toBe('boolean');
 		jeCislo(klavesy.rev);
-		expect(klice(klavesy.karty)).toEqual(['pady', 'rev']);
+		expect(klice(klavesy.karty)).toEqual(['pady', 'rev', 'rozbalene']);
 		jeCislo(klavesy.karty.rev);
 		expect(klavesy.karty.pady[0]).toBe(0);
 		for (const p of klavesy.karty.pady) jeCislo(p);
 		expect(klavesy.karty.pady).toEqual([...klavesy.karty.pady].sort((a, b) => a - b));
+		// Rozbalené (Fáze 7, OQ 70): vzestupně a jen z karet v okně.
+		for (const p of klavesy.karty.rozbalene) expect(klavesy.karty.pady).toContain(p);
+		expect(klavesy.karty.rozbalene).toEqual([...klavesy.karty.rozbalene].sort((a, b) => a - b));
+		jeNastaveni(klavesy.nastaveni);
 		jeKlavesa(klavesy.zkratka, true);
 		expect(typeof klavesy.zpet).toBe('boolean');
 		expect(['ok', 'obnovena', 'novejsi', 'necitelna', 'neulozena']).toContain(klavesy.konfigurace);
@@ -103,11 +127,20 @@ describe('zlaté soubory smlouvy', () => {
 		}
 	});
 
-	test('klavesy: vazby v pořadí Mapping::bindings() a každá klávesa jednou', () => {
+	test('klavesy: vazby v pořadí Mapping::bindings(), sdílená klávesa víckrát (nejvýš 4×)', () => {
 		const index = (v: Vazba) => (v.klavesa.e0 ? 0x80 : 0) + v.klavesa.scan;
+		// Klávesa, pak ovladač, pak pořadí vstupů (bity živého stavu) — tatáž
+		// dvojice nikdy dvakrát (Fáze 7: sdílená klávesa = víc vstupů).
+		const klic = (v: Vazba) => index(v) * 1000 + v.pad * 100 + klavesy.vstupy.indexOf(v.vstup);
+		const klice2 = klavesy.vazby.map(klic);
+		expect(klice2).toEqual([...klice2].sort((a, b) => a - b));
+		expect(new Set(klice2).size).toBe(klice2.length);
 		const poradi = klavesy.vazby.map(index);
-		expect(poradi).toEqual([...poradi].sort((a, b) => a - b));
-		expect(new Set(poradi).size).toBe(poradi.length);
+		const kolikrat = new Map<number, number>();
+		for (const i of poradi) kolikrat.set(i, (kolikrat.get(i) ?? 0) + 1);
+		expect(Math.max(...kolikrat.values())).toBeLessThan(5);
+		// Zlatý soubor má aspoň jednu sdílenou klávesu (F: ovladač 1 · X, ovladač 2 · B).
+		expect([...kolikrat.values()].some((n) => n > 1)).toBe(true);
 		// Zkratka ani Win nikdy nejsou vazbou (jádro je nedovolí).
 		expect(poradi).not.toContain(index({ ...klavesy.vazby[0]!, klavesa: klavesy.zkratka }));
 		expect(poradi).not.toContain(0x80 + 0x5b);
@@ -120,6 +153,12 @@ describe('zlaté soubory smlouvy', () => {
 		jeCislo(rezimJson.seq);
 		jeCil(rezimJson.cil);
 		expect(typeof rezimJson.hook_chyba).toBe('boolean');
+	});
+
+	test('rezim: přiřazuje se zkratka pozastavení (Fáze 7, Z6)', () => {
+		expect(klice(rezimZkratkaJson)).toEqual(['cil', 'hook_chyba', 'rezim', 'seq']);
+		expect(rezimZkratkaJson.rezim).toBe('binding');
+		expect(rezimZkratkaJson.cil).toEqual({ zkratka: true });
 	});
 
 	test('zive: tvar a 4 ovladače', () => {
@@ -142,6 +181,7 @@ describe('zlaté soubory smlouvy', () => {
 
 	test('oznameni: všechny varianty a nic navíc', () => {
 		const typy = new Set<string>();
+		const duvody = new Set<string>();
 		for (const o of oznameniJson as Record<string, unknown>[]) {
 			jeCislo(o.seq);
 			expect(o.seq as number).toBeLessThan(65536);
@@ -149,14 +189,40 @@ describe('zlaté soubory smlouvy', () => {
 			typy.add(o.typ as string);
 			switch (o.typ) {
 				case 'ulozeno':
-					expect(klice(o)).toEqual(['klavesa', 'mezera', 'odkud', 'pad', 'seq', 'typ', 'vstup']);
+					// Nová zkratka pozastavení (Z6): bez ovladače, vstupu a přesunu.
+					if (o.zkratka !== undefined) {
+						expect(klice(o)).toEqual(['klavesa', 'mezera', 'seq', 'typ', 'zkratka']);
+						expect(o.zkratka).toBe(true);
+						jeKlavesa(o.klavesa, false);
+						typy.add('ulozeno-zkratka');
+						break;
+					}
+					expect(klice(o)).toEqual([
+						'klavesa',
+						'mezera',
+						'odkud',
+						'odkud_dalsi',
+						'pad',
+						'sdileno',
+						'seq',
+						'typ',
+						'vstup'
+					]);
 					jeCil({ pad: o.pad, vstup: o.vstup });
 					jeKlavesa(o.klavesa, false);
 					if (o.odkud !== null) jeCil(o.odkud);
+					// Fáze 7: kolik dalších vstupů o klávesu přišlo (jen s `odkud`)
+					// a kolika dalším klávesa patří — obojí 0–3.
+					for (const n of [o.odkud_dalsi, o.sdileno]) {
+						jeCislo(n);
+						expect([0, 1, 2, 3]).toContain(n as number);
+					}
+					if (o.odkud === null) expect(o.odkud_dalsi).toBe(0);
 					break;
 				case 'odmitnuto':
 					expect(klice(o)).toEqual(['duvod', 'klavesa', 'mezera', 'seq', 'typ']);
-					expect(['zkratka', 'win', 'nejde']).toContain(o.duvod);
+					expect(['zkratka', 'win', 'nejde', 'plno', 'namapovana', 'nevhodna']).toContain(o.duvod);
+					duvody.add(o.duvod as string);
 					jeKlavesa(o.klavesa, false);
 					break;
 				case 'zruseno':
@@ -170,7 +236,13 @@ describe('zlaté soubory smlouvy', () => {
 					throw new Error(`neznámý typ oznámení ${String(o.typ)}`);
 			}
 		}
-		expect([...typy].sort()).toEqual(['odmitnuto', 'ulozeno', 'zapni_ovladac', 'zruseno']);
+		expect([...typy].sort()).toEqual(['odmitnuto', 'ulozeno', 'ulozeno-zkratka', 'zapni_ovladac', 'zruseno']);
+		// Zlatý soubor má každý důvod odmítnutí, i přiřazování zkratky.
+		expect([...duvody].sort()).toEqual(['namapovana', 'nejde', 'nevhodna', 'plno', 'win', 'zkratka']);
+	});
+
+	test('nastaveni: tvar (Fáze 7)', () => {
+		jeNastaveni(nastaveniJson);
 	});
 });
 
@@ -349,7 +421,8 @@ describe('klávesy ovladače', () => {
 
 	test('počty a „má všechny klávesy"', () => {
 		expect(pocetKlaves(klavesy.vazby, 0)).toBe(25);
-		expect(pocetKlaves(klavesy.vazby, 1)).toBe(5);
+		// Numerická klávesnice a F sdílená s ovladačem 1 (Fáze 7).
+		expect(pocetKlaves(klavesy.vazby, 1)).toBe(6);
 		expect(maVsechnyKlavesy(klavesy.vazby, 0)).toBe(false);
 		expect(maVsechnyKlavesy(klavesy.vazby.filter((v) => v.pad === 1), 1)).toBe(true);
 		expect(maVsechnyKlavesy([], 1)).toBe(false);
@@ -387,12 +460,53 @@ describe('texty', () => {
 		expect(textOdmitnuti('zkratka')).toBe('Zkratka je pauza');
 		expect(textOdmitnuti('win')).toBe('Win patří Windows');
 		expect(textOdmitnuti('nejde')).toBe('Tuhle klávesu nejde použít');
+		expect(textOdmitnuti('plno')).toBe('Klávesa už ovládá 4 vstupy');
+		expect(textOdmitnuti('plno', { klavesa: 'F' })).toBe('F už ovládá 4 vstupy');
+		// Přiřazování zkratky pozastavení (Z6).
+		expect(textOdmitnuti('namapovana', { klavesa: 'F5', kam: { pad: 0, vstup: 'a' } })).toBe('F5 patří ovladači 1 · A');
+		expect(textOdmitnuti('namapovana', { klavesa: 'F5' })).toBe('F5 už ovládá vstup');
+		expect(textOdmitnuti('nevhodna')).toBe('Pauza jde jen na F1–F24 (ne F4), Scroll Lock nebo Pause');
+	});
+
+	test('sdílená klávesa: kam ještě patří, bublina a oznámení (Fáze 7, Z4)', () => {
+		// Zlatý soubor: F je X ovladače 1 i B ovladače 2.
+		const cile = cileKlaves(klavesy.vazby);
+		const f = { scan: 0x21, e0: false };
+		expect(cile.get(klicKlavesy(f))).toEqual([
+			{ pad: 0, vstup: 'x' },
+			{ pad: 1, vstup: 'b' }
+		]);
+		expect(dalsiCile(cile, f, 0, 'x')).toEqual([{ pad: 1, vstup: 'b' }]);
+		expect(dalsiCile(cile, f, 1, 'b')).toEqual([{ pad: 0, vstup: 'x' }]);
+		expect(dalsiCile(cile, { scan: 0x11, e0: false }, 0, 'ls_up')).toEqual([]);
+		const s = seskup(klavesy.vazby, 0);
+		expect(bublinaVstupu('x', s.x ?? [], (k) => dalsiCile(cile, k, 0, 'x'))).toBe(
+			'X · F\nF — také: Ovladač 2 · B'
+		);
+		// Nesdílená čepička bez řádku navíc.
+		expect(bublinaVstupu('ls_up', s.ls_up ?? [], (k) => dalsiCile(cile, k, 0, 'ls_up'))).toBe('Levá páčka ↑ · W');
+		expect(textCile({ pad: 0, vstup: 'ls_up' })).toBe('Ovladač 1 · Levá páčka ↑');
+		expect(textSdileni([{ pad: 1, vstup: 'a' }], 0)).toBe('Sdíleno s ovladačem 2 · A');
+		expect(textSdileni([{ pad: 0, vstup: 'lb' }], 0)).toBe('Sdíleno s LB');
+		expect(textSdileni([{ pad: 1, vstup: 'a' }, { pad: 0, vstup: 'lb' }], 0)).toBe('Sdíleno se 2 vstupy');
+	});
+
+	test('varování u zkratky pozastavení (Z6)', () => {
+		expect(varovaniZkratky({ scan: 0x46, e0: false }, false)).toBe('');
+		expect(varovaniZkratky({ scan: 0x58, e0: false }, false)).toContain('F12 ve Steamu');
+		expect(varovaniZkratky({ scan: 0x0f, e0: false }, true)).toBe('Tuhle klávesu Windows nedostanou, dokud je zapnutý ovladač');
+		// F4 ručně v config.json (z okna nejde, OQ 69): konkrétně, co nepůjde.
+		expect(varovaniZkratky({ scan: 0x3e, e0: false }, true)).toBe('Alt+F4 nezavře okno, dokud je zapnutý ovladač');
+		expect(varovaniZkratky(null, true)).toBe('');
 	});
 
 	test('přesun ze stejného a z jiného ovladače', () => {
 		expect(textPresunu({ pad: 0, vstup: 'lb' }, 0)).toBe('Přesunuto z LB');
 		expect(textPresunu({ pad: 1, vstup: 'lb' }, 0)).toBe('Přesunuto z ovladače 2 · LB');
 		expect(textPresunu({ pad: 0, vstup: 'ls_up' }, 1)).toBe('Přesunuto z ovladače 1 · levá ↑');
+		// Ze sdílené klávesy bez volby (Fáze 7): o klávesu přišlo víc vstupů.
+		expect(textPresunu({ pad: 1, vstup: 'lb' }, 0, 1)).toBe('Přesunuto z ovladače 2 · LB a 1 dalšího');
+		expect(textPresunu({ pad: 0, vstup: 'lb' }, 0, 3)).toBe('Přesunuto z LB a 3 dalších');
 	});
 
 	test('chyby konfigurace v bublině pruhu (spec 1.7)', () => {

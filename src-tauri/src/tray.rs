@@ -156,6 +156,18 @@ pub fn stav(app: &AppHandle, s: TrayStav) {
     let _ = app.run_on_main_thread(move || proved(&a, s));
 }
 
+/// Zaškrtnutí „✓ Zvuk“ podle volby změněné v okně (Fáze 7: přepínač v ⓘ
+/// a nabídka ukazují vždy totéž). Jako [`stav`] jen předá práci hlavnímu
+/// vláknu a nečeká.
+pub fn zaskrtni_zvuk(app: &AppHandle, zapnuto: bool) {
+    let a = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(o) = a.try_state::<Oblast>() {
+            let _ = o.zvuk.set_checked(zapnuto);
+        }
+    });
+}
+
 /// [`stav`] na hlavním vlákně: mění jen to, co se opravdu změnilo.
 fn proved(app: &AppHandle, s: TrayStav) {
     let (Some(ikona), Some(o)) = (app.tray_by_id(ID), app.try_state::<Oblast>()) else {

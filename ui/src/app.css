@@ -173,6 +173,11 @@ button {
 	--pad-4: #67e8f9;
 	/* Text na plné barvě ovladače (svítící čepička, odznak). */
 	--na-barve: #0e0f12;
+	/* Klávesa sdílená víc vstupy (Fáze 7, Z4 — volba „Jedna klávesa pro víc
+	   vstupů"). Oranžová = „sdílená", ne chyba: jantarová --warn zůstává
+	   varováním (tečka Alt, F12) a krátkým zábleskem přesunu (OQ 65). Nesplývá
+	   s barvami ovladačů a v tmavém motivu je čitelná i jako text. */
+	--sdilena: #fb923c;
 }
 [data-pad='1'] {
 	--barva: var(--pad-1);
@@ -187,7 +192,7 @@ button {
 	--barva: var(--pad-4);
 }
 
-/* ── mikroanimace (jen tyhle čtyři; „Omezit pohyb" je vypne pravidlem níž) ──
+/* ── mikroanimace (jen tyhle; „Omezit pohyb" je vypne pravidlem níž) ──
  * Jednorázové spouští akce `prehraj` (lib/motion.ts) přidáním třídy,
  * proto jsou tady globálně, ne ve stylech komponent. */
 
@@ -249,6 +254,18 @@ button {
 	animation: kp-zablesk-presun 320ms ease-out;
 }
 
+/* Klávesa se teď sdílí: ostatní čepičky téže klávesy jednou oranžově
+   bliknou (Fáze 7, Z4). */
+@keyframes kp-zablesk-sdilena {
+	from {
+		background-color: color-mix(in srgb, var(--sdilena) 55%, transparent);
+		border-color: var(--sdilena);
+	}
+}
+.kp-zablesk-sdilena {
+	animation: kp-zablesk-sdilena 320ms ease-out;
+}
+
 /* Odznak karty, ze které klávesa odešla. */
 @keyframes kp-zablesk-odznak {
 	from {
@@ -274,9 +291,13 @@ button {
 
 /* CSS přechody vypne tohle pravidlo. Přechody Svelte (transition:)
    jedou přes Web Animations API, na které CSS nedosáhne — ty hlídá
-   lib/motion.ts. */
+   lib/motion.ts. Pseudoelementy výslovně: `*` na ně nedosáhne a záře
+   karty (::after) i starý pruh (::before) by si přechod nechaly
+   (nalezeno revizí). */
 @media (prefers-reduced-motion: reduce) {
-	* {
+	*,
+	*::before,
+	*::after {
 		transition: none !important;
 		animation: none !important;
 	}

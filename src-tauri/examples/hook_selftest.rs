@@ -74,7 +74,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hook::{Hook, HookPrikaz, Udalost, Vystup};
-use keypad_core::{Action, Decision, KeyId, Mapping, Mode, PadAction, PadButton, PadId, MAX_PADS};
+use keypad_core::{
+    Action, Decision, KeyConflict, KeyId, Mapping, Mode, PadAction, PadButton, PadId, StickDir,
+    MAX_PADS,
+};
 use windows::core::HSTRING;
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -318,6 +321,25 @@ fn vk_klavesy(k: KeyId) -> u32 {
     unsafe { MapVirtualKeyW(scan, MAPVK_VSC_TO_VK_EX) }
 }
 
+/// Výchozí mapování, ve kterém prvních šest kláves (ty měření mačká)
+/// ovládá 4 vstupy dvou ovladačů — nejdražší sdílená klávesa (Fáze 7):
+/// stav padu i živý stav se počítají ze všech jejích cílů.
+fn sdilene_mapovani() -> Mapping {
+    let mut m = Mapping::default();
+    let druhy = PadId::ALL[1];
+    let klavesy: Vec<KeyId> = m.keys().map(|(k, _)| k).take(6).collect();
+    for k in klavesy {
+        for a in [
+            Action::LeftStick(StickDir::Up),
+            Action::Button(PadButton::A),
+            Action::RightTrigger,
+        ] {
+            let _ = m.bind(k, PadAction::new(druhy, a), KeyConflict::Share);
+        }
+    }
+    m
+}
+
 fn mereni() -> ExitCode {
     let sloty: Result<Vec<Arc<slot::StavSlot>>, String> = (0..MAX_PADS)
         .map(|_| slot::StavSlot::new().map(Arc::new))
@@ -345,17 +367,20 @@ fn mereni() -> ExitCode {
     let mut v_limitu = true;
     // Na stav klávesnice se callback od opravy OQ 57 neptá vůbec —
     // dřívější třetí řádek „bez GetAsyncKeyState" je teď první dva.
-    for (zive, popis) in [
-        (false, "bez živé detekce         "),
-        (true, "s živou detekcí (popředí)"),
+    // Fáze 7: totéž se sdílenými klávesami o 4 cílech na dvou ovladačích.
+    for (zive, sdilene, popis) in [
+        (false, false, "bez živé detekce         "),
+        (true, false, "s živou detekcí (popředí)"),
+        (false, true, "sdílené 4 cíle, bez živé "),
+        (true, true, "sdílené 4 cíle, s živou  "),
     ] {
-        let mut casy = hook::zmer_zpracovani(
-            MERENI_N,
-            Mapping::default(),
-            Arc::clone(&vystup),
-            zive,
-            vk_klavesy,
-        );
+        let mapovani = if sdilene {
+            sdilene_mapovani()
+        } else {
+            Mapping::default()
+        };
+        let mut casy =
+            hook::zmer_zpracovani(MERENI_N, mapovani, Arc::clone(&vystup), zive, vk_klavesy);
         casy.sort_unstable();
         let p50 = percentil(&casy, 0.50);
         let p99 = percentil(&casy, 0.99);

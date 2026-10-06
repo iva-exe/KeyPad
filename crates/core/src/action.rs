@@ -281,8 +281,20 @@ impl ActionSet {
     }
 
     /// Akce v množině v pořadí [`Action::ALL`].
+    ///
+    /// Po nastavených bitech, ne přes všech 24 akcí: stav padu se počítá
+    /// v hook callbacku z cílů každé držené klávesy (sdílená klávesa jich
+    /// má až 4, Fáze 7) pro každý ovladač.
     pub fn iter(self) -> impl Iterator<Item = Action> {
-        Action::ALL.into_iter().filter(move |&a| self.contains(a))
+        let mut bity = self.0 & ActionSet::MASK;
+        std::iter::from_fn(move || {
+            if bity == 0 {
+                return None;
+            }
+            let i = bity.trailing_zeros() as usize;
+            bity &= bity - 1;
+            Action::from_index(i)
+        })
     }
 }
 
@@ -356,8 +368,10 @@ impl From<PadId> for u8 {
 
 /// Akce na konkrétním ovladači — to, na co se klávesa mapuje.
 ///
-/// Klávesa patří vždy jen jednomu ovladači: dva hráči na jedné
-/// klávesnici si nesmí sdílet klávesu, jinak by jeden stisk hýbal oběma.
+/// Bez volby „Jedna klávesa pro víc vstupů" patří klávesa jen jednomu
+/// vstupu (přiřazení ji přesune). S volbou smí ovládat až
+/// [`crate::MAX_TARGETS_PER_KEY`] vstupů i různých ovladačů — jeden stisk
+/// pak hýbe všemi, o což si uživatel řekl (Fáze 7, [`crate::Targets`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PadAction {
     pub pad: PadId,

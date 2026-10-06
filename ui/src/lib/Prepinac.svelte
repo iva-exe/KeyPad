@@ -12,17 +12,23 @@
 		ceka?: boolean;
 		/** Každá nová hodnota přepínačem jednou pulzne („nejdřív zapni ovladač"). */
 		pulz?: number;
+		/**
+		 * Volba, ne ovladač (ⓘ, Fáze 7): zapnuto bíle — zelená patří jen tomu,
+		 * co opravdu běží (WinSent).
+		 */
+		volba?: boolean;
 		popis: string;
 		title?: string;
 		onprepni: () => void;
 	}
 
-	let { zapnuto, zakazano = false, ceka = false, pulz = 0, popis, title, onprepni }: Props = $props();
+	let { zapnuto, zakazano = false, ceka = false, pulz = 0, volba = false, popis, title, onprepni }: Props = $props();
 </script>
 
 <button
 	class="sw"
 	class:on={zapnuto}
+	class:volba
 	class:ceka
 	role="switch"
 	aria-checked={zapnuto}
@@ -59,6 +65,10 @@
 	.sw.on {
 		border-color: color-mix(in srgb, var(--ok) 55%, transparent);
 		background: color-mix(in srgb, var(--ok) 22%, transparent);
+	}
+	.sw.volba.on {
+		border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+		background: color-mix(in srgb, var(--accent) 16%, transparent);
 	}
 	.sw:disabled {
 		opacity: 0.4;

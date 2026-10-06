@@ -25,12 +25,14 @@ import type {
 	KartyInfo,
 	Klavesa,
 	KlavesyInfo,
+	NastaveniInfo,
 	Oznameni,
 	PadInfo,
 	PadStav,
 	RezimInfo,
 	StavKonfigurace,
 	Vazba,
+	Volba,
 	ZivaInfo,
 	ZmenaKlaves
 } from './smlouva';
@@ -129,7 +131,12 @@ function klavesaZUdalosti(e: KeyboardEvent): Klavesa | null {
 	return { scan: k[0], e0: k[1], nazev, kratky: k[3] ?? nazev.slice(0, 5) };
 }
 
-const ZKRATKA = klavesyJson.zkratka as Klavesa;
+/** Zkratka pauzy — mění ji přiřazování zkratky (ⓘ → Pauza, Fáze 7 Z6). */
+let zkratka = klavesyJson.zkratka as Klavesa;
+/** F1–F24 kromě F4 (Alt+F4, OQ 69), Scroll Lock a Pause bez E0 (KeyId::is_toggle_candidate v jádře). */
+const jeKandidatZkratky = (k: { scan: number; e0: boolean }) =>
+	!k.e0 &&
+	((k.scan >= 0x3b && k.scan <= 0x46 && k.scan !== 0x3e) || k.scan === 0x57 || k.scan === 0x58 || (k.scan >= 0x64 && k.scan <= 0x6e) || k.scan === 0x76);
 const jeWin = (k: { scan: number; e0: boolean }) => k.e0 && (k.scan === 0x5b || k.scan === 0x5c);
 const stejna = (a: { scan: number; e0: boolean }, b: { scan: number; e0: boolean }) =>
 	a.scan === b.scan && a.e0 === b.e0;
@@ -153,17 +160,25 @@ if (adresa.get('karty') === '4') {
 let rev = klavesyJson.rev;
 /** Ovladače s kartou (OQ 52) — jako backend: 0 vždy, ovladač s klávesami taky. */
 const karty = new Set<number>([0, ...vazby.map((v) => v.pad)]);
+/** Rozbalené karty (Fáze 7, OQ 70) — jako backend: výchozí ovladač 1. */
+const rozbalene = new Set<number>([0]);
 let kartyRev = 0;
 
 function kartyInfo(): KartyInfo {
-	return { rev: kartyRev, pady: [...karty].sort((a, b) => a - b) };
+	const serad = (s: Iterable<number>) => [...s].sort((a, b) => a - b);
+	return { rev: kartyRev, pady: serad(karty), rozbalene: serad([...rozbalene].filter((p) => karty.has(p))) };
 }
 
 function pridejKartu(pad: number): void {
 	if (karty.has(pad)) return;
 	karty.add(pad);
+	// Nová karta přijde rozbalená (Fáze 7 Z2).
+	rozbalene.add(pad);
 	kartyRev++;
 }
+
+/** Volby z ⓘ (Fáze 7) — v maketě jen v paměti. */
+const nastaveni: NastaveniInfo = { rev: 0, zvuk: true, sdilene_klavesy: false };
 
 /** Mapování před poslední změnou — pro „Zpět" (jen přesný předchůdce). */
 let predchozi: { rev: number; vazby: Vazba[] } | null = null;
@@ -197,7 +212,8 @@ if (adresa.get('zapnuto') === '1' || adresa.get('zive') === 'zlaty') pady[0]!.st
 const hookChyba = adresa.get('hook') === 'chyba';
 let pauza = false;
 let rezimSeq = 1;
-let prirazovani: { cil: Cil; pridat: boolean; casovac: ReturnType<typeof setTimeout> } | null = null;
+/** `cil: null` = přiřazuje se zkratka pozastavení. */
+let prirazovani: { cil: Cil | null; pridat: boolean; casovac: ReturnType<typeof setTimeout> } | null = null;
 let oznameniSeq = 0;
 let ziveSeq = 0;
 
@@ -212,7 +228,7 @@ function rezimInfo(): RezimInfo {
 	return {
 		rezim: rezimTed(),
 		seq: rezimSeq,
-		cil: prirazovani ? { ...prirazovani.cil } : null,
+		cil: prirazovani ? (prirazovani.cil ? { ...prirazovani.cil } : { zkratka: true }) : null,
 		hook_chyba: hookChyba
 	};
 }
@@ -232,7 +248,8 @@ function klavesyInfo(): KlavesyInfo {
 	return {
 		rev,
 		vstupy: [...VSTUPY],
-		zkratka: ZKRATKA,
+		zkratka,
+		zkratka_mimo: !jeKandidatZkratky(zkratka),
 		vazby: structuredClone(vazby),
 		zpet: predchozi !== null && predchozi.rev === rev,
 		konfigurace,
@@ -241,7 +258,8 @@ function klavesyInfo(): KlavesyInfo {
 			konfigurace === 'obnovena' || konfigurace === 'necitelna'
 				? ['řádek 7: expected value', 'vazba č. 3: neznámý vstup "skok"']
 				: [],
-		karty: kartyInfo()
+		karty: kartyInfo(),
+		nastaveni: { ...nastaveni }
 	};
 }
 
@@ -319,7 +337,7 @@ function konecPrirazovani(oznameni?: Record<string, unknown>): void {
 	if (oznameni) oznam(oznameni);
 }
 
-function prirad(cil: Cil, pridat: boolean): void {
+function prirad(cil: Cil | null, pridat: boolean): void {
 	if (prirazovani) clearTimeout(prirazovani.casovac);
 	const casovac = setTimeout(() => konecPrirazovani({ typ: 'zruseno', duvod: 'cas' }), 10_000);
 	prirazovani = { cil, pridat, casovac };
@@ -330,21 +348,48 @@ function prirad(cil: Cil, pridat: boolean): void {
 	}
 }
 
-function uloz(k: Klavesa): void {
-	const p = prirazovani!;
-	const puvodni = vazby.find((v) => stejna(v.klavesa, k));
-	const odkud = puvodni && !(puvodni.pad === p.cil.pad && puvodni.vstup === p.cil.vstup) ? puvodni : null;
-	let nove = vazby.filter((v) => !stejna(v.klavesa, k));
-	if (!p.pridat) nove = nove.filter((v) => !(v.pad === p.cil.pad && v.vstup === p.cil.vstup));
-	nove.push({ pad: p.cil.pad, vstup: p.cil.vstup, klavesa: k });
+/**
+ * Uloží klávesu vstupu jako engine: bez volby „Jedna klávesa pro víc
+ * vstupů" ji přesune, s volbou ji sdílí (nejvýš 4 vstupy, pátý odmítne).
+ */
+function uloz(k: Klavesa, cil: Cil, pridat: boolean): void {
+	const puvodni = vazby.filter((v) => stejna(v.klavesa, k));
+	const jeCil = (v: { pad: number; vstup: string }) => v.pad === cil.pad && v.vstup === cil.vstup;
+	const uzPatri = puvodni.some(jeCil);
+	const sdilet = nastaveni.sdilene_klavesy || uzPatri;
+	if (sdilet && !uzPatri && puvodni.length >= 4) {
+		oznam({ typ: 'odmitnuto', duvod: 'plno', klavesa: { scan: k.scan, e0: k.e0 } });
+		return;
+	}
+	const odesli = sdilet ? [] : puvodni.filter((v) => !jeCil(v));
+	let nove = sdilet ? [...vazby] : vazby.filter((v) => !stejna(v.klavesa, k));
+	if (!pridat) nove = nove.filter((v) => !jeCil(v) || stejna(v.klavesa, k));
+	if (!nove.some((v) => jeCil(v) && stejna(v.klavesa, k))) nove.push({ pad: cil.pad, vstup: cil.vstup, klavesa: k });
+	const [odkud, ...dalsi] = odesli;
 	konecPrirazovani({
 		typ: 'ulozeno',
-		pad: p.cil.pad,
-		vstup: p.cil.vstup,
+		pad: cil.pad,
+		vstup: cil.vstup,
 		klavesa: { scan: k.scan, e0: k.e0 },
-		odkud: odkud ? { pad: odkud.pad, vstup: odkud.vstup } : null
+		odkud: odkud ? { pad: odkud.pad, vstup: odkud.vstup } : null,
+		odkud_dalsi: dalsi.length,
+		sdileno: sdilet ? puvodni.filter((v) => !jeCil(v)).length : 0
 	});
 	zmenVazby(nove);
+}
+
+/** Nová zkratka pauzy (Z6): jen F1–F24 kromě F4, Scroll Lock, Pause a nenamapovaná. */
+function ulozZkratku(k: Klavesa): void {
+	const pozice = { scan: k.scan, e0: k.e0 };
+	if (!stejna(k, zkratka)) {
+		if (!jeKandidatZkratky(k)) return oznam({ typ: 'odmitnuto', duvod: 'nevhodna', klavesa: pozice });
+		if (vazby.some((v) => stejna(v.klavesa, k))) return oznam({ typ: 'odmitnuto', duvod: 'namapovana', klavesa: pozice });
+		zkratka = k;
+		konecPrirazovani({ typ: 'ulozeno', zkratka: true, klavesa: pozice });
+		zmenVazby(vazby);
+		return;
+	}
+	konecPrirazovani({ typ: 'ulozeno', zkratka: true, klavesa: pozice });
 }
 
 // ── klávesnice prohlížeče místo hooku ──
@@ -354,15 +399,17 @@ function dolu(e: KeyboardEvent): void {
 	const k = klavesaZUdalosti(e);
 	const pozice = k ? { scan: k.scan, e0: k.e0 } : { scan: 0, e0: false };
 	if (prirazovani) {
+		const p = prirazovani;
 		if (k?.scan === 0x01) konecPrirazovani({ typ: 'zruseno', duvod: 'esc' });
-		else if (k && stejna(k, ZKRATKA)) oznam({ typ: 'odmitnuto', duvod: 'zkratka', klavesa: pozice });
 		else if (k && jeWin(k)) oznam({ typ: 'odmitnuto', duvod: 'win', klavesa: pozice });
 		else if (!k) oznam({ typ: 'odmitnuto', duvod: 'nejde', klavesa: pozice });
-		else uloz(k);
+		else if (!p.cil) ulozZkratku(k);
+		else if (stejna(k, zkratka)) oznam({ typ: 'odmitnuto', duvod: 'zkratka', klavesa: pozice });
+		else uloz(k, p.cil, p.pridat);
 		return;
 	}
 	if (!k) return;
-	if (stejna(k, ZKRATKA)) {
+	if (stejna(k, zkratka)) {
 		if (pady.some((p) => p.state === 'on')) {
 			pauza = !pauza;
 			zmenRezim();
@@ -455,6 +502,12 @@ function obsluz(prikaz: string, a: Record<string, unknown>): unknown {
 			prirad({ pad, vstup: a.vstup }, !!a.pridat);
 			return null;
 		}
+		case 'prirad_zkratku':
+			prirad(null, false);
+			return null;
+		case 'ukazka_zvuku':
+			// Maketa nic nehraje — jako simulace v backendu.
+			throw 'Simulace — zvuk se nepřehrává.';
 		case 'zrus_prirazeni':
 			if (prirazovani) konecPrirazovani({ typ: 'zruseno', duvod: 'okno' });
 			return null;
@@ -468,7 +521,8 @@ function obsluz(prikaz: string, a: Record<string, unknown>): unknown {
 			const zbyle = vazby.filter((v) => v.pad !== pad);
 			if (zbyle.length === 0) throw 'Nejdřív dej klávesy jinému ovladači.';
 			if (zbyle.length !== vazby.length) zmenVazby(zbyle);
-			if (karty.delete(pad)) kartyRev++;
+			const karta = karty.delete(pad);
+			if (rozbalene.delete(pad) || karta) kartyRev++;
 			return kartyInfo();
 		}
 		case 'pridej_kartu': {
@@ -476,6 +530,27 @@ function obsluz(prikaz: string, a: Record<string, unknown>): unknown {
 			if (pad === 0) throw 'Ovladač 1 má kartu vždy.';
 			pridejKartu(pad);
 			return kartyInfo();
+		}
+		case 'rozbal_kartu': {
+			const pad = cislo(a.pad);
+			if (!karty.has(pad)) throw 'Ovladač nemá kartu.';
+			const pred = rozbalene.has(pad);
+			if (a.rozbalena) rozbalene.add(pad);
+			else rozbalene.delete(pad);
+			if (pred !== !!a.rozbalena) kartyRev++;
+			return kartyInfo();
+		}
+		case 'nastaveni':
+			return { ...nastaveni };
+		case 'nastav': {
+			const volba = a.volba as Volba;
+			if (volba !== 'zvuk' && volba !== 'sdilene_klavesy') throw 'Taková volba není.';
+			if (nastaveni[volba] !== !!a.zapnuto) {
+				nastaveni[volba] = !!a.zapnuto;
+				nastaveni.rev++;
+				vydej('nastaveni', { ...nastaveni });
+			}
+			return { ...nastaveni };
 		}
 		case 'pad_on': {
 			const pad = cislo(a.pad);

@@ -15,7 +15,14 @@
 # během přiřazování, restart (klávesy i karta zůstanou), poškozenou
 # konfiguraci, prázdnou kartu ovladače 2 po konci procesu (Fáze 6b) a
 # přiřazení s Esc s podvrhem „Windows drží všechno" (KEYPAD_TEST_OS_DRZI,
-# OQ 57) a Esc do okna, který hook nevidí (Fáze 6c, OQ 60). Z logu
+# OQ 57) a Esc do okna, který hook nevidí (Fáze 6c, OQ 60). Fáze 7: karty
+# rozbalené naráz i po restartu (Z2), ↺ a 🗑 jedním klikem s potvrzovacím
+# dialogem — Zrušit, Esc, klik mimo, Enter po otevření myší, Tab + Enter,
+# minimalizace (Z3) —, jednu klávesu pro víc vstupů (oranžové čepičky,
+# bublina, oba ovladače ve hře, strop 4, vypnutí volby, restart — Z4), rámeček
+# a záři karty po dobu drženého vstupu i se sbalenou kartou a „Omezit pohyb“
+# (Z5), zvuk v logu (přepínač nepípá, Scroll Lock ano — Z1) a nastavení
+# pod ⓘ (Zvuk, zkratka pozastavení — Z6). Z logu
 # testovací instance ověří řádky „přiřazování skončilo" (důvod, počty
 # a doručení, nikdy klávesa) a „raw input klávesnice: ne" při každém startu
 # i přiřazování (OQ 60). Snímky okna ukládá do -Snimky
@@ -370,7 +377,20 @@ window.__kpt = (() => {
     const t = q('.cepicka .telo');
     return { pismoMin: min, kde, cepicka: t ? Math.round(t.getBoundingClientRect().width) : null, sirka: innerWidth, vyska: innerHeight };
   };
-  return { q, qa, app, karta, cep, cekej, inv, klavesa, klik, text, napoveda, nazev, barva, karty, sviti, pretek, miry };
+  // Panel dojel: plynulý posun (karta z „+ Ovladač") skončil — stejná poloha
+  // pět snímků po sobě. Dobíhající plynulý posun by jinak dojel i po
+  // ručním `scrollTop = 0` a test by ho připsal klávesám.
+  const klid = async () => {
+    const p = q('main.panel');
+    let a = -1, stejne = 0;
+    for (let i = 0; i < 180 && stejne < 5; i++) {
+      await new Promise((r) => requestAnimationFrame(() => r()));
+      stejne = p.scrollTop === a ? stejne + 1 : 0;
+      a = p.scrollTop;
+    }
+    return stejne >= 5;
+  };
+  return { q, qa, app, karta, cep, cekej, inv, klavesa, klik, text, napoveda, nazev, barva, karty, sviti, pretek, miry, klid };
 })();
 '@
 
@@ -636,7 +656,7 @@ function LogRadky {
 # počty doručení (kolikrát Windows zavolaly callback hooku) a kontrolou
 # Raw Input klávesnice (OQ 60). Nic jiného v něm být nesmí — hlavně ne
 # identita klávesy (OQ 33: log se posílá při hlášení chyby).
-$katDiag = '(modifikátor|Win|s Win|nemapovatelná|držená Windows|zkratka pauzy|vstříknutá|už držená|jiné)'
+$katDiag = '(modifikátor|Win|s Win|nemapovatelná|držená Windows|zkratka pauzy|vstříknutá|už 4 vstupy|namapovaná|nevhodná pro pauzu|už držená|jiné)'
 $script:reDiag = '^(uloženo|Esc|limit 10 s|okno|vynuceno) — nepřiřazeno: (nic|\d+× ' + $katDiag + '(, \d+× ' + $katDiag + ')*)( \(a \d+ dřívějších bez záznamu\))?' +
     ' · callback \d+× \(stisků \d+, souběh \d+, rozbitý \d+\) · raw input klávesnice: (ne|ano — odregistrováno|ano — nejde zrušit|nezjištěno)$'
 # Doručení a Raw Input v testu okna: klávesy posílá `test_klavesa` MIMO
@@ -666,7 +686,8 @@ function OverKonec([int]$Od, [string]$Cekany) {
     Over ('log: „přiřazování skončilo: ' + $Cekany + ' · …“') ($r -ceq ($Cekany + $script:konecDoruceni)) $r
 }
 
-# Rozbalí kartu (akordeon: klik na už rozbalenou kartu by ji sbalil).
+# Rozbalí kartu (klik na už rozbalenou kartu by ji sbalil — karty se od
+# Fáze 7 rozbalují každá zvlášť).
 function Rozbal([int]$N) {
     if (-not (Js "!!__kpt.karta($N) && __kpt.karta($N).dataset.rozbalena === 'true'")) {
         $null = Klik "section.karta[data-pad=`"$N`"] .rozbal"
@@ -676,7 +697,7 @@ function Rozbal([int]$N) {
 
 # ── Scénáře ────────────────────────────────────────────────────────
 function ScenarStart {
-    Krok '1/13  Start (prázdné APPDATA)'
+    Krok '1/19  Start (prázdné APPDATA)'
     Over 'okno načteno, ovladač 1 má 24 čepiček' (Cekej '!!__kpt.app() && __kpt.qa("section.karta[data-pad=\"1\"] [data-vstup]").length === 24 && !__kpt.cep(1, "a").hasAttribute("data-prazdna")' 30000)
     $sirka = Js 'innerWidth'
     Over "šířka okna 440 px (je $sirka)" ($sirka -ge 430 -and $sirka -le 450)
@@ -699,19 +720,27 @@ function ScenarStart {
 }
 
 function ScenarKarty {
-    Krok '2/13  Ovladače 2–4 a jejich barvy'
+    Krok '2/19  Ovladače 2–4 a jejich barvy'
     foreach ($n in 2, 3, 4) {
         $klik = Klik "[data-pridat=`"$n`"]"
         # Pozor: „ a “ jsou pro PowerShell uvozovky — v textu jen v '…'.
         Over ('„+ Ovladač“ přidá kartu ' + $n + ' a rozbalí ji') ($klik -and (Cekej "!!__kpt.karta($n) && __kpt.karta($n).dataset.rozbalena === `"true`""))
     }
     Over 'při čtyřech kartách „+ Ovladač“ zmizí' (Cekej '!__kpt.q("[data-pridat]")')
-    Over 'rozbalená je jen jedna karta' ((Js '__kpt.qa("section.karta[data-rozbalena=\"true\"]").length') -eq 1)
+    # Nová karta vzniká rovnou rozbalená (bez přechodu rozbalení) — do
+    # zorného pole ji musí posunout „+ Ovladač" sám (revize): celá, nebo
+    # (je-li vyšší než panel) od horního okraje.
+    $videt4 = '(() => { const p = __kpt.q("main.panel").getBoundingClientRect(); const k = __kpt.karta(4).getBoundingClientRect(); const c = [...__kpt.karta(4).querySelectorAll(".cepicka")].at(-1).getBoundingClientRect(); return k.height <= p.height ? c.top >= p.top - 1 && c.bottom <= p.bottom + 1 : Math.abs(k.top - p.top) < 16; })()'
+    Over 'po „+ Ovladač“ je nová karta 4 v zorném poli panelu (i její poslední čepička)' ((Cekej $videt4 3000) -and (Js '__kpt.klid()') -and (Js $videt4)) (Js '(() => { const p = __kpt.q("main.panel"); const k = __kpt.karta(4).getBoundingClientRect(); return { scrollTop: p.scrollTop, panel: p.getBoundingClientRect().bottom, karta: [k.top, k.bottom] }; })()')
+    # Fáze 7, Z2: žádný akordeon — nová karta přijde rozbalená a ostatní
+    # se nemění.
+    Over 'rozbalené jsou všechny čtyři karty (každá zvlášť, Z2)' ((Js '__kpt.qa("section.karta[data-rozbalena=\"true\"]").length') -eq 4)
     $cekane = @('rgb(96, 165, 250)', 'rgb(244, 114, 182)', 'rgb(167, 139, 250)', 'rgb(103, 232, 249)')
     $odznaky = @(Js '[1, 2, 3, 4].map((n) => __kpt.barva(n, ".odznak"))')
-    $pruhy = @(Js '[1, 2, 3, 4].map((n) => __kpt.barva(n, ".pruh"))')
+    # Rámeček karty (Z5) místo levého pruhu: bez data-vzhled-karty pruh není.
+    $pruhy = @(Js '[1, 2, 3, 4].map((n) => getComputedStyle(__kpt.karta(n), "::before").content)')
     Over 'barvy odznaků 1–4 = --pad-1..4 (modrá, růžová, fialová, azurová)' ((($odznaky -join '|') -eq ($cekane -join '|'))) $odznaky
-    Over 'barvy pruhů 1–4 = --pad-1..4' ((($pruhy -join '|') -eq ($cekane -join '|'))) $pruhy
+    Over 'karta nemá levý pruh (.pruh ani ::before) — vzhled Z5' ((-not (Js '!!__kpt.q("section.karta .pruh")')) -and -not @($pruhy | Where-Object { $_ -ne 'none' -and $_ -ne 'normal' })) $pruhy
     Over 'odznak nese číslo ovladače' (Js '[1, 2, 3, 4].every((n) => __kpt.text(__kpt.q(`section.karta[data-pad="${n}"] .odznak`)) === String(n))')
     Over 'prázdný ovladač 4: všechny čepičky čárkované' ((Js '__kpt.qa("section.karta[data-pad=\"4\"] .cepicka[data-prazdna]").length') -eq 24)
     Over 'prázdný ovladač 4: „Klikni na vstup a stiskni klávesu“' ((Js '__kpt.napoveda(4)') -eq 'Klikni na vstup a stiskni klávesu') (Js '__kpt.napoveda(4)')
@@ -721,7 +750,7 @@ function ScenarKarty {
 }
 
 function ScenarKlavesyOkna {
-    Krok '3/13  Klávesy psané do okna (spec 1.8) — důvěryhodné události přes CDP'
+    Krok '3/19  Klávesy psané do okna (spec 1.8) — důvěryhodné události přes CDP'
     # Nižší okno, ať má panel co posouvat (4 karty, jedna rozbalená).
     $null = $script:cdp.Volej('Emulation.setDeviceMetricsOverride', '{"width":440,"height":480,"deviceScaleFactor":0,"mobile":false}', 10000)
     $null = Cekej 'innerHeight === 480'
@@ -731,17 +760,27 @@ function ScenarKlavesyOkna {
     # Záznam keydown až po stráži (ta poslouchá v zachytávací fázi): co
     # došlo, jestli to byla důvěryhodná událost a jestli stráž zrušila
     # výchozí akci. Značka v `window` zmizí, kdyby se stránka obnovila.
-    $pripraveno = Js '(() => {
+    $pripraveno = Js '(async () => {
         window.__kptZnacka = 1;
         window.__kptKlavesy = [];
         window.__kptTisk = false;
         addEventListener("keydown", (e) => __kptKlavesy.push({ k: e.key, p: e.defaultPrevented, t: e.isTrusted }));
         addEventListener("beforeprint", () => { window.__kptTisk = true; });
         const panel = __kpt.q("main.panel");
+        // Nahoru a počkat, až panel stojí — plynulý posun na kartu 4
+        // z „+ Ovladač" (scénář 2) mohl ještě dobíhat (naměřeno: dojel
+        // o 4–8 px i po ručním scrollTop = 0).
+        await __kpt.klid();
         panel.scrollTop = 0;
+        await __kpt.klid();
+        panel.scrollTop = 0;
+        // Posuny panelu s časem — kdyby se posunul, detail řekne kdy.
+        window.__kptPosuny = [];
+        const t0 = performance.now();
+        panel.addEventListener("scroll", () => __kptPosuny.push([Math.round(performance.now() - t0), panel.scrollTop]));
         const sw = __kpt.q("section.karta[data-pad=\"1\"] button[role=\"switch\"]");
         sw.focus();
-        return { posouva: panel.scrollHeight > panel.clientHeight + 20, fokus: document.activeElement === sw };
+        return { posouva: panel.scrollHeight > panel.clientHeight + 20, fokus: document.activeElement === sw, posun: panel.scrollTop };
     })()'
     Over 'panel se dá posouvat a přepínač ovladače 1 má fokus (bez Tabu)' ($pripraveno.posouva -and $pripraveno.fokus) $pripraveno
 
@@ -749,13 +788,13 @@ function ScenarKlavesyOkna {
     OknuKlavesa 'Enter' 'Enter' 13 0 "`r"
     foreach ($k in @(@('ArrowDown', 40), @('PageDown', 34), @('End', 35))) { OknuKlavesa $k[0] $k[0] $k[1] }
     Start-Sleep -Milliseconds 500
-    $po = Js '({ stav: __kpt.karta(1).dataset.stav, posun: __kpt.q("main.panel").scrollTop, klavesy: __kptKlavesy })'
+    $po = Js '({ stav: __kpt.karta(1).dataset.stav, posun: __kpt.q("main.panel").scrollTop, klavesy: __kptKlavesy, posuny: __kptPosuny })'
     $kl = @($po.klavesy)
     Over 'klávesy došly do stránky jako důvěryhodné (isTrusted) — je co ověřovat' ((($kl | ForEach-Object { $_.k }) -join ',') -eq ' ,Enter,ArrowDown,PageDown,End' -and -not @($kl | Where-Object { -not $_.t })) $kl
     Over 'stráž jim zrušila výchozí akci (preventDefault)' ($kl.Count -gt 0 -and -not @($kl | Where-Object { -not $_.p })) $kl
     $r = (Prikaz 'rezim').v
     Over 'mezerník ani Enter nepřepnuly přepínač s fokusem (ovladač vypnutý, backend: vypnuto)' ($po.stav -eq 'off' -and $r.rezim -eq 'disabled') @{ stav = $po.stav; rezim = $r.rezim }
-    Over 'šipka, PageDown, End ani mezerník panel neposunuly' ($po.posun -eq 0) $po.posun
+    Over 'šipka, PageDown, End ani mezerník panel neposunuly' ($po.posun -eq 0) @{ posun = $po.posun; posuny = $po.posuny; pred = $pripraveno.posun }
 
     $null = Js '(() => { __kptKlavesy.length = 0; return true; })()'
     OknuKlavesa 'F5' 'F5' 116
@@ -785,9 +824,10 @@ function ScenarKlavesyOkna {
 }
 
 function ScenarPrirazeni {
-    Krok '4/13  Přiřazení F24 k A ovladače 2'
-    $null = Klik 'section.karta[data-pad="2"] .rozbal'
-    Over 'klik na hlavičku rozbalí kartu 2' (Cekej '__kpt.karta(2).dataset.rozbalena === "true" && !!__kpt.cep(2, "a")')
+    Krok '4/19  Přiřazení F24 k A ovladače 2'
+    # Karta 2 zůstala rozbalená od přidání (Z2: karty se rozbalují každá
+    # zvlášť); Rozbal na rozbalenou kartu neklikne — klik by ji sbalil.
+    Over 'karta 2 rozbalená' (Rozbal 2)
     $null = Klik 'section.karta[data-pad="2"] [data-vstup="a"] .telo'
     Over 'klik na čepičku A → přiřazování (data-rezim=binding)' (Cekej '__kpt.app().dataset.rezim === "binding" && __kpt.cep(2, "a").hasAttribute("data-cil")')
     $r = (Prikaz 'rezim').v
@@ -811,9 +851,8 @@ function ScenarPrirazeni {
 }
 
 function ScenarPresun {
-    Krok '5/13  Přesun F24 na ovladač 1 a „Zpět“'
-    $null = Klik 'section.karta[data-pad="1"] .rozbal'
-    $null = Cekej '__kpt.karta(1).dataset.rozbalena === "true" && !!__kpt.cep(1, "b")'
+    Krok '5/19  Přesun F24 na ovladač 1 a „Zpět“'
+    $null = Rozbal 1
     $rev0 = (Klavesy).rev
     $null = Klik 'section.karta[data-pad="1"] [data-vstup="b"] .telo'
     Over 'klik na B ovladače 1 → přiřazování' (Cekej '__kpt.app().dataset.rezim === "binding" && __kpt.cep(1, "b").hasAttribute("data-cil")')
@@ -832,7 +871,7 @@ function ScenarPresun {
 }
 
 function ScenarWin {
-    Krok '7/13  Win a AltGr při přiřazování'
+    Krok '7/19  Win a AltGr při přiřazování'
     $rev0 = (Klavesy).rev
     $null = Klik 'section.karta[data-pad="1"] [data-vstup="x"] .telo'
     Over 'klik na X ovladače 1 → přiřazování' (Cekej '__kpt.app().dataset.rezim === "binding" && __kpt.cep(1, "x").hasAttribute("data-cil")')
@@ -884,7 +923,7 @@ function ScenarWin {
 }
 
 function ScenarUpravy {
-    Krok '6/13  Přidat, vyprázdnit, výchozí klávesy, odebrat ovladač, klik jinam, 10 s'
+    Krok '6/19  Přidat, vyprázdnit, výchozí klávesy, odebrat ovladač, klik jinam, 10 s'
     $y = 'section.karta[data-pad="1"] [data-vstup="y"]'
     $vazbyY = { param($k) @($k.vazby | Where-Object { $_.pad -eq 0 -and $_.vstup -eq 'y' }) }
 
@@ -909,29 +948,71 @@ function ScenarUpravy {
     $null = PravyKlik "$y .telo"
     Over 'pravý klik vyprázdní Y' ((Cekej '__kpt.cep(1, "y").hasAttribute("data-prazdna")') -and (CekejNa { (& $vazbyY (Klavesy)).Count -eq 0 }))
 
-    # ↺ výchozí klávesy ovladače 1: dva kliky do 3 s.
+    # ↺ výchozí klávesy ovladače 1: jeden klik → potvrzovací dialog v okně
+    # (Fáze 7, Z3). Fokus na „Zrušit"; Esc, Zrušit, klik mimo a Enter po
+    # otevření myší nic nezmění; Tab na „Vrátit" + Enter potvrdí.
     $vychozi = 'section.karta[data-pad="1"] .ikony button[aria-label="Výchozí klávesy"]'
     $vj = ConvertTo-Json $vychozi -Compress
+    $dialog = '!!__kpt.q("[role=alertdialog]")'
+    $rev0 = (Klavesy).rev
+    # Přechod dialogu (průhlednost + zvětšení, 120 ms) se má opravdu
+    # přehrát při otevření i zavření — `{#key}` ho dřív potichu vypínal
+    # (revize). Svelte ho hraje přes Element.animate: záznam jen tady,
+    # v okně testovací instance.
+    $null = Js '(() => { if (!window.__kptAnim) { window.__kptAnim = []; const a = Element.prototype.animate; Element.prototype.animate = function (...x) { if (this.matches && this.matches("[role=alertdialog]")) window.__kptAnim.push(Date.now()); return a.apply(this, x); }; } window.__kptAnim.length = 0; return true; })()'
     $null = Klik $vychozi
-    Over '↺ první klik jen potvrzuje („Znovu = potvrdit“), nic nemění' ((Cekej "__kpt.q($vj).classList.contains('potvrdit') && __kpt.q($vj).title === 'Znovu = potvrdit'") -and (Js '__kpt.cep(1, "y").hasAttribute("data-prazdna")'))
+    Over 'dialog se objeví přechodem (Element.animate na dialogu)' (Cekej 'window.__kptAnim.length > 0' 2000) (Js 'window.__kptAnim.length')
+    Over '↺ jeden klik → dialog „Vrátit výchozí klávesy ovladače 1?“, fokus na Zrušit' (Cekej "$dialog && __kpt.text(__kpt.q('#potvrzeni-nadpis')) === 'Vrátit výchozí klávesy ovladače 1?' && document.activeElement === __kpt.q('[data-akce=zrusit]')") (Js '({ nadpis: __kpt.text(__kpt.q("#potvrzeni-nadpis")), fokus: document.activeElement && document.activeElement.textContent })')
+    Over 'dialog: role alertdialog, aria-modal, popis „Klávesy jiných ovladačů zůstanou.“' (Js '(() => { const d = __kpt.q("[role=alertdialog]"); return d.getAttribute("aria-modal") === "true" && d.getAttribute("aria-labelledby") === "potvrzeni-nadpis" && __kpt.text(__kpt.q("#potvrzeni-popis")) === "Klávesy jiných ovladačů zůstanou."; })()')
+    Over 'otevření dialogu nic nezměnilo (revize mapování stejná)' ((Klavesy).rev -eq $rev0)
+    Snimek '05b-potvrzeni-vychozi'
+    # Klávesy do okna jen s emulací fokusu (skrytá plocha nemá popředí).
+    $null = $script:cdp.Volej('Emulation.setFocusEmulationEnabled', '{"enabled":true}', 10000)
+    # Otevírací přechod volá animate dvakrát (prodleva, pak přechod) —
+    # počítat až po něm, ať se nezaměnil za zavírací.
+    Start-Sleep -Milliseconds 300
+    $a0 = [int](Js 'window.__kptAnim.length')
+    OknuKlavesa 'Escape' 'Escape' 27
+    Over 'Esc dialog zavře a nic nezmění' ((Cekej "!$dialog") -and (Js '__kpt.cep(1, "y").hasAttribute("data-prazdna")') -and (Klavesy).rev -eq $rev0)
+    Over 'dialog zmizí přechodem (další Element.animate na dialogu)' ([int](Js 'window.__kptAnim.length') -gt $a0) (Js 'window.__kptAnim.length')
     $null = Klik $vychozi
-    Over '↺ druhý klik vrátí výchozí klávesy (Y = R)' (Cekej '!__kpt.cep(1, "y").hasAttribute("data-prazdna") && __kpt.nazev(1, "y") === "R"')
+    $null = Cekej $dialog
+    $null = Klik '[data-akce="zrusit"]'
+    Over '„Zrušit“ dialog zavře a nic nezmění, fokus zpět na ↺' ((Cekej "!$dialog && document.activeElement === __kpt.q($vj)") -and (Klavesy).rev -eq $rev0) (Js 'document.activeElement && document.activeElement.getAttribute("aria-label")')
+    $null = Klik $vychozi
+    $null = Cekej $dialog
+    $null = StiskMysi '.vrstva'
+    Over 'klik mimo dialog = Zrušit' ((Cekej "!$dialog") -and (Klavesy).rev -eq $rev0)
+    $null = Klik $vychozi
+    $null = Cekej $dialog
+    # Dialog otevřený myší: Enter nic nepotvrdí (stráž kláves — Enter je
+    # Start ovladače 1, ne potvrzení).
+    $null = StiskMysi '[data-akce="zrusit"]'
+    OknuKlavesa 'Enter' 'Enter' 13 0 "`r"
+    Start-Sleep -Milliseconds 300
+    Over 'Enter po otevření myší nic nepotvrdí (dialog zůstal, revize stejná)' ((Js $dialog) -and (Klavesy).rev -eq $rev0)
+    OknuKlavesa 'Tab' 'Tab' 9
+    Over 'Tab přesune fokus na „Vrátit“ (jen uvnitř dialogu)' (Cekej "document.activeElement === __kpt.q('[data-akce=potvrdit]')") (Js 'document.activeElement && document.activeElement.textContent')
+    OknuKlavesa 'Enter' 'Enter' 13 0 "`r"
+    Over 'Tab + Enter → výchozí klávesy (Y = R), dialog zavřený' (Cekej "!$dialog && !__kpt.cep(1, 'y').hasAttribute('data-prazdna') && __kpt.nazev(1, 'y') === 'R'")
+    Over 'nápověda „Výchozí klávesy“ se „Zpět“' (Cekej '(__kpt.napoveda(1) || "").startsWith("Výchozí klávesy") && !!__kpt.q("section.karta[data-pad=\"1\"] .napoveda .zpet")') (Js '__kpt.napoveda(1)')
+    $null = $script:cdp.Volej('Emulation.setFocusEmulationEnabled', '{"enabled":false}', 10000)
+    $null = StiskMysi 'main.panel'
     $k = Klavesy
     $f24 = Vazba $k 0x76
     Over 'výchozí: ovladač 1 má 24 vazeb, F24 zůstala ovladači 2 (OQ 49), F23 pryč' (@($k.vazby | Where-Object { $_.pad -eq 0 }).Count -eq 24 -and $f24.pad -eq 1 -and -not (Vazba $k 0x6E)) @{ pad1 = @($k.vazby | Where-Object { $_.pad -eq 0 }).Count; f24 = $f24 }
 
-    # 🗑 odebere vypnutý ovladač 2–4: dva kliky.
-    $null = Klik 'section.karta[data-pad="4"] .rozbal'
-    $null = Cekej '__kpt.karta(4).dataset.rozbalena === "true"'
+    # 🗑 odebere vypnutý ovladač 2–4: jeden klik → dialog → „Odebrat“.
+    $null = Rozbal 4
     $kos = ConvertTo-Json 'section.karta[data-pad="4"] .ikony button[aria-label="Odebrat ovladač"]' -Compress
     $null = Js "__kpt.klik($kos)"
-    Over '🗑 první klik jen potvrzuje, karta 4 zůstává' ((Cekej "!!__kpt.q($kos) && __kpt.q($kos).classList.contains('potvrdit')") -and (Js '!!__kpt.karta(4)'))
-    $null = Js "__kpt.klik($kos)"
-    Over '🗑 druhý klik odebere ovladač 4 (karta zmizí, „+ Ovladač“ nabízí 4)' (Cekej '!__kpt.karta(4) && !!__kpt.q("[data-pridat=\"4\"]")') (Js '__kpt.karty()')
+    Over '🗑 jeden klik → dialog „Odebrat ovladač 4?“ (bez kláves bez druhého řádku), karta zůstává' ((Cekej "$dialog && __kpt.text(__kpt.q('#potvrzeni-nadpis')) === 'Odebrat ovladač 4?' && !__kpt.q('#potvrzeni-popis')") -and (Js '!!__kpt.karta(4)'))
+    Snimek '05c-potvrzeni-odebrat'
+    $null = Klik '[data-akce="potvrdit"]'
+    Over '„Odebrat“ odebere ovladač 4 (karta zmizí, „+ Ovladač“ nabízí 4)' (Cekej "!$dialog && !__kpt.karta(4) && !!__kpt.q('[data-pridat=`"4`"]')") (Js '__kpt.karty()')
 
     # Klik jinam (stisk myši mimo čepičky) přiřazování zruší.
-    $null = Klik 'section.karta[data-pad="1"] .rozbal'
-    $null = Cekej '__kpt.karta(1).dataset.rozbalena === "true" && !!__kpt.cep(1, "x")'
+    $null = Rozbal 1
     $rev0 = (Klavesy).rev
     $null = Klik 'section.karta[data-pad="1"] [data-vstup="x"] .telo'
     $null = Cekej '__kpt.app().dataset.rezim === "binding"'
@@ -964,9 +1045,8 @@ function ScenarUpravy {
 }
 
 function ScenarMinimalizace {
-    Krok '10/13  Minimalizace okna během přiřazování'
-    $null = Klik 'section.karta[data-pad="1"] .rozbal'
-    $null = Cekej '__kpt.karta(1).dataset.rozbalena === "true" && !!__kpt.cep(1, "x")'
+    Krok '10/19  Minimalizace okna během přiřazování'
+    $null = Rozbal 1
     $rev0 = (Klavesy).rev
     $null = Klik 'section.karta[data-pad="1"] [data-vstup="x"] .telo'
     Over 'přiřazování běží' (Cekej '__kpt.app().dataset.rezim === "binding"')
@@ -987,7 +1067,7 @@ function ScenarMinimalizace {
 }
 
 function ScenarZive {
-    Krok '8/13  Živé svícení, simulovaný ovladač'
+    Krok '8/19  Živé svícení, simulovaný ovladač'
     Klavesa 0x11 $false $true
     Over 'W dolů → čepička ↑ levé páčky obrysem (data-sviti=nahled)' (Cekej '__kpt.cep(1, "ls_up").dataset.sviti === "nahled"') (Js '__kpt.sviti()')
     Klavesa 0x1E $false $true
@@ -1035,7 +1115,7 @@ function ScenarZive {
 }
 
 function ScenarSirka {
-    Krok '9/13  Rozvržení 380 px'
+    Krok '9/19  Rozvržení 380 px'
     foreach ($v in @(@(380, 620), @(380, 480))) {
         $null = $script:cdp.Volej('Emulation.setDeviceMetricsOverride', ('{"width":' + $v[0] + ',"height":' + $v[1] + ',"deviceScaleFactor":0,"mobile":false}'), 10000)
         $null = Cekej ('innerWidth === ' + $v[0])
@@ -1043,8 +1123,7 @@ function ScenarSirka {
         Pretek ("{0}×{1} px" -f $v[0], $v[1])
         Snimek ('09-{0}x{1}' -f $v[0], $v[1])
     }
-    $null = Klik 'section.karta[data-pad="2"] .rozbal'
-    $null = Cekej '__kpt.karta(2).dataset.rozbalena === "true"'
+    $null = Rozbal 2
     Start-Sleep -Milliseconds 300
     Pretek '380×480 px, karta 2'
     Snimek '10-380x480-karta2'
@@ -1053,7 +1132,7 @@ function ScenarSirka {
 }
 
 function ScenarRestart {
-    Krok '11/13  Restart a poškozená konfigurace'
+    Krok '11/19  Restart a poškozená konfigurace'
     $ulozeno = CekejNaKonfiguraci { param($j) @($j.vazby | Where-Object { $_.ovladac -eq 2 -and $_.vstup -eq 'a' -and $_.scan -eq 0x76 }).Count -eq 1 }
     Over 'config.json má F24 u ovladače 2 (zápis do 0,5 s po změně)' $ulozeno
     # Karty se ukládají (OQ 52, vlastník 6. 10.): prázdná karta 3 zůstala,
@@ -1068,7 +1147,7 @@ function ScenarRestart {
     $null = Cekej '__kpt.karty().length === 3'
     $karty = @(Js '__kpt.karty()')
     Over 'po restartu karty 1, 2 a prázdná 3; odebraná 4 ne (OQ 52)' (($karty -join ',') -eq '1,2,3') $karty
-    $null = Klik 'section.karta[data-pad="2"] .rozbal'
+    $null = Rozbal 2
     Over 'karta 2 po restartu ukazuje F24 na A' (Cekej ('__kpt.nazev(2, "a") === ' + (ConvertTo-Json -InputObject ((Vazba $k 0x76).klavesa.kratky) -Compress)))
     Snimek '11-po-restartu'
 
@@ -1092,7 +1171,7 @@ function ScenarRestart {
 }
 
 function ScenarPrazdnaKarta {
-    Krok '12/13  Prázdná karta ovladače 2 po úplném ukončení procesu (OQ 52)'
+    Krok '12/19  Prázdná karta ovladače 2 po úplném ukončení procesu (OQ 52)'
     # Hlášení vlastníka 6. 10. (bod 6): karta 2 přežila zavření okna, ale
     # ne konec procesu. Tady bez jediné klávesy — ScenarRestart má kartu 2
     # s F24, a ta by zůstala i bez ukládání karet.
@@ -1116,7 +1195,7 @@ function ScenarPrazdnaKarta {
 }
 
 function ScenarOsDrziVse {
-    Krok '13/13  Přiřazení a Esc, i když by Windows callbacku tvrdily, že drží všechno (OQ 57)'
+    Krok '13/19  Přiřazení a Esc, i když by Windows callbacku tvrdily, že drží všechno (OQ 57)'
     # KEYPAD_TEST_OS_DRZI=vse: kdyby se callback ptal na stav klávesnice
     # (jako ve vydání 0.1.0+20261006.1208), uslyšel by „drží" i o klávese,
     # o které rozhoduje — a nepřiřadilo by se nic, ani Esc by nezrušil.
@@ -1166,6 +1245,378 @@ function ScenarOsDrziVse {
     $null = Cekej '__kpt.karty().length === 2'
     $karty = @(Js '__kpt.karty()')
     Over 'po konci procesu karta 2 zůstala i po vyprázdnění poslední klávesy' (($karty -join ',') -eq '1,2') $karty
+}
+
+# ── Fáze 7 ─────────────────────────────────────────────────────────
+
+# Sbalí kartu (jen když je rozbalená).
+function Sbal([int]$N) {
+    if (Js "!!__kpt.karta($N) && __kpt.karta($N).dataset.rozbalena === 'true'") {
+        $null = Klik "section.karta[data-pad=`"$N`"] .rozbal"
+    }
+    return (Cekej "!!__kpt.karta($N) && __kpt.karta($N).dataset.rozbalena === 'false'")
+}
+
+function Velikost([int]$Sirka, [int]$Vyska) {
+    $null = $script:cdp.Volej('Emulation.setDeviceMetricsOverride', ('{"width":' + $Sirka + ',"height":' + $Vyska + ',"deviceScaleFactor":0,"mobile":false}'), 10000)
+    $null = Cekej ('innerWidth === ' + $Sirka + ' && innerHeight === ' + $Vyska)
+    Start-Sleep -Milliseconds 300
+}
+
+function VelikostZpet {
+    $null = $script:cdp.Volej('Emulation.clearDeviceMetricsOverride', '{}', 10000)
+    $null = Cekej 'innerWidth > 420'
+}
+
+# Panel karet: nic nepřetéká vodorovně, karty mají na obou stranách
+# aspoň 8 px k hraně ořezu panelu (dosah záře, Z5) a poslední čepička
+# ovladače $Pad jde posunem do zorného pole celá (Z2).
+function OverPanel([string]$Kde, [int]$Pad) {
+    $m = Js "(() => {
+        const p = __kpt.q('main.panel');
+        const r = p.getBoundingClientRect();
+        const vl = r.left + p.clientLeft, vp = vl + p.clientWidth;
+        const okraje = __kpt.qa('section.karta').map((k) => { const b = k.getBoundingClientRect(); return { pad: k.dataset.pad, vlevo: Math.round((b.left - vl) * 10) / 10, vpravo: Math.round((vp - b.right) * 10) / 10 }; });
+        const c = __kpt.cep($Pad, 'rs_down');
+        if (c) c.scrollIntoView({ block: 'nearest' });
+        const t = c ? c.querySelector('.telo').getBoundingClientRect() : null;
+        const vt = r.top + p.clientTop, vb = vt + p.clientHeight;
+        return { sirka: p.scrollWidth, klient: p.clientWidth, posouva: p.scrollHeight > p.clientHeight, okraje,
+                 cepicka: t ? (t.top >= vt - 0.5 && t.bottom <= vb + 0.5 && t.left >= vl - 0.5 && t.right <= vp + 0.5) : false };
+    })()"
+    Over "panel $Kde se vodorovně neposouvá (scrollWidth ≤ clientWidth)" ($m.sirka -le $m.klient) $m
+    $uzke = @($m.okraje | Where-Object { $_.vlevo -lt 8 -or $_.vpravo -lt 8 })
+    Over "panel $Kde`: každá karta má k hraně ořezu ≥ 8 px vlevo i vpravo (záře se neusekne)" ($uzke.Count -eq 0) $m.okraje
+    Over "panel $Kde`: poslední čepička ovladače $Pad jde posunem do zorného pole celá" ($m.cepicka) $m
+}
+
+function ScenarRozbaleni {
+    Krok '14/19  Karty: rozbalit víc i všechny, pamatuje se (Z2)'
+    foreach ($n in 3, 4) {
+        if (-not (Js "!!__kpt.karta($n)")) { $null = Klik "[data-pridat=`"$n`"]"; $null = Cekej "!!__kpt.karta($n)" }
+    }
+    foreach ($n in 1, 2, 3, 4) { $null = Rozbal $n }
+    Over 'rozbalené všechny čtyři karty naráz' (Cekej '__kpt.qa("section.karta[data-rozbalena=\"true\"]").length === 4') (Js '__kpt.qa("section.karta").map((k) => k.dataset.pad + "=" + k.dataset.rozbalena)')
+    Over 'hlavička rozbalené karty: aria-expanded, bublina „Skrýt klávesy“' (Js '[1, 2, 3, 4].every((n) => { const b = __kpt.q(`section.karta[data-pad="${n}"] .rozbal`); return b.getAttribute("aria-expanded") === "true" && b.title === "Skrýt klávesy"; })')
+    $ulozeno = CekejNaKonfiguraci { param($j) (@($j.rozbalene) -join ',') -eq '1,2,3,4' }
+    Over 'config.json: rozbalene [1, 2, 3, 4] (zápis 0,5 s po poslední změně)' $ulozeno
+    foreach ($v in @(@(440, 620), @(380, 480))) {
+        Velikost $v[0] $v[1]
+        OverPanel ("{0}×{1} px, 4 rozbalené" -f $v[0], $v[1]) 4
+        Snimek ('14-rozbalene-{0}x{1}' -f $v[0], $v[1])
+    }
+    VelikostZpet
+    Ukonci
+    Spust
+    Over 'po restartu rozbalené zůstaly všechny čtyři' (Cekej '__kpt.qa("section.karta").length === 4 && __kpt.qa("section.karta[data-rozbalena=\"true\"]").length === 4' 30000) (Js '__kpt.qa("section.karta").map((k) => k.dataset.pad + "=" + k.dataset.rozbalena)')
+    foreach ($n in 1, 2, 3, 4) { $null = Sbal $n }
+    Over 'sbalené všechny (sbalit jde i ovladač 1), hlavička „Ukázat klávesy“' ((Cekej '__kpt.qa("section.karta[data-rozbalena=\"true\"]").length === 0') -and (Js '__kpt.q("section.karta[data-pad=\"1\"] .rozbal").title === "Ukázat klávesy"'))
+    $ulozeno = CekejNaKonfiguraci { param($j) $null -ne $j.rozbalene -and @($j.rozbalene).Count -eq 0 }
+    Over 'config.json: rozbalene []' $ulozeno
+    Ukonci
+    Spust
+    Over 'po restartu všechny sbalené' (Cekej '__kpt.qa("section.karta").length === 4 && __kpt.qa("section.karta[data-rozbalena=\"true\"]").length === 0' 30000)
+
+    # Přiřazování na kartě 2 a Enter na její hlavičce (fokus z Tabu) —
+    # sbalení karty s pulzující čepičkou přiřazování zruší.
+    $null = Rozbal 2
+    $null = Klik 'section.karta[data-pad="2"] [data-vstup="a"] .telo'
+    $null = Cekej '__kpt.app().dataset.rezim === "binding" && __kpt.cep(2, "a").hasAttribute("data-cil")'
+    $null = $script:cdp.Volej('Emulation.setFocusEmulationEnabled', '{"enabled":true}', 10000)
+    $null = Js '(() => { __kpt.q("section.karta[data-pad=\"1\"] button[role=\"switch\"]").focus(); return true; })()'
+    OknuKlavesa 'Tab' 'Tab' 9
+    $fokus = Js 'document.activeElement === __kpt.q("section.karta[data-pad=\"2\"] .rozbal")'
+    Over 'Tab z přepínače sbalené karty 1 → hlavička karty 2' $fokus (Js 'document.activeElement && document.activeElement.className')
+    $n0 = @(KonceLogu).Count
+    OknuKlavesa 'Enter' 'Enter' 13 0 "`r"
+    Over 'Enter na hlavičce kartu 2 sbalí a přiřazování zruší (oznámení „zrušeno“)' (Cekej '__kpt.karta(2).dataset.rozbalena === "false" && __kpt.app().dataset.rezim !== "binding" && __kpt.app().dataset.oznameni === "zruseno"')
+    OverKonec $n0 'okno — nepřiřazeno: nic'
+    $null = $script:cdp.Volej('Emulation.setFocusEmulationEnabled', '{"enabled":false}', 10000)
+    $null = StiskMysi 'main.panel'
+
+    # Soubor bez `rozbalene` (starší KeyPad) → rozbalená jen karta 1.
+    Ukonci
+    $cfg = Join-Path $script:appData 'KeyPad\config.json'
+    $j = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($cfg))
+    $j.PSObject.Properties.Remove('rozbalene')
+    [IO.File]::WriteAllText($cfg, (ConvertTo-Json -InputObject $j -Depth 6), (New-Object Text.UTF8Encoding($false)))
+    Spust
+    Over 'config.json bez „rozbalene“ → rozbalená jen karta 1' (Cekej '__kpt.qa("section.karta").length === 4 && __kpt.qa("section.karta[data-rozbalena=\"true\"]").map((k) => k.dataset.pad).join(",") === "1"' 30000) (Js '__kpt.qa("section.karta").map((k) => k.dataset.pad + "=" + k.dataset.rozbalena)')
+}
+
+function ScenarZare {
+    Krok '15/19  Karta ovladače: rámeček a záře, svítí po dobu držení (Z5)'
+    $null = Rozbal 1
+    $null = Rozbal 2
+    # Rozbalení karty 2 posune panel na ni (Z2) — pro snímky zpět nahoru,
+    # ať je vidět karta 1 i se svítící čepičkou W a pod ní rozbalená dvojka.
+    # Plynulý posun začne až koncem přechodu rozbalení (onintroend): nejdřív
+    # doběhnout přechody, pak počkat, až panel stojí, a teprve pak nahoru.
+    $null = Js '(async () => { const p = __kpt.q("main.panel"); await Promise.all(document.getAnimations().filter((a) => a.effect && a.effect.getComputedTiming().endTime < 1000).map((a) => a.finished.catch(() => null))); await new Promise((r) => setTimeout(r, 50)); await __kpt.klid(); p.scrollTop = 0; await __kpt.klid(); return true; })()'
+    $zare = '(() => { const k = __kpt.karta(1); return { zare: k.hasAttribute("data-zare"), opacity: Number(getComputedStyle(k, "::after").opacity), ramecek: getComputedStyle(k).borderTopColor }; })()'
+    $klid = Js $zare
+    Over 'v klidu bez záře (data-zare chybí, ::after opacity 0)' (-not $klid.zare -and $klid.opacity -eq 0) $klid
+    Snimek '15-karta-klid'
+    Klavesa 0x11 $false $true
+    $t0 = [Diagnostics.Stopwatch]::StartNew()
+    $rozsviceno = Cekej "__kpt.karta(1).hasAttribute('data-zare') && Number(getComputedStyle(__kpt.karta(1), '::after').opacity) >= 0.9" 2000
+    $ms = $t0.ElapsedMilliseconds
+    Over ('W dolů → karta 1 svítí (data-zare, opacity ≥ 0,9; za {0} ms včetně cesty přes CDP)' -f $ms) $rozsviceno (Js $zare)
+    Start-Sleep -Milliseconds 600
+    $drzi = Js $zare
+    Over 'po 600 ms drženého W pořád svítí (záře drží, dokud je vstup držený)' ($drzi.zare -and $drzi.opacity -ge 0.9) $drzi
+    Over 'rámeček karty se září v plné barvě ovladače (rgb(96, 165, 250))' ($drzi.ramecek -eq 'rgb(96, 165, 250)') $drzi.ramecek
+    Over 'karta 2 nesvítí (W patří ovladači 1)' (Js '!__kpt.karta(2).hasAttribute("data-zare")')
+    Snimek '15-karta-zare'
+    Klavesa 0x11 $false $false
+    Start-Sleep -Milliseconds 400
+    $po = Js $zare
+    Over 'puštěno → po 400 ms zhasnuto (opacity 0, bez data-zare)' (-not $po.zare -and $po.opacity -eq 0) $po
+    # Sbalená karta svítí taky.
+    $null = Sbal 1
+    Klavesa 0x11 $false $true
+    Over 'sbalená karta 1 se při drženém W rozsvítí taky' (Cekej "__kpt.karta(1).hasAttribute('data-zare') && Number(getComputedStyle(__kpt.karta(1), '::after').opacity) >= 0.9" 2000) (Js $zare)
+    Snimek '15-sbalena-zare'
+    # Pravá hrana: výřez, ať je vidět, že se záře neusekne.
+    $vyrez = Js '(() => { const r = __kpt.karta(1).getBoundingClientRect(); return { x: Math.max(0, Math.floor(r.right - 60)), y: Math.max(0, Math.floor(r.top - 12)), width: 74, height: Math.ceil(Math.min(80, r.height + 24)), scale: 2 }; })()'
+    $r = $script:cdp.Volej('Page.captureScreenshot', ('{"format":"png","clip":' + (ConvertTo-Json -InputObject $vyrez -Compress) + '}'), 20000)
+    $i = $r.IndexOf('"data":"')
+    if ($i -ge 0) {
+        $i += 8
+        $k = $r.IndexOf('"', $i)
+        $cesta = Join-Path $script:snimky '15-zare-prava-hrana.png'
+        [IO.File]::WriteAllBytes($cesta, [Convert]::FromBase64String($r.Substring($i, $k - $i)))
+        Write-Host "  snímek  $cesta" -ForegroundColor DarkGray
+    }
+    Klavesa 0x11 $false $false
+    $null = Cekej "!__kpt.karta(1).hasAttribute('data-zare')" 2000
+    $null = Rozbal 1
+    # „Omezit pohyb": bez přechodů — rozsvítí se i zhasne naráz.
+    $null = $script:cdp.Volej('Emulation.setEmulatedMedia', '{"features":[{"name":"prefers-reduced-motion","value":"reduce"}]}', 10000)
+    # Pseudoelementy: `*` v pravidle „Omezit pohyb" na ně nedosáhne — záře
+    # (::after) i pruh (::before) musí být bez přechodu výslovně (revize).
+    $prechody = Js '(() => { const r = document.documentElement.dataset; const po = getComputedStyle(__kpt.karta(1), "::after").transitionDuration; r.vzhledKarty = "pruh"; const pred = getComputedStyle(__kpt.karta(1), "::before").transitionDuration; delete r.vzhledKarty; return [po, pred]; })()'
+    Over '„Omezit pohyb“: záře i starý pruh karty bez přechodu (::after, ::before 0s)' ((@($prechody) -join '|') -eq '0s|0s') $prechody
+    Klavesa 0x11 $false $true
+    Over '„Omezit pohyb“: záře svítí i bez přechodu' (Cekej "__kpt.karta(1).hasAttribute('data-zare') && Number(getComputedStyle(__kpt.karta(1), '::after').opacity) === 1" 2000) (Js $zare)
+    Snimek '15-zare-omezit-pohyb'
+    Klavesa 0x11 $false $false
+    # Hned, jak zmizí data-zare — s přechodem 250 ms by průhlednost ještě
+    # nebyla nulová (dřív se čekalo až 1 s a přechod prošel).
+    $zhasnuto = (Cekej "!__kpt.karta(1).hasAttribute('data-zare')" 1000) -and (Js "Number(getComputedStyle(__kpt.karta(1), '::after').opacity) === 0")
+    Over '„Omezit pohyb“: po puštění zhasne hned' $zhasnuto (Js $zare)
+    $null = $script:cdp.Volej('Emulation.setEmulatedMedia', '{"features":[]}', 10000)
+    # Starý vzhled jedním přepnutím v CSS (pro srovnání snímků).
+    $null = Js '(() => { document.documentElement.dataset.vzhledKarty = "pruh"; return true; })()'
+    $pruh = Js '[1, 2].map((n) => getComputedStyle(__kpt.karta(n), "::before").backgroundColor)'
+    Over 'data-vzhled-karty="pruh" vrátí levý pruh v barvě ovladače' ((@($pruh) -join '|') -eq 'rgb(96, 165, 250)|rgb(244, 114, 182)') $pruh
+    Snimek '15-vzhled-pruh'
+    $null = Js '(() => { delete document.documentElement.dataset.vzhledKarty; return true; })()'
+}
+
+function ScenarZvuk {
+    Krok '16/19  Zvuk: přepínač nepípá, zkratka ano (log, simulace), volba Zvuk v ⓘ (Z1, Z6)'
+    $zvuky = { @(LogRadky | Where-Object { $_ -match ' zvuk: ' }) }
+    $z0 = @(& $zvuky).Count
+    $null = Klik 'section.karta[data-pad="1"] button[role="switch"]'
+    $null = Cekej '__kpt.karta(1).dataset.stav === "on" && __kpt.app().dataset.rezim === "capturing"' 10000
+    Start-Sleep -Milliseconds 500
+    $po = @(& $zvuky)
+    Over 'zapnutí ovladače přepínačem nepípá (žádný řádek „zvuk:“ v logu)' ($po.Count -eq $z0) @($po | Select-Object -Skip $z0)
+    Stisk 0x46
+    $null = Cekej '__kpt.app().dataset.rezim === "paused"'
+    $ok = CekejNa { @(& $zvuky).Count -gt $z0 } 3000
+    $novy = @(& $zvuky | Select-Object -Skip $z0)
+    Over 'Scroll Lock → „zvuk: Pauza (ztlumeno: simulace)“' ($ok -and $novy.Count -eq 1 -and $novy[0] -match 'zvuk: Pauza \(ztlumeno: simulace\)$') $novy
+    Stisk 0x46
+    $null = Cekej '__kpt.app().dataset.rezim === "capturing"'
+    $ok = CekejNa { @(& $zvuky).Count -gt $z0 + 1 } 3000
+    $novy = @(& $zvuky | Select-Object -Skip ($z0 + 1))
+    Over 'Scroll Lock znovu → „zvuk: Hra (ztlumeno: simulace)“' ($ok -and $novy.Count -eq 1 -and $novy[0] -match 'zvuk: Hra \(ztlumeno: simulace\)$') $novy
+    $z1 = @(& $zvuky).Count
+    $null = Klik 'section.karta[data-pad="1"] button[role="switch"]'
+    $null = Cekej '__kpt.karta(1).dataset.stav === "off" && __kpt.app().dataset.rezim === "disabled"' 10000
+    Start-Sleep -Milliseconds 500
+    Over 'vypnutí přepínačem nepípá' (@(& $zvuky).Count -eq $z1) @(& $zvuky | Select-Object -Skip $z1)
+
+    # ⓘ → Zvuk vypnout: událost `nastaveni`, config.json, po restartu vypnutý.
+    $null = Klik 'button[aria-label="Nastavení a o aplikaci"]'
+    Over 'ⓘ otevře „Nastavení a o aplikaci“ s volbami' (Cekej '!!__kpt.q("[role=dialog][aria-label=\"Nastavení a o aplikaci\"]") && !!__kpt.q("[data-volba=zvuk] [role=switch]")')
+    Snimek '16-nastaveni'
+    $null = Klik '[data-volba="zvuk"] [role="switch"]'
+    Over 'Zvuk vypnutý (přepínač i backend)' ((Cekej '__kpt.q("[data-volba=zvuk] [role=switch]").getAttribute("aria-checked") === "false"') -and (CekejNa { -not (Prikaz 'nastaveni').v.zvuk }))
+    Over 'config.json: zvuk false' (CekejNaKonfiguraci { param($j) $j.zvuk -eq $false })
+    $null = Klik '[data-volba="zvuk"] .ukazka'
+    Over '▷ v simulaci nic nehraje, bublina řekne proč' (Cekej '/Simulace/.test(__kpt.q("[data-volba=zvuk] .ukazka").title)') (Js '__kpt.q("[data-volba=zvuk] .ukazka").title')
+    Ukonci
+    Spust
+    $null = Klik 'button[aria-label="Nastavení a o aplikaci"]'
+    Over 'po restartu Zvuk vypnutý' ((Cekej '!!__kpt.q("[data-volba=zvuk] [role=switch]") && __kpt.q("[data-volba=zvuk] [role=switch]").getAttribute("aria-checked") === "false"' 30000) -and -not (Prikaz 'nastaveni').v.zvuk)
+    $null = Klik '[data-volba="zvuk"] [role="switch"]'
+    $null = CekejNa { (Prikaz 'nastaveni').v.zvuk }
+    $null = StiskMysi 'main.panel'
+    $null = Cekej '!__kpt.q("[role=dialog][aria-label=\"Nastavení a o aplikaci\"]")'
+}
+
+function Prirad([int]$Pad, [string]$Vstup, [int]$Scan) {
+    $null = Rozbal $Pad
+    $null = Klik "section.karta[data-pad=`"$Pad`"] [data-vstup=`"$Vstup`"] .telo"
+    $null = Cekej "__kpt.app().dataset.rezim === 'binding' && __kpt.cep($Pad, '$Vstup').hasAttribute('data-cil')"
+    Klavesa $Scan $false $true
+    Klavesa $Scan $false $false
+}
+
+function ScenarSdilene {
+    Krok '17/19  Jedna klávesa pro víc vstupů (Z4)'
+    $null = Klik 'button[aria-label="Nastavení a o aplikaci"]'
+    $null = Cekej '!!__kpt.q("[data-volba=sdilene_klavesy] [role=switch]")'
+    $null = Klik '[data-volba="sdilene_klavesy"] [role="switch"]'
+    Over 'ⓘ → „Jedna klávesa pro víc vstupů“ zapnutá' ((Cekej '__kpt.q("[data-volba=sdilene_klavesy] [role=switch]").getAttribute("aria-checked") === "true"') -and (CekejNa { (Prikaz 'nastaveni').v.sdilene_klavesy }))
+    $null = StiskMysi 'main.panel'
+    $null = Rozbal 1
+    $null = Rozbal 2
+    Prirad 1 'a' 0x21
+    Over 'F → A ovladače 1 (sdílí se s X ovladače 1)' (Cekej '__kpt.app().dataset.oznameni === "ulozeno" && __kpt.app().dataset.rezim === "disabled"')
+    Over 'nápověda „Sdíleno s X“' (Cekej '(__kpt.napoveda(1) || "").startsWith("Sdíleno s X")') (Js '__kpt.napoveda(1)')
+    Prirad 2 'x' 0x21
+    $null = Cekej '__kpt.app().dataset.rezim === "disabled"'
+    $k = Klavesy
+    $f = @($k.vazby | Where-Object { $_.klavesa.scan -eq 0x21 } | ForEach-Object { "$($_.pad):$($_.vstup)" })
+    Over 'F patří X a A ovladače 1 i X ovladače 2 (nikdo o ni nepřišel)' (($f -join ',') -eq '0:a,0:x,1:x') $f
+    Over 'čepičky F (A a X ovladače 1, X ovladače 2) jsou oranžové (data-sdilena)' (Cekej '__kpt.cep(1, "a").hasAttribute("data-sdilena") && __kpt.cep(1, "x").hasAttribute("data-sdilena") && __kpt.cep(2, "x").hasAttribute("data-sdilena") && !__kpt.cep(1, "b").hasAttribute("data-sdilena")')
+    $bublina = Js '__kpt.q("section.karta[data-pad=\"1\"] [data-vstup=\"a\"] .telo").title'
+    Over 'bublina A ovladače 1: „F — také: … Ovladač 2 · X“, aria-label „sdílená“' ($bublina -match 'F — také: .*Ovladač 2 · X' -and (Js '__kpt.q("section.karta[data-pad=\"1\"] [data-vstup=\"a\"] .telo").getAttribute("aria-label").endsWith(", sdílená")')) $bublina
+    # Obrys se mění přechodem (130 ms) — počkat na konec.
+    $obrys = 'getComputedStyle(__kpt.q("section.karta[data-pad=\"2\"] [data-vstup=\"x\"] .telo")).borderTopColor'
+    Over 'obrys sdílené čepičky oranžový (--sdilena rgb(251, 146, 60))' (Cekej "$obrys === 'rgb(251, 146, 60)'") (Js $obrys)
+    $null = Js '(() => { __kpt.q("section.karta[data-pad=\"1\"] [data-vstup=\"a\"] .telo").dispatchEvent(new PointerEvent("pointerenter")); return true; })()'
+    Over 'najetí myší na sdílenou čepičku zvýrazní i ostatní čepičky téže klávesy' (Cekej '__kpt.cep(2, "x").hasAttribute("data-zvyraznena") && __kpt.cep(1, "x").hasAttribute("data-zvyraznena")')
+    Snimek '17-sdilena-klavesa'
+    # Bublina je `title` — tu kreslí WebView2 mimo stránku a do snímku CDP
+    # se nikdy nedostane. Pro ukázku vlastníkovi ji test nakreslí sám
+    # (přesně týž text, pod čepičku, kam ji dá systém) a hned zase smaže;
+    # okno samo žádný takový prvek nemá.
+    $null = Js '(() => { const t = __kpt.q("section.karta[data-pad=\"1\"] [data-vstup=\"a\"] .telo"); const r = t.getBoundingClientRect(); const b = document.createElement("div"); b.id = "kpt-nahled-bubliny"; b.textContent = t.title; b.style.cssText = "position:fixed;z-index:2147483647;pointer-events:none;max-width:" + (innerWidth - 16) + "px;padding:3px 7px;font:12px Segoe UI,sans-serif;color:#e8e8e8;background:#2b2b2b;border:1px solid #6b6b6b;box-shadow:0 2px 6px rgba(0,0,0,.5);white-space:pre-line"; document.body.appendChild(b); const s = b.getBoundingClientRect().width; b.style.left = Math.max(8, Math.min(r.left + 12, innerWidth - s - 8)) + "px"; b.style.top = (r.bottom + 6) + "px"; return true; })()'
+    Snimek '17b-sdilena-bublina-nahled'
+    $null = Js '(() => { const b = document.getElementById("kpt-nahled-bubliny"); if (b) b.remove(); return true; })()'
+    $null = Js '(() => { __kpt.q("section.karta[data-pad=\"1\"] [data-vstup=\"a\"] .telo").dispatchEvent(new PointerEvent("pointerleave")); return true; })()'
+    $null = Cekej '!__kpt.q("[data-zvyraznena]")'
+
+    # Ve hře: F stiskne A i X na prvním a X na druhém zároveň.
+    foreach ($n in 1, 2) { $null = Klik "section.karta[data-pad=`"$n`"] button[role=`"switch`"]" }
+    Over 'ovladače 1 a 2 zapnuté (simulace), hraje' (Cekej '__kpt.karta(1).dataset.stav === "on" && __kpt.karta(2).dataset.stav === "on" && __kpt.app().dataset.rezim === "capturing"' 10000)
+    Klavesa 0x21 $false $true
+    Over 'F dolů → svítí A i X ovladače 1 a X ovladače 2 (hra je dostává)' (Cekej '__kpt.cep(1, "a").dataset.sviti === "hra" && __kpt.cep(1, "x").dataset.sviti === "hra" && __kpt.cep(2, "x").dataset.sviti === "hra"') (Js '__kpt.sviti()')
+    Klavesa 0x21 $false $false
+    Over 'F nahoru → nic nesvítí (neutrál obou)' (Cekej '__kpt.sviti().length === 0') (Js '__kpt.sviti()')
+    foreach ($n in 1, 2) { $null = Klik "section.karta[data-pad=`"$n`"] button[role=`"switch`"]" }
+    $null = Cekej '__kpt.karta(1).dataset.stav === "off" && __kpt.karta(2).dataset.stav === "off"' 10000
+
+    # Strop 4 vstupy: čtvrtý projde, pátý se odmítne a přiřazování čeká dál.
+    Prirad 2 'y' 0x21
+    $null = Cekej '__kpt.app().dataset.rezim === "disabled"'
+    $rev0 = (Klavesy).rev
+    $null = Klik 'section.karta[data-pad="2"] [data-vstup="b"] .telo'
+    $null = Cekej '__kpt.app().dataset.rezim === "binding"'
+    $n0 = @(KonceLogu).Count
+    Stisk 0x21
+    Over 'pátý vstup: „F už ovládá 4 vstupy“, přiřazování čeká dál' ((Cekej '__kpt.napoveda(2) === "F už ovládá 4 vstupy"') -and (Js '__kpt.app().dataset.rezim === "binding"') -and (Klavesy).rev -eq $rev0) (Js '__kpt.napoveda(2)')
+    Stisk 0x01
+    $null = Cekej '__kpt.app().dataset.rezim === "disabled"'
+    OverKonec $n0 'Esc — nepřiřazeno: 1× už 4 vstupy'
+
+    # Volbu vypnout: sdílené vazby zůstanou (oranžové), nová přiřazení přesouvají.
+    $null = Klik 'button[aria-label="Nastavení a o aplikaci"]'
+    $null = Cekej '!!__kpt.q("[data-volba=sdilene_klavesy] [role=switch]")'
+    $null = Klik '[data-volba="sdilene_klavesy"] [role="switch"]'
+    $null = CekejNa { -not (Prikaz 'nastaveni').v.sdilene_klavesy }
+    $null = StiskMysi 'main.panel'
+    Over 'po vypnutí volby čepičky F zůstanou oranžové (OQ 62)' (Cekej '__kpt.cep(1, "a").hasAttribute("data-sdilena") && __kpt.cep(2, "y").hasAttribute("data-sdilena")')
+    Prirad 2 'b' 0x22
+    $null = Cekej '__kpt.app().dataset.rezim === "disabled"'
+    Prirad 2 'a' 0x22
+    $null = Cekej '__kpt.app().dataset.rezim === "disabled"'
+    $g = @((Klavesy).vazby | Where-Object { $_.klavesa.scan -eq 0x22 } | ForEach-Object { "$($_.pad):$($_.vstup)" })
+    Over 'bez volby G přesouvá (B ovladače 2 → A ovladače 2), nesdílí' (($g -join ',') -eq '1:a') $g
+    Over 'nápověda „Přesunuto z B“' (Cekej '(__kpt.napoveda(2) || "").startsWith("Přesunuto z B")') (Js '__kpt.napoveda(2)')
+    Over 'config.json má verze 2 (sdílená klávesa) a F u 4 vstupů' (CekejNaKonfiguraci { param($j) $j.verze -eq 2 -and @($j.vazby | Where-Object { $_.scan -eq 0x21 }).Count -eq 4 })
+    Ukonci
+    Spust
+    $null = Rozbal 1
+    $null = Rozbal 2
+    $f = @((Klavesy).vazby | Where-Object { $_.klavesa.scan -eq 0x21 } | ForEach-Object { "$($_.pad):$($_.vstup)" })
+    Over 'po restartu F pořád u 4 vstupů, čepičky oranžové' ((($f -join ',') -eq '0:a,0:x,1:x,1:y') -and (Cekej '__kpt.cep(1, "a").hasAttribute("data-sdilena") && __kpt.cep(2, "y").hasAttribute("data-sdilena")' 10000)) $f
+}
+
+function ScenarZkratka {
+    Krok '18/19  Zkratka pozastavení z ⓘ (Z6)'
+    # F5 vstupu (namapovaná F-klávesa zkratkou být nesmí).
+    Prirad 2 'lb' 0x3F
+    $null = Cekej '__kpt.app().dataset.rezim === "disabled"'
+    $panel = '!!__kpt.q("[role=dialog][aria-label=\"Nastavení a o aplikaci\"]")'
+    $napoveda = '__kpt.text(__kpt.q(".volby .napoveda"))'
+    $null = Klik 'button[aria-label="Nastavení a o aplikaci"]'
+    Over 'ⓘ: čepička Pauza ukazuje Scroll Lock' (Cekej '__kpt.text(__kpt.q("[data-zkratka] .klavesa")) === "Scroll Lock"') (Js '__kpt.text(__kpt.q("[data-zkratka] .klavesa"))')
+    $null = Klik '[data-zkratka]'
+    $script:rz = $null
+    $ok = CekejNa { $script:rz = (Prikaz 'rezim').v; $script:rz.rezim -eq 'binding' -and $script:rz.cil.zkratka -eq $true } 3000
+    Over 'klik na Pauza → přiřazování zkratky (rezim.cil = { zkratka: true }), čepička pulzuje, panel zůstal' ($ok -and (Js '__kpt.q("[data-zkratka]").hasAttribute("data-cil")') -and (Js $panel)) $script:rz
+    $n0 = @(KonceLogu).Count
+    # F4 (0x3E): se zkratkou F4 by Alt+F4 nezavřel okno (OQ 69).
+    foreach ($s in 0x0F, 0x11, 0x3E) {
+        Stisk $s
+        Over ('0x{0:X2} → odmítnuto (jen F1–F24 bez F4, Scroll Lock, Pause), přiřazování čeká dál' -f $s) ((Cekej "/Pauza jde jen na F1–F24 \(ne F4\), Scroll Lock nebo Pause/.test($napoveda || '')") -and (Js '__kpt.app().dataset.rezim === "binding"')) (Js $napoveda)
+    }
+    Stisk 0x3F
+    Over 'F5 (namapovaná) → „F5 patří ovladači 2 · LB“' (Cekej "$napoveda === 'F5 patří ovladači 2 · LB'") (Js $napoveda)
+    Snimek '18-zkratka-odmitnuta'
+    Stisk 0x76
+    Over 'F24 → uloženo (backend: zkratka F24, čepička „F24“)' ((CekejNa { (Klavesy).zkratka.scan -eq 0x76 }) -and (Cekej '__kpt.text(__kpt.q("[data-zkratka] .klavesa")) === "F24"')) (Klavesy).zkratka
+    OverKonec $n0 'uloženo — nepřiřazeno: 1× namapovaná, 3× nevhodná pro pauzu'
+    Over 'config.json: zkratka F24' (CekejNaKonfiguraci { param($j) $j.zkratka.scan -eq 0x76 })
+    # Ve hře pozastavuje F24, Scroll Lock už nic.
+    $null = StiskMysi 'main.panel'
+    $null = Klik 'section.karta[data-pad="1"] button[role="switch"]'
+    $null = Cekej '__kpt.app().dataset.rezim === "capturing"' 10000
+    Stisk 0x46
+    Start-Sleep -Milliseconds 300
+    Over 'Scroll Lock už nepozastaví' (Js '__kpt.app().dataset.rezim === "capturing"')
+    Stisk 0x76
+    Over 'F24 pozastaví' (Cekej '__kpt.app().dataset.rezim === "paused"')
+    Stisk 0x76
+    $null = Cekej '__kpt.app().dataset.rezim === "capturing"'
+    $null = Klik 'section.karta[data-pad="1"] button[role="switch"]'
+    $null = Cekej '__kpt.app().dataset.rezim === "disabled"' 10000
+    # Esc do okna při přiřazování zkratky: přiřazování zruší, panel zůstane.
+    $null = Klik 'button[aria-label="Nastavení a o aplikaci"]'
+    $null = Cekej $panel
+    $null = Klik '[data-zkratka]'
+    $null = Cekej '__kpt.app().dataset.rezim === "binding"'
+    $null = $script:cdp.Volej('Emulation.setFocusEmulationEnabled', '{"enabled":true}', 10000)
+    OknuKlavesa 'Escape' 'Escape' 27
+    Over 'Esc přiřazování zkratky zruší, panel ⓘ zůstane otevřený' ((Cekej '__kpt.app().dataset.rezim === "disabled"') -and (Js $panel))
+    $null = $script:cdp.Volej('Emulation.setFocusEmulationEnabled', '{"enabled":false}', 10000)
+    # F12 projde s jantarovou tečkou (Steam jím fotí snímky).
+    $null = Klik '[data-zkratka]'
+    $null = Cekej '__kpt.app().dataset.rezim === "binding"'
+    Stisk 0x58
+    Over 'F12 → uloženo s jantarovou tečkou a bublinou o Steamu' ((Cekej '__kpt.text(__kpt.q("[data-zkratka] .klavesa")) === "F12" && !!__kpt.q("[data-zkratka] [data-varovani]")') -and (Js '/F12 ve Steamu/.test(__kpt.q("[data-zkratka]").title)')) (Js '__kpt.q("[data-zkratka]").title')
+    Snimek '18-zkratka-f12'
+    $null = StiskMysi 'main.panel'
+    $null = CekejNaKonfiguraci { param($j) $j.zkratka.scan -eq 0x58 }
+    Ukonci
+    Spust
+    Over 'po restartu zkratka F12' (CekejNa { (Klavesy).zkratka.scan -eq 0x58 } 30000) (Klavesy).zkratka
+}
+
+function ScenarMinimalizaceDialog {
+    Krok '19/19  Minimalizace s otevřeným potvrzovacím dialogem (Z3)'
+    $null = Rozbal 1
+    $rev0 = (Klavesy).rev
+    $null = Klik 'section.karta[data-pad="1"] .ikony button[aria-label="Výchozí klávesy"]'
+    $null = Cekej '!!__kpt.q("[role=alertdialog]")'
+    $null = Klik 'button[aria-label="Minimalizovat"]'
+    Over 'minimalizace dialog zruší (událost okno-videt) a nic se nezmění' ((Cekej '!__kpt.q("[role=alertdialog]")' 5000) -and (Klavesy).rev -eq $rev0)
 }
 
 # ── Běh ────────────────────────────────────────────────────────────
@@ -1228,7 +1679,8 @@ try {
     # Bezpečnostní stop a ztracené spojení končí hned.
     $scenare = 'ScenarStart', 'ScenarKarty', 'ScenarKlavesyOkna', 'ScenarPrirazeni', 'ScenarPresun', 'ScenarUpravy',
         'ScenarWin', 'ScenarZive', 'ScenarSirka', 'ScenarMinimalizace', 'ScenarRestart', 'ScenarPrazdnaKarta',
-        'ScenarOsDrziVse'
+        'ScenarOsDrziVse', 'ScenarRozbaleni', 'ScenarZare', 'ScenarZvuk', 'ScenarSdilene', 'ScenarZkratka',
+        'ScenarMinimalizaceDialog'
     foreach ($s in $scenare) {
         try {
             & $s

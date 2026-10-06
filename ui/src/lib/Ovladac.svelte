@@ -1,7 +1,20 @@
 <script lang="ts">
-	import { cilPrirazeni, efekty, klavesy, prirad, vyprazdni } from './klavesy.svelte';
+	import { cilPrirazeni, efekty, klavesy, prirad, vyprazdni, zvyraznene } from './klavesy.svelte';
+	import type { Klavesa } from './smlouva';
 	import Vstup from './Vstup.svelte';
-	import { indexy, jedinyVstup, PODKLADY, POLOHY, posunHlavicky, seskup, sviti, VSTUPY } from './vstupy';
+	import {
+		cileKlaves,
+		dalsiCile,
+		indexy,
+		jedinyVstup,
+		klicKlavesy,
+		PODKLADY,
+		POLOHY,
+		posunHlavicky,
+		seskup,
+		sviti,
+		VSTUPY
+	} from './vstupy';
 	import { zive } from './zive.svelte';
 
 	// Schéma ovladače ve tvaru Xboxu. Editor, živá detekce i náhled jsou
@@ -23,6 +36,22 @@
 	const cil = $derived(cilPrirazeni());
 	const posunL = $derived(posunHlavicky(z.l[0], z.l[1]));
 	const posunP = $derived(posunHlavicky(z.p[0], z.p[1]));
+	// Kam všude patří každá klávesa — sdílená klávesa (Fáze 7, Z4) zoranžoví
+	// čepičky všech svých vstupů, i na jiných ovladačích.
+	const cile = $derived(cileKlaves(klavesy.vazby));
+
+	/** Klávesy čepičky, které patří i jiným vstupům (klíče). */
+	function sdilene(v: (typeof VSTUPY)[number], klavesy: readonly Klavesa[]): string[] {
+		return klavesy.filter((k) => dalsiCile(cile, k, pad, v).length > 0).map(klicKlavesy);
+	}
+
+	/** Najetí myší: zvýraznit klávesy sdílené čepičky (jen při změně — přejíždění
+	    po nesdílených čepičkách stav nepřepisuje). */
+	function najeti(sdil: string[], najeto: boolean): void {
+		const nove = najeto ? sdil : [];
+		if (nove.length === 0 && zvyraznene.klice.length === 0) return;
+		zvyraznene.klice = nove;
+	}
 </script>
 
 <div class="schema">
@@ -34,6 +63,8 @@
 		{/each}
 		{#each VSTUPY as v (v)}
 			{@const pol = POLOHY[v]}
+			{@const kl = skupiny[v] ?? []}
+			{@const sdil = sdilene(v, kl)}
 			<Vstup
 				vstup={v}
 				r={pol.r}
@@ -41,7 +72,11 @@
 				popisek={pol.popisek}
 				hlavicka={!!pol.hlavicka}
 				posun={pol.hlavicka === 'l' ? posunL : pol.hlavicka === 'p' ? posunP : undefined}
-				klavesy={skupiny[v] ?? []}
+				klavesy={kl}
+				dalsi={(k) => dalsiCile(cile, k, pad, v)}
+				sdilena={sdil.length > 0}
+				zvyraznena={sdil.some((k) => zvyraznene.klice.includes(k))}
+				onnajeti={(najeto) => najeti(sdil, najeto)}
 				sviti={sviti(z.drzi, z.hra, bity[v])}
 				cil={cil?.pad === pad && cil.vstup === v}
 				posledni={jediny?.pad === pad && jediny.vstup === v}

@@ -3,23 +3,25 @@
 	import { nactiAplikaci } from './lib/aplikace.svelte';
 	import { escRusiPrirazeni, hlidejKlavesnici } from './lib/klavesnice';
 	import {
-		cilPrirazeni,
 		klavesy,
 		nactiVse,
 		posledniOznameni,
 		pridejKartu,
 		prihlasKlavesy,
+		prirazuje,
 		rezim,
 		zrusPrirazeni
 	} from './lib/klavesy.svelte';
 	import PadCard from './lib/PadCard.svelte';
 	import { nactiPady, pady, prihlasPady } from './lib/pady.svelte';
+	import Potvrzeni from './lib/Potvrzeni.svelte';
+	import { potvrzeni, zavriPotvrzeni } from './lib/dialog.svelte';
 	import PridatOvladac from './lib/PridatOvladac.svelte';
 	import Sbernice from './lib/Sbernice.svelte';
 	import Titlebar from './lib/Titlebar.svelte';
 	import UpdateBanner from './lib/UpdateBanner.svelte';
 	import { startUpdateChecks, updater } from './lib/updater.svelte';
-	import { maBackend } from './lib/tauri';
+	import { maBackend, poslouchej } from './lib/tauri';
 	import { dalsiKarta, viditelneKarty } from './lib/vstupy';
 	import { prihlasZive } from './lib/zive.svelte';
 
@@ -27,9 +29,9 @@
 	// virtuální ovladače) a všechno k ní má být vidět naráz. Co nejméně
 	// textu — stav je v barvě a ikonách, podrobnosti v bublinách a v logu.
 	//
-	// Karty ovladačů jsou akordeon: rozbalená je vždy jedna (schéma
-	// s klávesami), ostatní jen hlavička se stavem a přepínačem. Seznam
-	// karet ukládá backend (OQ 52); vidět je i ovladač s klávesami
+	// Karty ovladačů se rozbalují každá zvlášť — rozbalená může být víc
+	// i všechny (Fáze 7, Z2; dřív akordeon). Seznam karet i jejich
+	// rozbalení ukládá backend (OQ 52, 70); vidět je i ovladač s klávesami
 	// a zapnutý ovladač, ať nikdy nezmizí karta, která něco dělá.
 
 	const karty = $derived(
@@ -41,23 +43,12 @@
 	);
 	const dalsi = $derived(dalsiKarta(karty));
 
-	let zvolena = $state(0);
-	// Rozbalená karta zmizela (odebraný ovladač) → první.
-	const rozbalena = $derived(karty.includes(zvolena) ? zvolena : (karty[0] ?? 0));
-
-	// Běžící přiřazování zruší už stisk myši na hlavičce (`stiskMysi`) —
-	// čepička by jinak pulzovala ve sbalené kartě, kde ji nikdo nevidí.
-	function rozbal(pad: number): void {
-		zvolena = pad;
-	}
-
 	function pridejDalsi(): void {
 		// Zapamatovat předem: `dalsi` se po přidání hned přepočítá na
-		// následující volný ovladač.
+		// následující volný ovladač. Nová karta přijde rozbalená.
 		const pad = dalsi;
 		if (pad === null) return;
 		void pridejKartu(pad);
-		rozbal(pad);
 	}
 
 	/** Všechno, co se mohlo změnit, když okno nebylo vidět. */
@@ -68,12 +59,13 @@
 	/**
 	 * Klik mimo přiřazovanou čepičku přiřazování zruší („klik jinam",
 	 * spec 1.4). Klik na jinou čepičku ne: ta začne přiřazovat sama a zrušení
-	 * by jen navíc přepnulo režim tam a zpátky.
+	 * by jen navíc přepnulo režim tam a zpátky — stejně čepička zkratky
+	 * pozastavení v ⓘ (Z6). Zrušit sbalením karty z klávesnice umí karta.
 	 */
 	function stiskMysi(e: PointerEvent): void {
-		if (cilPrirazeni() === null) return;
+		if (!prirazuje()) return;
 		const cil = e.target instanceof Element ? e.target : null;
-		if (cil?.closest('[data-vstup]')) return;
+		if (cil?.closest('[data-vstup], [data-zkratka]')) return;
 		zrusPrirazeni();
 	}
 
@@ -81,10 +73,10 @@
 	 * Esc, který došel až do okna, přiřazování zruší — hook ho buď
 	 * nedostal (OQ 60), nebo propustil jako vstříknutý (SendInput);
 	 * skutečný Esc živý hook spolkne a do okna nedojde. Autorepeat ne:
-	 * zrušení už letí do backendu.
+	 * zrušení už letí do backendu. Panel ⓘ se přitom nezavře (Z6).
 	 */
 	function klavesa(e: KeyboardEvent): void {
-		if (!e.repeat && escRusiPrirazeni(e, cilPrirazeni() !== null)) zrusPrirazeni();
+		if (!e.repeat && escRusiPrirazeni(e, prirazuje())) zrusPrirazeni();
 	}
 
 	onMount(() => {
@@ -96,6 +88,11 @@
 			// a přihlášením k události by se jinak ztratila. Starší
 			// odpovědi zahodí `seq` a `rev`.
 			void Promise.all([prihlasPady(), prihlasKlavesy(), prihlasZive()]).then(nactiStav);
+			// Schované i minimalizované okno potvrzovací dialog zruší (Z3) —
+			// minimalizace WebView2 neuspí, `visibilitychange` by nepřišlo.
+			void poslouchej<boolean>('okno-videt', (videt) => {
+				if (!videt) zavriPotvrzeni(false);
+			});
 		}
 		// Schované okno má uspaný WebView a backend mu živý stav
 		// neposílá; po návratu z oznamovací oblasti všechno znovu
@@ -130,7 +127,7 @@
 		<Sbernice />
 
 		{#each karty as pad (pad)}
-			<PadCard {pad} rozbalena={pad === rozbalena} onrozbal={() => rozbal(pad)} />
+			<PadCard {pad} rozbalena={klavesy.rozbalene.includes(pad)} />
 		{/each}
 
 		{#if dalsi !== null}
@@ -143,6 +140,14 @@
 	{/if}
 </div>
 
+<!-- Bez {#key}: lokální přechod dialogu se přehraje, jen když blok, který
+     ho vytvořil, už jednou běžel — `{#key}` vznikal zároveň s dialogem
+     a přechod se nepřehrál nikdy (revize). Dialog vytváří tenhle {#if}:
+     mezi dvěma otevřeními projde `druh` vždy přes null. -->
+{#if potvrzeni.druh !== null}
+	<Potvrzeni />
+{/if}
+
 <style>
 	.app {
 		display: flex;
@@ -153,8 +158,8 @@
 	}
 
 	/* Jeden obsahový panel (WinSent „Frame 5" bez sidebaru — v úzkém
-	   okně by postranní navigace sebrala místo obsahu). Při čtyřech
-	   kartách se posouvá panel, okno ne. */
+	   okně by postranní navigace sebrala místo obsahu). Při víc rozbalených
+	   kartách se posouvá panel, okno ne — nic se neořízne (Z2). */
 	.panel {
 		flex: 1;
 		min-height: 0;
@@ -163,13 +168,16 @@
 		gap: 0.6rem;
 		margin: 0 10px;
 		/* Vpravo místo pro posuvník (10 px, app.css) napořád: objeví se,
-		   až se rozbalená karta nevejde, a schéma by jinak při rozbalení
-		   poskočilo o šířku posuvníku. Vlevo i vpravo pak zůstává 12 px. */
-		padding: 0.75rem 2px 0.75rem 0.75rem;
+		   až se rozbalené karty nevejdou, a schéma by jinak při rozbalení
+		   poskočilo o šířku posuvníku. Panel ořezává na hraně svého vnitřku
+		   (padding box) a mezera posuvníku leží vně — vpravo tedy 8 px, ať se
+		   záře karty (dosah 8 px, Z5) neusekne; vlevo 12 px. */
+		padding: 0.75rem 8px 0.75rem 0.75rem;
 		scrollbar-gutter: stable;
 		background: var(--panel);
 		border: 1px solid var(--border);
 		border-radius: var(--radius-lg);
+		overflow-x: hidden;
 		overflow-y: auto;
 	}
 </style>
