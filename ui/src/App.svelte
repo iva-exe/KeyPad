@@ -7,12 +7,13 @@
 		klavesy,
 		nactiVse,
 		posledniOznameni,
+		pridejKartu,
 		prihlasKlavesy,
 		rezim,
 		zrusPrirazeni
 	} from './lib/klavesy.svelte';
 	import PadCard from './lib/PadCard.svelte';
-	import { nactiPady, pady, pridane, pridej, prihlasPady } from './lib/pady.svelte';
+	import { nactiPady, pady, prihlasPady } from './lib/pady.svelte';
 	import PridatOvladac from './lib/PridatOvladac.svelte';
 	import Sbernice from './lib/Sbernice.svelte';
 	import Titlebar from './lib/Titlebar.svelte';
@@ -28,13 +29,14 @@
 	//
 	// Karty ovladačů jsou akordeon: rozbalená je vždy jedna (schéma
 	// s klávesami), ostatní jen hlavička se stavem a přepínačem. Seznam
-	// karet se neukládá — odvozuje se z mapování a stavu ovladačů.
+	// karet ukládá backend (OQ 52); vidět je i ovladač s klávesami
+	// a zapnutý ovladač, ať nikdy nezmizí karta, která něco dělá.
 
 	const karty = $derived(
 		viditelneKarty(
 			klavesy.vazby,
 			pady.map((p) => p.state),
-			pridane
+			klavesy.karty
 		)
 	);
 	const dalsi = $derived(dalsiKarta(karty));
@@ -49,12 +51,12 @@
 		zvolena = pad;
 	}
 
-	function pridejKartu(): void {
+	function pridejDalsi(): void {
 		// Zapamatovat předem: `dalsi` se po přidání hned přepočítá na
 		// následující volný ovladač.
 		const pad = dalsi;
 		if (pad === null) return;
-		pridej(pad);
+		void pridejKartu(pad);
 		rozbal(pad);
 	}
 
@@ -122,7 +124,7 @@
 		{/each}
 
 		{#if dalsi !== null}
-			<PridatOvladac pad={dalsi} onpridej={pridejKartu} />
+			<PridatOvladac pad={dalsi} onpridej={pridejDalsi} />
 		{/if}
 	</main>
 

@@ -1,8 +1,9 @@
 //! Uložení kláves: `%APPDATA%\KeyPad\config.json` (`updater::config_path`).
 //!
-//! Soubor nese mapování všech ovladačů, zkratku a zapnutý zvuk. Stav
-//! zapnutí ovladače v něm **není a nikdy nebude**: ovladač se připojuje
-//! jen na povel uživatele (princip 11), takže po startu nemá co obnovovat.
+//! Soubor nese mapování všech ovladačů, zkratku, zapnutý zvuk a karty
+//! ovladačů v okně ([`Karty`], OQ 52). Stav zapnutí ovladače v něm **není
+//! a nikdy nebude**: ovladač se připojuje jen na povel uživatele
+//! (princip 11), takže po startu nemá co obnovovat.
 //!
 //! Proč JSON, a ne TOML, a proč takhle (princip 10, hranice +50 kB ze
 //! specifikace Fáze 6; naměřeno release buildem přes Tauri CLI a mapou
@@ -88,6 +89,8 @@ pub struct Konfigurace {
     pub mapovani: Mapping,
     /// Zvuk pozastavení a pokračování (✓ Zvuk v nabídce ikony).
     pub zvuk: bool,
+    /// Ovladače s kartou v okně (OQ 52).
+    pub karty: Karty,
 }
 
 impl Default for Konfigurace {
@@ -95,7 +98,61 @@ impl Default for Konfigurace {
         Konfigurace {
             mapovani: Mapping::default(),
             zvuk: true,
+            karty: Karty::PRVNI,
         }
+    }
+}
+
+/// Ovladače, které mají v okně kartu (OQ 52, rozhodl vlastník 6. 10.:
+/// karty se ukládají). Karta zůstává i bez kláves — „+ Ovladač" ji
+/// přidá, jen 🗑 ji odebere — a přežije restart. Ovladač 1 ji má vždy
+/// a ovladač s klávesami taky: jinak by jeho klávesy v okně nebyly vidět.
+/// Bitová maska podle `PadId::index`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Karty(u8);
+
+impl Karty {
+    /// Jen ovladač 1.
+    pub const PRVNI: Karty = Karty(1);
+
+    /// Karty doplněné o ovladače, které mají klávesy.
+    pub fn s_klavesami(mut self, m: &Mapping) -> Karty {
+        for (_, cil) in m.bindings() {
+            self.pridej(cil.pad);
+        }
+        self
+    }
+
+    pub fn ma(self, pad: PadId) -> bool {
+        self.0 & 1 << pad.index() != 0
+    }
+
+    /// `true` = karta přibyla.
+    pub fn pridej(&mut self, pad: PadId) -> bool {
+        let pred = self.0;
+        self.0 |= 1 << pad.index();
+        self.0 != pred
+    }
+
+    /// Ovladač 1 kartu nikdy neztratí. `true` = karta ubyla.
+    pub fn odeber(&mut self, pad: PadId) -> bool {
+        if pad == PadId::FIRST {
+            return false;
+        }
+        let pred = self.0;
+        self.0 &= !(1 << pad.index());
+        self.0 != pred
+    }
+
+    /// Ovladače s kartou, vzestupně.
+    pub fn pady(self) -> impl Iterator<Item = PadId> {
+        PadId::ALL.into_iter().filter(move |&p| self.ma(p))
+    }
+}
+
+impl Default for Karty {
+    fn default() -> Self {
+        Karty::PRVNI
     }
 }
 
@@ -311,10 +368,65 @@ impl Cteni<'_> {
     }
 }
 
+/// `karty` ze souboru — čísla ovladačů 1–4. Karty nejsou kritické:
+/// chybná položka (0, 5, text, duplicita) se jen vynechá s varováním do
+/// logu a soubor kvůli ní nevalidní není (klávesy v něm platí dál).
+/// Chybějící klíč (soubor ze starší verze) = jen ovladač 1; ovladače
+/// s klávesami doplní volající.
+fn karty_z(o: &Map<String, Value>, varovani: &mut Vec<String>) -> Karty {
+    let mut karty = Karty::PRVNI;
+    let polozky = match klic(o, "karty") {
+        None => return karty,
+        Some(Value::Array(v)) => v,
+        Some(_) => {
+            varovani.push(format!(
+                "„karty“ musí být seznam čísel 1–{MAX_PADS} — vynecháno"
+            ));
+            return karty;
+        }
+    };
+    let mut videno = Karty(0);
+    for (i, x) in polozky.iter().enumerate() {
+        let pad = x
+            .as_u64()
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|n| usize::try_from(n).ok())
+            .and_then(PadId::new);
+        match pad {
+            None => {
+                // Hodnota ze souboru může být libovolně dlouhá.
+                let text = x.to_string();
+                let konec = text.char_indices().nth(16).map_or(text.len(), |(j, _)| j);
+                varovani.push(format!(
+                    "karty, položka č. {}: {} není ovladač 1–{MAX_PADS} — vynechána",
+                    i + 1,
+                    &text[..konec]
+                ));
+            }
+            Some(p) if !videno.pridej(p) => varovani.push(format!(
+                "karty, položka č. {}: ovladač {} podruhé — vynechána",
+                i + 1,
+                p.index() + 1
+            )),
+            Some(p) => {
+                karty.pridej(p);
+            }
+        }
+    }
+    karty
+}
+
 /// Text souboru → konfigurace. Čistá funkce; obsah hlídají pravidla jádra
 /// ([`Mapping::new`]), takže konfigurace projde, právě když by ji přijal
 /// i engine.
+#[cfg(test)]
 pub fn z_textu(text: &str) -> Result<Konfigurace, ChybaKonfigurace> {
+    z_textu_s_varovanim(text).map(|(k, _)| k)
+}
+
+/// [`z_textu`] i s varováními k položkám, které se vynechaly, aniž by byl
+/// soubor nevalidní (karty) — pro log.
+pub fn z_textu_s_varovanim(text: &str) -> Result<(Konfigurace, Vec<String>), ChybaKonfigurace> {
     // Poznámkový blok starších Windows ukládá UTF-8 s BOM; JSON ho nezná.
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let jedna = |c| ChybaKonfigurace::Neplatna(vec![c]);
@@ -348,6 +460,8 @@ pub fn z_textu(text: &str) -> Result<Konfigurace, ChybaKonfigurace> {
     }
 
     let mut chyby = Vec::new();
+    let mut varovani = Vec::new();
+    let karty = karty_z(o, &mut varovani);
     let mut c = Cteni {
         chyby: &mut chyby,
         vazba: None,
@@ -433,7 +547,17 @@ pub fn z_textu(text: &str) -> Result<Konfigurace, ChybaKonfigurace> {
     // Se zkratkou, která nejde přečíst, se pravidla jádra (duplicity,
     // Win…) ověří s výchozí — chyba zkratky už je v seznamu.
     match Mapping::new(zkratka.unwrap_or(KeyId::SCROLL_LOCK), vazby) {
-        Ok(mapovani) if chyby.is_empty() => Ok(Konfigurace { mapovani, zvuk }),
+        Ok(mapovani) if chyby.is_empty() => {
+            let karty = karty.s_klavesami(&mapovani);
+            Ok((
+                Konfigurace {
+                    mapovani,
+                    zvuk,
+                    karty,
+                },
+                varovani,
+            ))
+        }
         Ok(_) => Err(ChybaKonfigurace::Neplatna(chyby)),
         Err(chyby_jadra) => {
             // „Prázdné" jen tehdy, když nevypadla žádná vazba — jinak by
@@ -461,12 +585,23 @@ pub fn do_textu(k: &Konfigurace) -> String {
     let m = &k.mapovani;
     let mut s = String::with_capacity(512 + m.len() * 64);
     let z = m.toggle_key();
+    // Od 1 jako „ovladac" ve vazbách; ovladače s klávesami vždy (stejně
+    // jako po načtení), ať stejný obsah dá vždy stejný text.
+    let karty: Vec<String> = k
+        .karty
+        .s_klavesami(m)
+        .pady()
+        .map(|p| (p.index() + 1).to_string())
+        .collect();
     // Zápis do `String` selhat nemůže.
     let _ = write!(
         s,
         "{{{NL}  \"poznamka\": \"{POZNAMKA}\",{NL}  \"verze\": {VERZE},{NL}  \"zvuk\": {},{NL}  \
-         \"zkratka\": {{ \"scan\": {}, \"e0\": {} }},{NL}  \"vazby\": [",
-        k.zvuk, z.scan, z.extended
+         \"zkratka\": {{ \"scan\": {}, \"e0\": {} }},{NL}  \"karty\": [{}],{NL}  \"vazby\": [",
+        k.zvuk,
+        z.scan,
+        z.extended,
+        karty.join(", ")
     );
     for (i, (klavesa, cil)) in m.bindings().enumerate() {
         let _ = write!(
@@ -513,25 +648,34 @@ pub fn nacti(cesta: &Path) -> Nacteno {
         }
     };
     let vysledek = match std::str::from_utf8(&bajty) {
-        Ok(text) => z_textu(text),
+        Ok(text) => z_textu_s_varovanim(text),
         Err(_) => Err(ChybaKonfigurace::Neplatna(vec![ChybaObsahu::Kodovani])),
     };
     match vysledek {
-        Ok(konfigurace) => {
+        Ok((konfigurace, varovani)) => {
             let n = pocty(&konfigurace.mapovani);
+            let karty: Vec<String> = konfigurace
+                .karty
+                .pady()
+                .map(|p| (p.index() + 1).to_string())
+                .collect();
             log::info!(
-                "konfigurace: načteno {} vazeb (ovladače 1–4: {}/{}/{}/{}), zvuk {}",
+                "konfigurace: načteno {} vazeb (ovladače 1–4: {}/{}/{}/{}), karty {}, zvuk {}",
                 konfigurace.mapovani.len(),
                 n[0],
                 n[1],
                 n[2],
                 n[3],
+                karty.join(", "),
                 if konfigurace.zvuk {
                     "zapnutý"
                 } else {
                     "vypnutý"
                 }
             );
+            for v in varovani.iter().take(MAX_CHYB_V_LOGU) {
+                log::warn!("konfigurace: {v}");
+            }
             Nacteno {
                 konfigurace,
                 stav: StavKonfigurace::Ok,
@@ -1084,9 +1228,13 @@ mod tests {
         m.bind(KeyId::new(0x58), cil(0, Action::LeftStick(StickDir::Up)))
             .unwrap();
         m.set_toggle_key(KeyId::new(0x45)).unwrap();
+        // Karta ovladače 3 bez kláves (přidaná „+ Ovladač").
+        let mut karty = Karty::PRVNI.s_klavesami(&m);
+        karty.pridej(PadId::new(2).unwrap());
         Konfigurace {
             mapovani: m,
             zvuk: false,
+            karty,
         }
     }
 
@@ -1148,8 +1296,88 @@ mod tests {
         assert_eq!(z_textu(&text), Ok(k));
         assert!(text.contains("\"zvuk\": false"));
         assert!(text.contains("\"zkratka\": { \"scan\": 69, \"e0\": false }"));
+        assert!(text.contains("\"karty\": [1, 2, 3, 4],"));
         assert!(text.contains("{ \"ovladac\": 4, \"vstup\": \"rt\", \"scan\": 72, \"e0\": true }"));
         assert!(text.contains("{ \"ovladac\": 2, \"vstup\": \"a\", \"scan\": 72, \"e0\": false }"));
+    }
+
+    /// Karty (OQ 52): přidaná karta bez kláves přežije zápis i čtení;
+    /// soubor ze starší verze (bez „karty") dá ovladač 1 a ovladače
+    /// s klávesami; ovladač 1 a ovladač s klávesami kartu mají, i když
+    /// v seznamu chybí.
+    #[test]
+    fn karty_tam_a_zpet_a_starsi_soubor() {
+        let p = |i| PadId::new(i).unwrap();
+        let k = vice_ovladacu();
+        assert!(k.karty.ma(p(2)), "prázdná karta 3");
+        let zpet = z_textu(&do_textu(&k)).unwrap();
+        assert_eq!(zpet.karty, k.karty);
+        // Starší soubor bez „karty": klávesy má ovladač 1 a 3.
+        let starsi = s_vazbami(&[(1, "a", 57, false), (3, "b", 46, false)]);
+        let karty: Vec<usize> = z_textu(&starsi)
+            .unwrap()
+            .karty
+            .pady()
+            .map(PadId::index)
+            .collect();
+        assert_eq!(karty, [0, 2]);
+        // Seznam bez ovladače 1 a bez ovladače s klávesou.
+        let mut v: Value = serde_json::from_str(&starsi).unwrap();
+        v["karty"] = json!([4]);
+        let karty: Vec<usize> = z_textu(&v.to_string())
+            .unwrap()
+            .karty
+            .pady()
+            .map(PadId::index)
+            .collect();
+        assert_eq!(karty, [0, 2, 3]);
+        // Ovladač 1 kartu nikdy neztratí; přidání a odebrání hlásí změnu.
+        let mut c = Karty::PRVNI;
+        assert!(!c.odeber(PadId::FIRST));
+        assert!(c.pridej(p(3)) && !c.pridej(p(3)));
+        assert!(c.odeber(p(3)) && !c.odeber(p(3)));
+        assert_eq!(c, Karty::default());
+    }
+
+    /// Chybné karty nejsou chyba souboru: vynechají se s varováním do logu
+    /// a klávesy platí dál (karty nejsou kritické).
+    #[test]
+    fn chybne_karty_se_vynechaji_s_varovanim() {
+        let mut v: Value = serde_json::from_str(&s_vazbami(&[(1, "a", 57, false)])).unwrap();
+        v["karty"] = json!([0, 2, "3", 5, 2, 2.5, -1, 4, null]);
+        let (k, varovani) = z_textu_s_varovanim(&v.to_string()).unwrap();
+        let karty: Vec<usize> = k.karty.pady().map(PadId::index).collect();
+        assert_eq!(karty, [0, 1, 3]);
+        assert_eq!(varovani.len(), 7, "{varovani:?}");
+        assert!(
+            varovani[0].contains("položka č. 1: 0 není ovladač 1–4"),
+            "{varovani:?}"
+        );
+        assert!(varovani[1].contains("\"3\""), "{varovani:?}");
+        assert!(varovani[3].contains("ovladač 2 podruhé"), "{varovani:?}");
+        assert_eq!(
+            k.mapovani.target(KeyId::SPACE),
+            Some(cil(0, Action::Button(PadButton::A)))
+        );
+        // Úplně špatný tvar: jedno varování, platí ovladač 1.
+        v["karty"] = json!({ "1": true });
+        let (k, varovani) = z_textu_s_varovanim(&v.to_string()).unwrap();
+        assert_eq!(k.karty, Karty::PRVNI);
+        assert_eq!(varovani.len(), 1);
+        // Dlouhý text se do logu utne.
+        v["karty"] = json!(["x".repeat(500)]);
+        let (_, varovani) = z_textu_s_varovanim(&v.to_string()).unwrap();
+        assert!(varovani[0].chars().count() < 100, "{varovani:?}");
+
+        // Načtení ze souboru: stav v pořádku, nic se neodkládá do zálohy.
+        let s = Slozka::nova("karty");
+        v["karty"] = json!([7, 2]);
+        std::fs::write(s.konfigurace(), v.to_string()).unwrap();
+        let n = nacti(&s.konfigurace());
+        assert_eq!(n.stav, StavKonfigurace::Ok);
+        assert!(n.ukladat && n.zaloha.is_none());
+        assert!(n.konfigurace.karty.ma(PadId::new(1).unwrap()));
+        assert!(!s.zaloha().exists());
     }
 
     /// Přesný tvar souboru — mění se jen vědomě (starší KeyPady ho čtou).
@@ -1163,9 +1391,14 @@ mod tests {
             ],
         )
         .unwrap();
+        // Karta ovladače 2 bez kláves; ovladač 3 má klávesu, takže kartu
+        // dostane i bez zápisu v `karty`.
+        let mut karty = Karty::PRVNI;
+        karty.pridej(PadId::new(1).unwrap());
         let text = do_textu(&Konfigurace {
             mapovani: m,
             zvuk: true,
+            karty,
         });
         let cekam = [
             "{",
@@ -1174,6 +1407,7 @@ mod tests {
             "  \"verze\": 1,",
             "  \"zvuk\": true,",
             "  \"zkratka\": { \"scan\": 70, \"e0\": false },",
+            "  \"karty\": [1, 2, 3],",
             "  \"vazby\": [",
             "    { \"ovladac\": 3, \"vstup\": \"ls_up\", \"scan\": 17, \"e0\": false },",
             "    { \"ovladac\": 1, \"vstup\": \"rs_up\", \"scan\": 72, \"e0\": true }",
@@ -1756,6 +1990,28 @@ mod tests {
         pockej_na(&zapisy, 1);
         assert_eq!(zapisy.load(Ordering::SeqCst), 1);
         assert!(!nacti(&s.konfigurace()).konfigurace.zvuk, "poslední změna");
+    }
+
+    /// Přidaná karta bez kláves je změna: soubor vznikne a po „restartu"
+    /// (novém načtení) karta zůstane (OQ 52, hlášení vlastníka 6. 10.).
+    #[test]
+    fn karta_bez_klaves_se_ulozi_a_po_restartu_zustane() {
+        let s = Slozka::nova("karta");
+        let n = nacti(&s.konfigurace());
+        let (u, zapisy, _) = ukladac(&s, &n, ODKLAD);
+        let mut karty = Karty::PRVNI;
+        karty.pridej(PadId::new(1).unwrap());
+        u.uloz(Konfigurace {
+            karty,
+            ..Konfigurace::default()
+        });
+        assert!(u.uloz_hned(Duration::from_secs(5)));
+        assert_eq!(zapisy.load(Ordering::SeqCst), 1);
+        let text = std::fs::read_to_string(s.konfigurace()).unwrap();
+        assert!(text.contains("\"karty\": [1, 2],"), "{text}");
+        let po_restartu = nacti(&s.konfigurace());
+        assert_eq!(po_restartu.konfigurace.karty, karty);
+        assert_eq!(po_restartu.stav, StavKonfigurace::Ok);
     }
 
     #[test]

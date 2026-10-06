@@ -276,22 +276,22 @@ export function procNeodebrat(stav: PadStav, maVsechny: boolean): string {
 const ZAPNUTE = new Set(['on', 'connecting', 'error']);
 
 /**
- * Které karty ukázat (vzestupně). Seznam karet se neukládá, odvozuje se:
- * ovladač 1 vždy, ovladač s klávesami, zapnutý ovladač a ovladač přidaný
- * v tomhle sezení. Zapnutý nebo s klávesami je vidět vždycky, takže
- * odebrání nemůže schovat ovladač, který ještě běží.
+ * Které karty ukázat (vzestupně): uložené karty od backendu (OQ 52 —
+ * karta zůstane i bez kláves a po restartu, zmizí jen 🗑), ovladač 1
+ * vždy, a navíc ovladač s klávesami a zapnutý ovladač — ty jsou vidět
+ * vždycky, takže nic nemůže schovat ovladač, který ještě běží nebo hraje.
  */
 export function viditelneKarty(
 	vazby: readonly { pad: number }[],
 	stavy: readonly (string | undefined)[],
-	pridane: readonly number[]
+	karty: readonly number[]
 ): number[] {
 	const videt = new Set<number>([0]);
 	for (const v of vazby) videt.add(v.pad);
 	stavy.forEach((s, i) => {
 		if (s !== undefined && ZAPNUTE.has(s)) videt.add(i);
 	});
-	for (const p of pridane) videt.add(p);
+	for (const p of karty) videt.add(p);
 	return [...videt].filter((p) => Number.isInteger(p) && p >= 0 && p < MAX_PADU).sort((a, b) => a - b);
 }
 

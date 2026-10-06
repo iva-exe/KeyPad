@@ -10,11 +10,14 @@
 # a jejich barvy, klávesy psané do okna (mezerník, Enter, šipky, F5,
 # Ctrl+R, Ctrl+P — spec 1.8), přiřazení, přesun a „Zpět", přidání (+),
 # vyprázdnění (× i pravý klik), výchozí klávesy (↺), odebrání ovladače
-# (🗑), klik jinam, 10s limit, Win a AltGr, živé svícení, zapnutí
-# simulovaného ovladače, rozvržení při 380 a 440 px, minimalizaci během
-# přiřazování, restart (klávesy i karta zůstanou) a poškozenou
-# konfiguraci. Snímky okna ukládá do -Snimky (Page.captureScreenshot),
-# na konci uklidí proces i plochu.
+# (🗑), klik jinam, 10s limit, Win, Win+klávesa a AltGr, živé svícení,
+# zapnutí simulovaného ovladače, rozvržení při 380 a 440 px, minimalizaci
+# během přiřazování, restart (klávesy i karta zůstanou), poškozenou
+# konfiguraci, prázdnou kartu ovladače 2 po konci procesu (Fáze 6b) a
+# přiřazení s Esc s podvrhem „Windows drží všechno" (KEYPAD_TEST_OS_DRZI,
+# OQ 57). Z logu testovací instance ověří řádky „přiřazování skončilo"
+# (důvod a počty, nikdy klávesa). Snímky okna ukládá do -Snimky
+# (Page.captureScreenshot), na konci uklidí proces i plochu.
 #
 # PROČ SKRYTÁ PLOCHA: na počítači vlastníka může běžet hra. Okno na jeho
 # ploše by mu vyskočilo přes ni a simulovaný vstup (SendInput) by šel do
@@ -24,7 +27,9 @@
 #     (jen debug build a jen s KEYPAD_TEST_KLAVESY=1). Klávesy psané do
 #     samotného okna (spec 1.8) posílá CDP Input.dispatchKeyEvent rovnou
 #     do WebView testovací instance — systémem neprojdou, hook ani jiný
-#     program je neuvidí;
+#     program je neuvidí. Stav klávesnice vlastníka hook testovací
+#     instance nečte (podvrh „nic nedrží", ve scénáři 13 „callbacku
+#     všechno drží");
 #   - KEYPAD_BEZ_VIGEM=pad: simulovaný ovladač, ViGEmBus vlastníka se
 #     nepoužije a nic se nepřehraje (simulace je vždy potichu);
 #   - pojmenovaná událost Local\KeyPad.Ukoncit se NIKDY nenastavuje
@@ -515,7 +520,8 @@ function OverSingleInstance {
     }
 }
 
-function Spust {
+# $Navic: další proměnné jen pro tohle spuštění ("JMENO=hodnota").
+function Spust([string[]]$Navic = @()) {
     OverSingleInstance
     # Starý DevToolsActivePort po tvrdém konci zůstává — port by byl mrtvý.
     Get-ChildItem $script:localApp -Recurse -Filter 'DevToolsActivePort' -ErrorAction SilentlyContinue |
@@ -533,11 +539,14 @@ function Spust {
         # (%LOCALAPPDATA%\<identifier>\EBWebView; naměřeno). Proměnná WebView2
         # má přednost před složkou od aplikace; EBWebView si přidá sám.
         "WEBVIEW2_USER_DATA_FOLDER=$(Join-Path $script:localApp $identifier)",
-        # Zděděný „starý ViGEmBus" by test obrátil jinam.
-        'KEYPAD_VIGEM_STARY='
-    )
+        # Zděděný „starý ViGEmBus" by test obrátil jinam; podvrh „Windows
+        # drží všechno" zapíná jen scénář, který ho potřebuje.
+        'KEYPAD_VIGEM_STARY=',
+        'KEYPAD_TEST_OS_DRZI='
+    ) + $Navic
     $script:proces = [KeyPadOknoTest.Proces]::Spust($script:plocha, $script:exe, $script:beh, $zmeny)
-    Write-Host "  proces $($script:proces.Pid) na ploše $($script:plocha)" -ForegroundColor DarkGray
+    $navicText = if ($Navic.Count) { ' (' + ($Navic -join ', ') + ')' } else { '' }
+    Write-Host "  proces $($script:proces.Pid) na ploše $($script:plocha)$navicText" -ForegroundColor DarkGray
     Pripoj
 }
 
@@ -605,9 +614,57 @@ function CekejNaKonfiguraci([scriptblock]$Overeni) {
         } 5000)
 }
 
+# ── Log testovací instance ─────────────────────────────────────────
+# KeyPad má keypad.log otevřený pro zápis (sdílí čtení i zápis) — číst
+# jde jen se sdílením; Get-Content by mohl narazit na zamčený soubor.
+function LogRadky {
+    $log = Join-Path $script:beh 'keypad.log'
+    if (-not (Test-Path $log)) { return @() }
+    $fs = New-Object IO.FileStream($log, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    try {
+        $text = (New-Object IO.StreamReader($fs, (New-Object Text.UTF8Encoding($false)))).ReadToEnd()
+    } finally {
+        $fs.Dispose()
+    }
+    return @($text -split "`r?`n" | Where-Object { $_ })
+}
+
+# Diagnostika přiřazování (Fáze 6b): na konci každého přiřazování jeden
+# řádek s důvodem konce a počty nepřiřazených stisků podle kategorií.
+# Nic jiného v něm být nesmí — hlavně ne identita klávesy (OQ 33: log
+# se posílá při hlášení chyby).
+$katDiag = '(modifikátor|Win|s Win|nemapovatelná|držená Windows|zkratka pauzy|vstříknutá)'
+$script:reDiag = '^(uloženo|Esc|limit 10 s|okno|vynuceno) — nepřiřazeno: (nic|\d+× ' + $katDiag + '(, \d+× ' + $katDiag + ')*)( \(a \d+ dřívějších bez záznamu\))?$'
+
+# Text za „přiřazování skončilo: " ze všech řádků logu (všechna spuštění).
+function KonceLogu {
+    @(LogRadky | ForEach-Object { if ($_ -match 'přiřazování skončilo: (.*)$') { $Matches[1] } })
+}
+
+# Další řádek „přiřazování skončilo" za prvními $Od (zapisuje ho smyčka
+# hook vlákna, logger hned potom) — $null, když do 3 s nepřišel.
+function DalsiKonec([int]$Od) {
+    $script:konecLogu = $null
+    $null = CekejNa { $k = @(KonceLogu); if ($k.Count -gt $Od) { $script:konecLogu = $k[$Od]; $true } else { $false } } 3000
+    return $script:konecLogu
+}
+
+function OverKonec([int]$Od, [string]$Cekany) {
+    $r = DalsiKonec $Od
+    Over ('log: „přiřazování skončilo: ' + $Cekany + '“') ($r -eq $Cekany) $r
+}
+
+# Rozbalí kartu (akordeon: klik na už rozbalenou kartu by ji sbalil).
+function Rozbal([int]$N) {
+    if (-not (Js "!!__kpt.karta($N) && __kpt.karta($N).dataset.rozbalena === 'true'")) {
+        $null = Klik "section.karta[data-pad=`"$N`"] .rozbal"
+    }
+    return (Cekej "!!__kpt.karta($N) && __kpt.karta($N).dataset.rozbalena === 'true' && !!__kpt.cep($N, 'a')")
+}
+
 # ── Scénáře ────────────────────────────────────────────────────────
 function ScenarStart {
-    Krok '1/11  Start (prázdné APPDATA)'
+    Krok '1/13  Start (prázdné APPDATA)'
     Over 'okno načteno, ovladač 1 má 24 čepiček' (Cekej '!!__kpt.app() && __kpt.qa("section.karta[data-pad=\"1\"] [data-vstup]").length === 24 && !__kpt.cep(1, "a").hasAttribute("data-prazdna")' 30000)
     $sirka = Js 'innerWidth'
     Over "šířka okna 440 px (je $sirka)" ($sirka -ge 430 -and $sirka -le 450)
@@ -630,7 +687,7 @@ function ScenarStart {
 }
 
 function ScenarKarty {
-    Krok '2/11  Ovladače 2–4 a jejich barvy'
+    Krok '2/13  Ovladače 2–4 a jejich barvy'
     foreach ($n in 2, 3, 4) {
         $klik = Klik "[data-pridat=`"$n`"]"
         # Pozor: „ a “ jsou pro PowerShell uvozovky — v textu jen v '…'.
@@ -652,7 +709,7 @@ function ScenarKarty {
 }
 
 function ScenarKlavesyOkna {
-    Krok '3/11  Klávesy psané do okna (spec 1.8) — důvěryhodné události přes CDP'
+    Krok '3/13  Klávesy psané do okna (spec 1.8) — důvěryhodné události přes CDP'
     # Nižší okno, ať má panel co posouvat (4 karty, jedna rozbalená).
     $null = $script:cdp.Volej('Emulation.setDeviceMetricsOverride', '{"width":440,"height":480,"deviceScaleFactor":0,"mobile":false}', 10000)
     $null = Cekej 'innerHeight === 480'
@@ -716,7 +773,7 @@ function ScenarKlavesyOkna {
 }
 
 function ScenarPrirazeni {
-    Krok '4/11  Přiřazení F24 k A ovladače 2'
+    Krok '4/13  Přiřazení F24 k A ovladače 2'
     $null = Klik 'section.karta[data-pad="2"] .rozbal'
     Over 'klik na hlavičku rozbalí kartu 2' (Cekej '__kpt.karta(2).dataset.rozbalena === "true" && !!__kpt.cep(2, "a")')
     $null = Klik 'section.karta[data-pad="2"] [data-vstup="a"] .telo'
@@ -725,10 +782,12 @@ function ScenarPrirazeni {
     Over 'rezim.cil = ovladač 2 (index 1), vstup a' ($r.cil -and $r.cil.pad -eq 1 -and $r.cil.vstup -eq 'a') $r
     Over 'nápověda „Stiskni klávesu · Esc zruší“' (Cekej '(__kpt.napoveda(2) || "").startsWith("Stiskni klávesu · Esc zruší")') (Js '__kpt.napoveda(2)')
     Snimek '03-prirazovani'
+    $n0 = @(KonceLogu).Count
     Klavesa 0x76 $false $true
     Over 'F24 → oznámení „uloženo“' (Cekej '__kpt.app().dataset.oznameni === "ulozeno"')
     Klavesa 0x76 $false $false
     Over 'po uložení konec přiřazování' (Cekej '__kpt.app().dataset.rezim === "disabled" && !__kpt.cep(2, "a").hasAttribute("data-cil")')
+    OverKonec $n0 'uloženo — nepřiřazeno: nic'
     $k = Klavesy
     $v = Vazba $k 0x76
     Over 'F24 je na A ovladače 2 (backend)' ($v -and $v.pad -eq 1 -and $v.vstup -eq 'a') $v
@@ -740,7 +799,7 @@ function ScenarPrirazeni {
 }
 
 function ScenarPresun {
-    Krok '5/11  Přesun F24 na ovladač 1 a „Zpět“'
+    Krok '5/13  Přesun F24 na ovladač 1 a „Zpět“'
     $null = Klik 'section.karta[data-pad="1"] .rozbal'
     $null = Cekej '__kpt.karta(1).dataset.rozbalena === "true" && !!__kpt.cep(1, "b")'
     $rev0 = (Klavesy).rev
@@ -761,26 +820,38 @@ function ScenarPresun {
 }
 
 function ScenarWin {
-    Krok '7/11  Win a AltGr při přiřazování'
+    Krok '7/13  Win a AltGr při přiřazování'
     $rev0 = (Klavesy).rev
     $null = Klik 'section.karta[data-pad="1"] [data-vstup="x"] .telo'
     Over 'klik na X ovladače 1 → přiřazování' (Cekej '__kpt.app().dataset.rezim === "binding" && __kpt.cep(1, "x").hasAttribute("data-cil")')
+    $n0 = @(KonceLogu).Count
     Klavesa 0x5B $true $true
     Over 'Win (0x5B + E0) → oznámení „odmítnuto“' (Cekej '__kpt.app().dataset.oznameni === "odmitnuto"')
     Over 'nápověda „Win patří Windows“' (Cekej '__kpt.napoveda(1) === "Win patří Windows"') (Js '__kpt.napoveda(1)')
     Over 'přiřazování běží dál' (Js '__kpt.app().dataset.rezim === "binding"')
     Snimek '05-win'
+    # Win+F24 (OQ 44): s drženou Win patří nový stisk Windows. Hook to ví
+    # z události Win (test_klavesa nese VK jako skutečná klávesa), na stav
+    # klávesnice se neptá (OQ 57).
+    Klavesa 0x76 $false $true
+    Klavesa 0x76 $false $false
+    Start-Sleep -Milliseconds 300
+    $st = Js '({ rezim: __kpt.app().dataset.rezim, napoveda: __kpt.napoveda(1) })'
+    Over 'Win+F24 při přiřazování nic nepřiřadí (patří Windows), přiřazuje se dál' ((Klavesy).rev -eq $rev0 -and $st.rezim -eq 'binding') $st
     Klavesa 0x5B $true $false
     Stisk 0x01
     Over 'Esc přiřazování zruší' (Cekej '__kpt.app().dataset.oznameni === "zruseno" && __kpt.app().dataset.rezim === "disabled"')
-    Over 'Win ani Esc nic nepřiřadily' ((Klavesy).rev -eq $rev0)
+    Over 'Win, Win+F24 ani Esc nic nepřiřadily' ((Klavesy).rev -eq $rev0)
+    OverKonec $n0 'Esc — nepřiřazeno: 1× Win, 1× s Win'
     # Zkratka pauzy při přiřazování se odmítne a přiřazování čeká dál.
     $null = Klik 'section.karta[data-pad="1"] [data-vstup="x"] .telo'
     $null = Cekej '__kpt.app().dataset.rezim === "binding"'
+    $n0 = @(KonceLogu).Count
     Stisk 0x46
     Over 'Scroll Lock při přiřazování → „Scroll Lock je pauza“, přiřazuje se dál' ((Cekej '/ je pauza$/.test(__kpt.napoveda(1) || "")') -and (Js '__kpt.app().dataset.rezim === "binding"')) (Js '__kpt.napoveda(1)')
     Stisk 0x01
     $null = Cekej '__kpt.app().dataset.rezim === "disabled"'
+    OverKonec $n0 'Esc — nepřiřazeno: 1× zkratka pauzy'
 
     # AltGr na české klávesnici, jak ho posílají Windows: falešný levý Ctrl
     # (scan 0x21D), pravý Alt (E0 0x38), puštění v tomtéž pořadí. Odmítne
@@ -801,7 +872,7 @@ function ScenarWin {
 }
 
 function ScenarUpravy {
-    Krok '6/11  Přidat, vyprázdnit, výchozí klávesy, odebrat ovladač, klik jinam, 10 s'
+    Krok '6/13  Přidat, vyprázdnit, výchozí klávesy, odebrat ovladač, klik jinam, 10 s'
     $y = 'section.karta[data-pad="1"] [data-vstup="y"]'
     $vazbyY = { param($k) @($k.vazby | Where-Object { $_.pad -eq 0 -and $_.vstup -eq 'y' }) }
 
@@ -852,10 +923,13 @@ function ScenarUpravy {
     $rev0 = (Klavesy).rev
     $null = Klik 'section.karta[data-pad="1"] [data-vstup="x"] .telo'
     $null = Cekej '__kpt.app().dataset.rezim === "binding"'
+    $n0 = @(KonceLogu).Count
     $null = StiskMysi 'main.panel'
     Over 'klik jinam přiřazování zruší' (Cekej '__kpt.app().dataset.rezim === "disabled" && __kpt.app().dataset.oznameni === "zruseno"')
+    OverKonec $n0 'okno — nepřiřazeno: nic'
 
     # 10 s bez klávesy: přiřazování skončí samo (limit jádra).
+    $n0 = @(KonceLogu).Count
     $null = Klik 'section.karta[data-pad="1"] [data-vstup="x"] .telo'
     Over 'přiřazování běží a ubývá čas (proužek, nebo „ještě N s“ s Omezit pohyb)' (Cekej '__kpt.app().dataset.rezim === "binding" && (!!__kpt.q("section.karta[data-pad=\"1\"] .odpocet") || /ještě \d+ s/.test(__kpt.napoveda(1) || ""))')
     $t0 = [Diagnostics.Stopwatch]::StartNew()
@@ -863,10 +937,11 @@ function ScenarUpravy {
     $s = $t0.Elapsed.TotalSeconds
     Over ('bez klávesy se přiřazování za 10 s samo zruší (za {0:N1} s)' -f $s) ($konec -and $s -ge 8.5 -and $s -lt 12.5) $s
     Over 'klik jinam ani limit nic nepřiřadily' ((Klavesy).rev -eq $rev0)
+    OverKonec $n0 'limit 10 s — nepřiřazeno: nic'
 }
 
 function ScenarMinimalizace {
-    Krok '10/11  Minimalizace okna během přiřazování'
+    Krok '10/13  Minimalizace okna během přiřazování'
     $null = Klik 'section.karta[data-pad="1"] .rozbal'
     $null = Cekej '__kpt.karta(1).dataset.rozbalena === "true" && !!__kpt.cep(1, "x")'
     $rev0 = (Klavesy).rev
@@ -889,7 +964,7 @@ function ScenarMinimalizace {
 }
 
 function ScenarZive {
-    Krok '8/11  Živé svícení, simulovaný ovladač'
+    Krok '8/13  Živé svícení, simulovaný ovladač'
     Klavesa 0x11 $false $true
     Over 'W dolů → čepička ↑ levé páčky obrysem (data-sviti=nahled)' (Cekej '__kpt.cep(1, "ls_up").dataset.sviti === "nahled"') (Js '__kpt.sviti()')
     Klavesa 0x1E $false $true
@@ -937,7 +1012,7 @@ function ScenarZive {
 }
 
 function ScenarSirka {
-    Krok '9/11  Rozvržení 380 px'
+    Krok '9/13  Rozvržení 380 px'
     foreach ($v in @(@(380, 620), @(380, 480))) {
         $null = $script:cdp.Volej('Emulation.setDeviceMetricsOverride', ('{"width":' + $v[0] + ',"height":' + $v[1] + ',"deviceScaleFactor":0,"mobile":false}'), 10000)
         $null = Cekej ('innerWidth === ' + $v[0])
@@ -955,16 +1030,21 @@ function ScenarSirka {
 }
 
 function ScenarRestart {
-    Krok '11/11  Restart a poškozená konfigurace'
+    Krok '11/13  Restart a poškozená konfigurace'
     $ulozeno = CekejNaKonfiguraci { param($j) @($j.vazby | Where-Object { $_.ovladac -eq 2 -and $_.vstup -eq 'a' -and $_.scan -eq 0x76 }).Count -eq 1 }
     Over 'config.json má F24 u ovladače 2 (zápis do 0,5 s po změně)' $ulozeno
+    # Karty se ukládají (OQ 52, vlastník 6. 10.): prázdná karta 3 zůstala,
+    # karta 4 odebraná 🗑 ne.
+    $kartyCfg = CekejNaKonfiguraci { param($j) (@($j.karty) -join ',') -eq '1,2,3' }
+    Over 'config.json má karty 1, 2 a 3 (4 odebraná 🗑)' $kartyCfg
     Ukonci
     Spust
     Over 'po restartu okno načteno' (Cekej '!!__kpt.app() && __kpt.qa("section.karta[data-pad=\"1\"] [data-vstup]").length === 24' 30000)
     $k = Klavesy
     Over 'po restartu F24 zůstala na A ovladače 2' ((Vazba $k 0x76).pad -eq 1 -and (Vazba $k 0x76).vstup -eq 'a' -and $k.konfigurace -eq 'ok') @{ f24 = (Vazba $k 0x76); konfigurace = $k.konfigurace }
+    $null = Cekej '__kpt.karty().length === 3'
     $karty = @(Js '__kpt.karty()')
-    Over 'po restartu karty 1 a 2; prázdné 3 a 4 zmizely (OQ 52)' (($karty -join ',') -eq '1,2') $karty
+    Over 'po restartu karty 1, 2 a prázdná 3; odebraná 4 ne (OQ 52)' (($karty -join ',') -eq '1,2,3') $karty
     $null = Klik 'section.karta[data-pad="2"] .rozbal'
     Over 'karta 2 po restartu ukazuje F24 na A' (Cekej ('__kpt.nazev(2, "a") === ' + (ConvertTo-Json -InputObject ((Vazba $k 0x76).klavesa.kratky) -Compress)))
     Snimek '11-po-restartu'
@@ -986,6 +1066,83 @@ function ScenarRestart {
     Over 'platí výchozí klávesy (24 vazeb ovladače 1), stav „obnovena“' ($k.vazby.Count -eq 24 -and -not @($k.vazby | Where-Object { $_.pad -ne 0 }) -and $k.konfigurace -eq 'obnovena' -and $k.zaloha) @{ n = $k.vazby.Count; konfigurace = $k.konfigurace; zaloha = $k.zaloha }
     Pretek '440 px s pruhem'
     Snimek '12-konfigurace-obnovena'
+}
+
+function ScenarPrazdnaKarta {
+    Krok '12/13  Prázdná karta ovladače 2 po úplném ukončení procesu (OQ 52)'
+    # Hlášení vlastníka 6. 10. (bod 6): karta 2 přežila zavření okna, ale
+    # ne konec procesu. Tady bez jediné klávesy — ScenarRestart má kartu 2
+    # s F24, a ta by zůstala i bez ukládání karet.
+    Over 'po obnovené konfiguraci jen karta 1' (Cekej '__kpt.karty().join(",") === "1"') (Js '__kpt.karty()')
+    $null = Klik '[data-pridat="2"]'
+    Over '„+ Ovladač“ přidá kartu 2, všech 24 čepiček prázdných' (Cekej '!!__kpt.karta(2) && __kpt.qa("section.karta[data-pad=\"2\"] .cepicka[data-prazdna]").length === 24')
+    $ulozeno = CekejNaKonfiguraci { param($j) (@($j.karty) -join ',') -eq '1,2' -and @($j.vazby | Where-Object { $_.ovladac -eq 2 }).Count -eq 0 }
+    Over 'config.json: karty 1 a 2, ovladač 2 bez kláves (uloženo hned přidáním)' $ulozeno
+    # Ukonci = taskkill /F celého stromu procesů, žádné zavření okna (to by
+    # KeyPad jen schovalo) — stejně tvrdé jako „úplné ukončení".
+    Ukonci
+    # Další spuštění rovnou s podvrhem pro scénář 13.
+    Spust @('KEYPAD_TEST_OS_DRZI=vse')
+    Over 'po restartu okno načteno' (Cekej '!!__kpt.app() && __kpt.qa("section.karta[data-pad=\"1\"] [data-vstup]").length === 24' 30000)
+    $null = Cekej '__kpt.karty().length === 2'
+    $karty = @(Js '__kpt.karty()')
+    Over 'po konci procesu karta 2 zůstala, i když nemá klávesy' (($karty -join ',') -eq '1,2') $karty
+    Over 'karta 2: všech 24 čepiček prázdných, „Klikni na vstup a stiskni klávesu“' ((Rozbal 2) -and (Cekej '__kpt.qa("section.karta[data-pad=\"2\"] .cepicka[data-prazdna]").length === 24 && __kpt.napoveda(2) === "Klikni na vstup a stiskni klávesu"')) (Js '__kpt.napoveda(2)')
+    Over 'konfigurace „ok“' ((Klavesy).konfigurace -eq 'ok')
+    Snimek '13-prazdna-karta-po-restartu'
+}
+
+function ScenarOsDrziVse {
+    Krok '13/13  Přiřazení a Esc, i když by Windows callbacku tvrdily, že drží všechno (OQ 57)'
+    # KEYPAD_TEST_OS_DRZI=vse: kdyby se callback ptal na stav klávesnice
+    # (jako ve vydání 0.1.0+20261006.1208), uslyšel by „drží" i o klávese,
+    # o které rozhoduje — a nepřiřadilo by se nic, ani Esc by nezrušil.
+    # Smyčka hook vlákna (snímek, srovnání při kliku) slyší „nic nedrží".
+    $podvrh = @(LogRadky | Where-Object { $_ -match 'KEYPAD_TEST_OS_DRZI=vse: ' })
+    Over 'testovací instance běží s podvrhem „Windows drží všechno“ (log)' ($podvrh.Count -ge 1) $podvrh.Count
+    Over 'karta 2 rozbalená' (Rozbal 2)
+    $n0 = @(KonceLogu).Count
+    $null = Klik 'section.karta[data-pad="2"] [data-vstup="a"] .telo'
+    Over 'klik na A ovladače 2 → přiřazování' (Cekej '__kpt.app().dataset.rezim === "binding" && __kpt.cep(2, "a").hasAttribute("data-cil")')
+    Klavesa 0x76 $false $true
+    Over 'F24 → „uloženo“' (Cekej '__kpt.app().dataset.oznameni === "ulozeno"')
+    Klavesa 0x76 $false $false
+    Over 'po uložení konec přiřazování' (Cekej '__kpt.app().dataset.rezim === "disabled"')
+    $v = Vazba (Klavesy) 0x76
+    Over 'F24 je na A ovladače 2 (backend)' ($v -and $v.pad -eq 1 -and $v.vstup -eq 'a') $v
+    OverKonec $n0 'uloženo — nepřiřazeno: nic'
+
+    $rev0 = (Klavesy).rev
+    $n0 = @(KonceLogu).Count
+    $null = Klik 'section.karta[data-pad="2"] [data-vstup="b"] .telo'
+    Over 'klik na B ovladače 2 → přiřazování' (Cekej '__kpt.app().dataset.rezim === "binding" && __kpt.cep(2, "b").hasAttribute("data-cil")')
+    Stisk 0x01
+    Over 'Esc přiřazování zruší' (Cekej '__kpt.app().dataset.oznameni === "zruseno" && __kpt.app().dataset.rezim === "disabled"')
+    Over 'Esc nic nepřiřadil' ((Klavesy).rev -eq $rev0)
+    OverKonec $n0 'Esc — nepřiřazeno: nic'
+
+    # Živé svícení jde touž cestou (callback) — s podvrhem taky. Karta 1
+    # je sbalená (čepičky nemá), proto živý stav z backendu.
+    Klavesa 0x11 $false $true
+    $ok = CekejNa { $z = (Prikaz 'zive').v; $z.pady[0].drzi -ne 0 } 3000
+    Over 'W za podvrhu svítí (živý stav: ovladač 1 drží vstup)' $ok (Prikaz 'zive').v
+    Klavesa 0x11 $false $false
+    $null = CekejNa { $z = (Prikaz 'zive').v; -not @($z.pady | Where-Object { $_.drzi -ne 0 }) } 3000
+    $dotazy = @(LogRadky | Where-Object { $_ -match 'zeptal na stav klávesnice' })
+    Over 'log: callback se na stav klávesnice nezeptal ani jednou' ($dotazy.Count -eq 0) $dotazy
+
+    # Vyprázdnění poslední klávesy ovladače 2 kartu uloží taky — karta,
+    # se kterou uživatel pracuje, nezmizí ani po konci procesu.
+    $null = Klik 'section.karta[data-pad="2"] [data-vstup="a"] .krizek'
+    Over '× vyprázdní A ovladače 2 — karta zůstává' (Cekej '__kpt.cep(2, "a").hasAttribute("data-prazdna") && __kpt.karty().join(",") === "1,2"') (Js '__kpt.karty()')
+    $ulozeno = CekejNaKonfiguraci { param($j) (@($j.karty) -join ',') -eq '1,2' -and @($j.vazby | Where-Object { $_.ovladac -eq 2 }).Count -eq 0 }
+    Over 'config.json: karta 2 bez kláves' $ulozeno
+    Ukonci
+    Spust
+    Over 'po restartu okno načteno' (Cekej '!!__kpt.app() && __kpt.qa("section.karta[data-pad=\"1\"] [data-vstup]").length === 24' 30000)
+    $null = Cekej '__kpt.karty().length === 2'
+    $karty = @(Js '__kpt.karty()')
+    Over 'po konci procesu karta 2 zůstala i po vyprázdnění poslední klávesy' (($karty -join ',') -eq '1,2') $karty
 }
 
 # ── Běh ────────────────────────────────────────────────────────────
@@ -1047,7 +1204,8 @@ try {
     # ne konec běhu: další scénáře ukážou, jestli je okno jinak v pořádku.
     # Bezpečnostní stop a ztracené spojení končí hned.
     $scenare = 'ScenarStart', 'ScenarKarty', 'ScenarKlavesyOkna', 'ScenarPrirazeni', 'ScenarPresun', 'ScenarUpravy',
-        'ScenarWin', 'ScenarZive', 'ScenarSirka', 'ScenarMinimalizace', 'ScenarRestart'
+        'ScenarWin', 'ScenarZive', 'ScenarSirka', 'ScenarMinimalizace', 'ScenarRestart', 'ScenarPrazdnaKarta',
+        'ScenarOsDrziVse'
     foreach ($s in $scenare) {
         try {
             & $s
@@ -1079,7 +1237,10 @@ try {
         Over 'data okna nainstalovaného KeyPadu nedotčená (WebView2 jen v pracovní složce)' ($po -eq $script:portVlastnikaPred) @{ pred = $script:portVlastnikaPred; po = $po }
         $log = Join-Path $script:beh 'keypad.log'
         if (Test-Path $log) {
-            $radky = @(Get-Content $log -Encoding UTF8)
+            # Holé řetězce: řádky z Get-Content nesou vlastnosti poskytovatele
+            # (PSPath, PSDrive…) a detail selhané kontroly by z nich
+            # ConvertTo-Json udělal desítky megabajtů (stalo se).
+            $radky = @(LogRadky)
             $paniky = @($radky | Where-Object { $_ -match 'PANIKA' })
             Over 'v logu není panika' ($paniky.Count -eq 0) $paniky
             # Spec 1.8: zkratky prohlížeče (F5, Ctrl+R, Ctrl+P) vypíná backend
@@ -1087,6 +1248,15 @@ try {
             # proto log (ladicí build píše i úroveň debug).
             $zkratky = @($radky | Where-Object { $_ -match 'WebView2: zkratky prohlížeče vypnuté' })
             Over 'WebView2: zkratky prohlížeče vypnuté (log)' ($zkratky.Count -ge 1) $zkratky.Count
+            # Diagnostika přiřazování celého běhu: každý konec (uloženo, Esc,
+            # limit, okno) má řádek a v žádném není nic než důvod a počty.
+            $konce = @($radky | ForEach-Object { if ($_ -match 'přiřazování skončilo: (.*)$') { $Matches[1] } })
+            $spatne = @($konce | Where-Object { $_ -cnotmatch $script:reDiag })
+            $duvody = @($konce | ForEach-Object { ($_ -split ' — ')[0] } | Sort-Object -Unique)
+            $vsechny = -not @('uloženo', 'Esc', 'limit 10 s', 'okno' | Where-Object { $duvody -notcontains $_ })
+            Over ('log: ' + $konce.Count + '× „přiřazování skončilo“ (uloženo, Esc, limit, okno) — jen důvod a počty, bez identity klávesy') ($konce.Count -gt 0 -and $vsechny -and $spatne.Count -eq 0) @{ duvody = $duvody; spatne = $spatne }
+            $dotazy = @($radky | Where-Object { $_ -match 'zeptal na stav klávesnice' })
+            Over 'log: callback se na stav klávesnice nezeptal (OQ 57)' ($dotazy.Count -eq 0) $dotazy
             $chyby = @($radky | Where-Object { $_ -cmatch '\bERROR\b' })
             if ($chyby.Count) {
                 Write-Host "  ERROR v logu ($($chyby.Count)):" -ForegroundColor DarkGray

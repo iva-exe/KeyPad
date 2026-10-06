@@ -23,7 +23,7 @@ use keypad_core::{
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
 
-use crate::config::StavKonfigurace;
+use crate::config::{Karty, StavKonfigurace};
 use crate::platform::windows::klavesy;
 use crate::platform::windows::vystup::CilInfo;
 
@@ -91,6 +91,30 @@ pub struct KlavesyInfo {
     /// nejvýš [`MAX_CHYB_V_OKNE`]) — jen u `obnovena` a `necitelna`
     /// (nevalidní soubor, který nešel odložit); jinak prázdné.
     pub chyby: Vec<String>,
+    /// Ovladače s kartou v okně (uložené, OQ 52).
+    pub karty: KartyInfo,
+}
+
+/// Karty ovladačů v okně (OQ 52, rozhodl vlastník 6. 10.: ukládají se).
+/// Část odpovědi `klavesy` a odpověď příkazů `pridej_kartu`
+/// a `odeber_ovladac`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct KartyInfo {
+    /// Pořadí změny seznamu — odpověď příkazu a načtení kláves se můžou
+    /// předběhnout, starší seznam okno zahodí.
+    pub rev: u64,
+    /// Ovladače od 0, vzestupně; ovladač 0 vždy a ovladač s klávesami
+    /// taky. Zapnutý ovladač okno ukáže i bez karty (nesmí zmizet).
+    pub pady: Vec<u8>,
+}
+
+impl KartyInfo {
+    pub fn z(rev: u64, karty: Karty) -> KartyInfo {
+        KartyInfo {
+            rev,
+            pady: karty.pady().map(|p| p.index() as u8).collect(),
+        }
+    }
 }
 
 /// Kódy vstupů v pořadí bitů živého stavu.
@@ -100,10 +124,15 @@ pub fn vstupy() -> [&'static str; Action::COUNT] {
 
 /// [`KlavesyInfo`] ze zrcadla mapování; `nazev` = název klávesy podle
 /// rozložení (`klavesy::nazev` na hlavním vlákně).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "čistá funkce ze zrcadla; struktura navíc by jen opakovala KlavesyInfo"
+)]
 pub fn klavesy_info(
     rev: u64,
     m: &Mapping,
     zpet: bool,
+    karty: KartyInfo,
     konfigurace: StavKonfigurace,
     zaloha: Option<&Path>,
     chyby: &[String],
@@ -139,6 +168,7 @@ pub fn klavesy_info(
         } else {
             Vec::new()
         },
+        karty,
     }
 }
 
@@ -382,14 +412,24 @@ mod tests {
         m
     }
 
-    /// `klavesy`: celý tvar včetně pořadí vazeb (`Mapping::bindings`)
-    /// a krátkých názvů (tabulka i utnutí na 5 znaků).
+    /// Jen karta ovladače 1.
+    fn karty0() -> KartyInfo {
+        KartyInfo::z(0, Karty::PRVNI)
+    }
+
+    /// `klavesy`: celý tvar včetně pořadí vazeb (`Mapping::bindings`),
+    /// krátkých názvů (tabulka i utnutí na 5 znaků) a karet (ovladač 4
+    /// s kartou bez kláves, OQ 52).
     #[test]
     fn zlaty_klavesy() {
+        let m = mapovani_zlateho();
+        let mut karty = Karty::PRVNI.s_klavesami(&m);
+        karty.pridej(PadId::new(3).unwrap());
         let info = klavesy_info(
             12,
-            &mapovani_zlateho(),
+            &m,
             true,
+            KartyInfo::z(3, karty),
             StavKonfigurace::Ok,
             Some(Path::new(r"C:\x\config.invalid.json")),
             &["řádek 1: x".to_string()],
@@ -424,12 +464,22 @@ mod tests {
             StavKonfigurace::Necitelna,
             StavKonfigurace::Neulozena,
         ] {
-            let i = klavesy_info(0, &m, false, stav, Some(p), &[], nazev_cz);
+            let i = klavesy_info(0, &m, false, karty0(), stav, Some(p), &[], nazev_cz);
             let ocekavano = (stav == StavKonfigurace::Obnovena).then(|| p.display().to_string());
             assert_eq!(i.zaloha, ocekavano, "{stav:?}");
         }
         assert_eq!(
-            klavesy_info(0, &m, false, StavKonfigurace::Obnovena, None, &[], nazev_cz).zaloha,
+            klavesy_info(
+                0,
+                &m,
+                false,
+                karty0(),
+                StavKonfigurace::Obnovena,
+                None,
+                &[],
+                nazev_cz
+            )
+            .zaloha,
             None
         );
     }
@@ -447,7 +497,7 @@ mod tests {
             StavKonfigurace::Necitelna,
             StavKonfigurace::Neulozena,
         ] {
-            let i = klavesy_info(0, &m, false, stav, None, &chyby, nazev_cz);
+            let i = klavesy_info(0, &m, false, karty0(), stav, None, &chyby, nazev_cz);
             let ocekavano =
                 if matches!(stav, StavKonfigurace::Obnovena | StavKonfigurace::Necitelna) {
                     chyby[..MAX_CHYB_V_OKNE].to_vec()
@@ -460,12 +510,26 @@ mod tests {
             0,
             &m,
             false,
+            karty0(),
             StavKonfigurace::Obnovena,
             None,
             &chyby[..1],
             nazev_cz,
         );
         assert_eq!(jedna.chyby, chyby[..1].to_vec());
+    }
+
+    /// Karty: ovladače od 0, vzestupně, s pořadím změny.
+    #[test]
+    fn karty_pro_okno() {
+        assert_eq!(
+            serde_json::to_value(karty0()).unwrap(),
+            serde_json::json!({ "rev": 0, "pady": [0] })
+        );
+        let mut k = Karty::PRVNI;
+        k.pridej(PadId::new(3).unwrap());
+        k.pridej(PadId::new(1).unwrap());
+        assert_eq!(KartyInfo::z(5, k).pady, vec![0, 1, 3]);
     }
 
     /// Krátký název: tabulka, jinak prvních 5 znaků (ne bajtů).

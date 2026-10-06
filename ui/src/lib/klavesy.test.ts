@@ -15,7 +15,11 @@ const posluchaci = new Map<string, Obsluha>();
 const prikazy: string[] = [];
 
 const zlate = klavesyJson as unknown as KlavesyInfo;
-/** Backend po restartu: ovladač 2 má jedinou klávesu z config.json. */
+/**
+ * Backend po restartu: ovladač 2 má jedinou klávesu z config.json (a tím
+ * i kartu). `zastarale` = odpověď `klavesy`, která se zpozdila za
+ * novější změnou karet.
+ */
 const backend = {
 	klavesy: {
 		...structuredClone(zlate),
@@ -23,14 +27,26 @@ const backend = {
 			...zlate.vazby.filter((v) => v.pad === 0),
 			...zlate.vazby.filter((v) => v.pad === 1).slice(0, 1)
 		] as Vazba[],
-		zpet: false
-	} as KlavesyInfo
+		zpet: false,
+		karty: { rev: 0, pady: [0, 1] }
+	} as KlavesyInfo,
+	zastarale: null as KlavesyInfo | null
 };
 const KLAVESA_2 = backend.klavesy.vazby.find((v) => v.pad === 1)!;
+
+/** Jako backend: karta přibude (uloží se) a roste pořadí. */
+function pridejKartu(pad: number): void {
+	const k = backend.klavesy.karty;
+	if (k.pady.includes(pad)) return;
+	k.pady = [...k.pady, pad].sort((a, b) => a - b);
+	k.rev++;
+}
 
 function uprav(z: ZmenaKlaves): void {
 	if (z.typ !== 'vyprazdnit') throw new Error(`test neumí ${z.typ}`);
 	const k = backend.klavesy;
+	// Karta s poslední klávesou nezmizí (OQ 52) — backend ji uloží předem.
+	pridejKartu(z.pad);
 	k.vazby = k.vazby.filter((v) => !(v.pad === z.pad && v.vstup === z.vstup));
 	k.rev++;
 	k.zpet = true;
@@ -51,10 +67,23 @@ mock.module('./tauri', () => ({
 	zavolej: async (prikaz: string, args?: Record<string, unknown>) => {
 		prikazy.push(prikaz);
 		switch (prikaz) {
-			case 'klavesy':
-				return structuredClone(backend.klavesy);
+			case 'klavesy': {
+				const z = backend.zastarale;
+				backend.zastarale = null;
+				return structuredClone(z ?? backend.klavesy);
+			}
 			case 'uprav_klavesy':
 				return uprav(args!.zmena as ZmenaKlaves);
+			case 'pridej_kartu':
+				pridejKartu(args!.pad as number);
+				return structuredClone(backend.klavesy.karty);
+			case 'odeber_ovladac': {
+				const k = backend.klavesy;
+				k.vazby = k.vazby.filter((v) => v.pad !== args!.pad);
+				k.karty.pady = k.karty.pady.filter((p) => p !== args!.pad);
+				k.karty.rev++;
+				return structuredClone(k.karty);
+			}
 			default:
 				return null;
 		}
@@ -63,6 +92,13 @@ mock.module('./tauri', () => ({
 
 const k = await import('./klavesy.svelte');
 const p = await import('./pady.svelte');
+/** Karty, jak je okno ukáže. */
+const videt = () =>
+	viditelneKarty(
+		k.klavesy.vazby,
+		p.pady.map((x) => x.state),
+		k.klavesy.karty
+	);
 // Jako okno: nejdřív poslouchat, pak načíst.
 await k.prihlasKlavesy();
 await k.nactiKlavesy();
@@ -155,27 +191,46 @@ describe('odmítnutá klávesa a konec přiřazování', () => {
 	});
 });
 
-describe('karta ovladače při vyprázdnění poslední klávesy', () => {
-	test('karta ovladače s klávesami z config.json zůstane i se „Zpět"', async () => {
-		const stavy = () => p.pady.map((x) => x.state);
-		// Po restartu: karta 2 je vidět jen díky klávese, přidaná není.
-		expect(p.pridane).not.toContain(1);
-		expect(viditelneKarty(k.klavesy.vazby, stavy(), p.pridane)).toEqual([0, 1]);
+describe('karty ovladačů (ukládají se, OQ 52)', () => {
+	test('karta ovladače s klávesami z config.json zůstane i po vyprázdnění, se „Zpět"', async () => {
+		// Po restartu: karta 2 uložená (má klávesu).
+		expect(k.klavesy.karty).toEqual([0, 1]);
+		expect(videt()).toEqual([0, 1]);
 
 		await k.vyprazdni(1, KLAVESA_2.vstup);
 		await tik();
 
 		expect(k.klavesy.vazby.some((v) => v.pad === 1)).toBe(false);
-		expect(viditelneKarty(k.klavesy.vazby, stavy(), p.pridane)).toEqual([0, 1]);
+		expect(videt()).toEqual([0, 1]);
 		expect(k.napovedaKarty(1, 0)).toEqual({
 			text: `Vyprázdněno: ${KRATKE[KLAVESA_2.vstup]}`,
 			druh: 'zprava',
 			titulek: undefined,
 			zpet: true
 		});
-		// Kartu pak schová jen 🗑 (po úspěšném odebrání ovladače).
-		p.zapomenPridany(1);
-		expect(viditelneKarty(k.klavesy.vazby, stavy(), p.pridane)).toEqual([0]);
+		k.skryjZpravu();
+	});
+
+	test('„+ Ovladač" kartu ukáže hned a starší odpověď ji neschová', async () => {
+		// Načtení kláves, které se zpozdilo za přidáním karty.
+		backend.zastarale = structuredClone(backend.klavesy);
+		const pridani = k.pridejKartu(3);
+		expect(videt()).toEqual([0, 1, 3]);
+		await pridani;
+		expect(prikazy).toContain('pridej_kartu');
+		await k.nactiKlavesy();
+		expect(k.klavesy.karty).toEqual([0, 1, 3]);
+		expect(videt()).toEqual([0, 1, 3]);
+	});
+
+	test('kartu schová jen 🗑 (backend ji odebere i z uložených)', async () => {
+		expect(await k.odeberOvladac(3)).toBe(true);
+		expect(videt()).toEqual([0, 1]);
+		expect(await k.odeberOvladac(1)).toBe(true);
+		expect(videt()).toEqual([0]);
+		// Po „restartu" (novém načtení) se nevrátí.
+		await k.nactiKlavesy();
+		expect(videt()).toEqual([0]);
 	});
 });
 

@@ -659,35 +659,15 @@ impl Engine {
             .flatten()
     }
 
-    /// Rozhodne engine o NOVÉM stisku `key` jinak, než že ho jen pustí do
-    /// OS? Tedy: zkratka přepnutí, přiřazování, nebo klávesa připraveného
-    /// ovladače při zachytávání.
-    ///
-    /// Jen u takového stisku má hook smysl ptát se Windows, jestli klávesu
-    /// (nebo Win) už drží OS ([`Engine::adopt_os_key`]). U ostatních by
-    /// převzetí dopadlo stejně jako nový stisk — klávesa OS bez efektu —
-    /// a dotaz je volání jádra Windows, které měření ukázalo jako ocas
-    /// zpracování klávesy (p99). Rovnost obou cest hlídá property test.
-    pub fn claims_new_press(&self, key: KeyId) -> bool {
-        key.index().is_some()
-            && (key == self.mapping.toggle_key()
-                || match self.mode {
-                    Mode::Binding { .. } => true,
-                    Mode::Gamepad => self
-                        .mapping
-                        .target(key)
-                        .is_some_and(|t| self.is_ready(t.pad)),
-                    Mode::Keyboard | Mode::Disabled { .. } => false,
-                })
-    }
-
     // ── Klávesnice ───────────────────────────────────────────────────
 
     /// Klávesa, kterou drží OS, ale engine o ní neví: hook neviděl její
     /// stisk (nainstaloval se, až když už byla dole, nebo `reset_held`
-    /// zapomněl držené klávesy). Hook to pozná z asynchronního stavu
-    /// klávesnice u key-downu bez záznamu a zavolá tohle PŘED
-    /// [`Engine::on_key`].
+    /// zapomněl držené klávesy). Hook to zjistí jednorázovým snímkem
+    /// klávesnice MIMO callback, hned po instalaci a po zapomenutí —
+    /// v callbacku Windows hlásily dole i právě stisknutou klávesu (OQ 57).
+    /// Totéž pro nový stisk s drženou Win (Win+D patří Windows, OQ 44),
+    /// tehdy PŘED [`Engine::on_key`].
     ///
     /// Klávesa dostane vlastníka `Os`, takže její autorepeat i key-up jdou
     /// dál do OS (princip 2). Bez toho by autorepeat vypadal jako nový
@@ -711,6 +691,35 @@ impl Engine {
                 last_ms: now_ms,
             },
         );
+        true
+    }
+
+    /// Zapomene klávesu OS, kterou podle Windows už nikdo nedrží: hook
+    /// neviděl její key-up (okno s právy správce v popředí, OQ 39), nebo
+    /// ji snímek klávesnice převzal pod jinou identitou, než s jakou pak
+    /// přišel key-up (falešný Ctrl z AltGr, OQ 38). Záznam vlastníka `Os`
+    /// sám nezastará ([`STALE_KEY_MS`]) — u modifikátoru by při
+    /// přiřazování každý další stisk patřil Windows a nepřiřadil se ani
+    /// nezrušil nic, ani Esc (OQ 55).
+    ///
+    /// Jen záznam `Os`: klávesu ovladače ani spolknutou Windows neviděly,
+    /// jejich stav o ní nic neříká. Režim ani stav ovladačů se nemění
+    /// (klávesa OS do nich nepatří); ťuknutí modifikátorem čekající na
+    /// tuhle klávesu se zahodí — její key-up už nic neuloží. Hook to volá
+    /// mimo callback a jen tehdy, když stavu Windows věří (okno KeyPadu
+    /// v popředí, začátek přiřazování): kdyby klávesu přece jen držely,
+    /// její autorepeat by pro engine byl nový stisk. `true` = zapomenuto.
+    pub fn forget_os_key(&mut self, key: KeyId) -> bool {
+        let Some(i) = key.index() else {
+            return false;
+        };
+        if !self.held(key).is_some_and(|h| h.owner == Owner::Os) {
+            return false;
+        }
+        self.forget(i);
+        if self.bind_tap == Some(key) {
+            self.bind_tap = None;
+        }
         true
     }
 
@@ -1984,36 +1993,32 @@ mod tests {
         ));
     }
 
-    /// Kdy se hook u nového stisku ptá Windows na stav klávesnice: jen
-    /// u zkratky, při přiřazování a u klávesy připraveného ovladače při
-    /// zachytávání. Že ostatní stisky dopadnou s převzetím i bez něj
-    /// stejně, hlídá property test.
+    /// Klávesa převzatá jako klávesa Windows (snímek po instalaci hooku:
+    /// držená před přiřazováním) se při přiřazování nepřiřadí — její
+    /// autorepeat jde Windows. Po uvolnění se nový stisk přiřadí. Proto
+    /// hook převzetí nesmí dělat podle stavu klávesnice v callbacku: tam
+    /// Windows hlásily dole i právě stisknutou klávesu a nepřiřadilo se
+    /// nic, ani Esc nerušil (OQ 57).
     #[test]
-    fn o_novem_stisku_rozhoduje_jen_kde_ma_co() {
-        let tab = KeyId::new(0x0F);
-        let mut m = Mapping::default();
-        m.bind(KeyId::C, PadAction::new(P1, Action::Button(PadButton::A)))
-            .unwrap();
-        let mut e = Engine::new(m);
-        // Disabled a Klávesnice: jen zkratka.
-        for _ in 0..2 {
-            assert!(e.claims_new_press(TOGGLE));
-            assert!(!e.claims_new_press(KeyId::W));
-            let _ = e.enable(P0);
+    fn prevzata_klavesa_se_neprirazuje_az_novy_stisk() {
+        let mut e = Engine::new(Mapping::default());
+        let _ = e.enable(P0);
+        let cil = t0(Action::Button(PadButton::B));
+        let _ = e.start_binding(cil, BindKind::Replace, T0);
+        for k in [KeyId::F, KeyId::ESC] {
+            assert!(e.adopt_os_key(k, T0));
+            let d = e.on_key(k, true, T0);
+            assert_eq!((d.suppress, d.ui), (false, None), "{k} jde Windows");
+            assert!(matches!(e.mode(), Mode::Binding { .. }), "{k}");
+            assert!(!e.on_key(k, false, T0).suppress);
         }
-        let _ = e.toggle(T0);
-        assert_eq!(e.mode(), Mode::Gamepad);
+        let d = e.on_key(KeyId::F, true, T0);
+        assert!(d.suppress);
         assert!(
-            e.claims_new_press(KeyId::W),
-            "klávesa připraveného ovladače"
+            matches!(d.ui, Some(UiEvent::BindingSaved { key: KeyId::F, target, .. }) if target == cil),
+            "{:?}",
+            d.ui
         );
-        assert!(!e.claims_new_press(KeyId::C), "nepřipravený ovladač");
-        assert!(!e.claims_new_press(tab), "nenamapovaná");
-        let _ = e.start_binding(t0(Action::Button(PadButton::A)), BindKind::Replace, T0);
-        assert!(e.claims_new_press(tab), "přiřazování: každá mapovatelná");
-        for k in [KeyId::LEFT_WIN, KeyId::new(0), KeyId::ALTGR_FAKE_CTRL] {
-            assert!(!e.claims_new_press(k), "{k} engine nesleduje");
-        }
     }
 
     #[test]
@@ -2290,6 +2295,98 @@ mod tests {
         let r = down(&mut e, TOGGLE);
         assert!(!r.suppress && r.ui.is_none());
         assert_eq!(e.mode(), Mode::Gamepad);
+    }
+
+    /// Revize opravy 6. 10. (OQ 39, 55): klávesa OS, jejíž key-up hook
+    /// neviděl (Ctrl+Shift+Esc → Správce úloh s právy správce), zůstane
+    /// v `held` napořád — záznam OS nezastará. Levý Ctrl pak při
+    /// přiřazování dělá z každého stisku zkratku Windows a Esc
+    /// („autorepeat" klávesy OS) přiřazování nezruší. Hook na začátku
+    /// přiřazování zapomene klávesy, které Windows nedrží
+    /// (`forget_os_key`) — pak F i Esc fungují.
+    #[test]
+    fn zastaraly_zaznam_os_po_zapomenuti_neblokuje_prirazovani() {
+        let cil = t0(Action::Button(PadButton::B));
+        for zapomenout in [false, true] {
+            let mut e = engine();
+            // Pauza se zapnutým ovladačem: Ctrl, levý Shift a Esc patří
+            // Windows a jejich key-upy se ztratily.
+            let _ = down(&mut e, KeyId::LEFT_CTRL);
+            let _ = down(&mut e, KeyId::LEFT_SHIFT);
+            let _ = down(&mut e, KeyId::ESC);
+            let pozdeji = T0 + 60_000;
+            if zapomenout {
+                for k in [KeyId::LEFT_CTRL, KeyId::LEFT_SHIFT, KeyId::ESC] {
+                    assert!(e.forget_os_key(k), "{k}");
+                }
+                assert_eq!(e.held_len(), 0);
+            }
+            let _ = e.start_binding(cil, BindKind::Replace, pozdeji);
+            let d = e.on_key(KeyId::F, true, pozdeji + 10);
+            if zapomenout {
+                assert!(d.suppress);
+                assert!(matches!(d.ui, Some(UiEvent::BindingSaved { key, .. }) if key == KeyId::F));
+                assert_eq!(e.mapping().target(KeyId::F), Some(cil));
+            } else {
+                // Bez zapomenutí: F patří Windows (Ctrl+F), nic se
+                // neuloží, a Esc je „autorepeat" a přiřazování nezruší.
+                assert!(!d.suppress && d.ui.is_none(), "{d:?}");
+                let esc = e.on_key(KeyId::ESC, true, pozdeji + 20);
+                assert!(!esc.suppress && esc.ui.is_none(), "{esc:?}");
+                assert!(matches!(e.mode(), Mode::Binding { .. }));
+            }
+        }
+        // Esc sám: zapomenutý se zase dá použít ke zrušení.
+        let mut e = engine();
+        let _ = down(&mut e, KeyId::ESC);
+        assert!(e.forget_os_key(KeyId::ESC));
+        let _ = e.start_binding(cil, BindKind::Replace, T0);
+        let d = down(&mut e, KeyId::ESC);
+        assert_eq!(
+            d.ui,
+            Some(UiEvent::BindingCancelled {
+                reason: BindingCancel::Escape
+            })
+        );
+    }
+
+    /// `forget_os_key` bere jen záznamy OS — klávesu ovladače ani
+    /// spolknutou Windows neviděly — a nemění režim ani ovladače.
+    /// Čekající ťuknutí modifikátorem zapomenuté klávesy zmizí: její
+    /// key-up už nic neuloží.
+    #[test]
+    fn forget_os_key_jen_klavesy_os() {
+        let mut e = gamepad();
+        assert!(down(&mut e, KeyId::W).suppress, "W ovladači");
+        assert!(!down(&mut e, KeyId::X).suppress, "X Windows");
+        assert!(!e.forget_os_key(KeyId::W), "klávesa ovladače zůstane");
+        assert!(!e.forget_os_key(TOGGLE), "nedržená nic");
+        assert!(
+            !e.forget_os_key(KeyId::ALTGR_FAKE_CTRL),
+            "nemapovatelná nic"
+        );
+        let pred = e.pad_state(P0);
+        assert!(e.forget_os_key(KeyId::X));
+        assert!(!e.forget_os_key(KeyId::X), "podruhé nic");
+        assert_eq!((e.mode(), e.pad_state(P0)), (Mode::Gamepad, pred));
+        assert_eq!(
+            e.held(KeyId::W).unwrap().owner,
+            Owner::Pad(t0(Action::LeftStick(StickDir::Up)))
+        );
+        // Spolknutá (Swallow po pauze) zůstane taky.
+        let _ = e.toggle(T0);
+        assert_eq!(e.held(KeyId::W).unwrap().owner, Owner::Swallow);
+        assert!(!e.forget_os_key(KeyId::W));
+        // Ťuknutí Altem při přiřazování: po zapomenutí Altu se key-up
+        // nic neuloží (Windows ho mezitím pustily jinde).
+        let cil = t0(Action::Button(PadButton::Y));
+        let _ = e.start_binding(cil, BindKind::Replace, T0);
+        assert!(!down(&mut e, KeyId::LEFT_ALT).suppress);
+        assert!(e.forget_os_key(KeyId::LEFT_ALT));
+        let d = up(&mut e, KeyId::LEFT_ALT);
+        assert!(!d.suppress && d.ui.is_none(), "{d:?}");
+        assert!(matches!(e.mode(), Mode::Binding { .. }));
+        assert_ne!(e.mapping().target(KeyId::LEFT_ALT), Some(cil));
     }
 
     #[test]

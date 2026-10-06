@@ -36,13 +36,20 @@ pub fn nazev(k: KeyId) -> String {
 /// z ní, ne z pevné tabulky scan kódů (princip 5: co klávesa znamená,
 /// říká rozložení).
 fn zalozni_nazev(k: KeyId) -> Option<String> {
-    let scan = u32::from(k.scan) | if k.extended { 0xE000 } else { 0 };
-    // SAFETY: jen převod kódu podle rozložení volajícího vlákna, nic nemění.
-    let vk = unsafe { MapVirtualKeyW(scan, MAPVK_VSC_TO_VK_EX) };
+    let vk = vk(k);
     let (f1, f13, f24) = (u32::from(VK_F1.0), u32::from(VK_F13.0), u32::from(VK_F24.0));
     (f13..=f24)
         .contains(&vk)
         .then(|| format!("F{}", vk - f1 + 1))
+}
+
+/// Virtuální klávesa podle rozložení volajícího vlákna (`0` = žádná).
+/// Kromě názvu ji potřebuje i syntetická klávesa testu okna: hook podle
+/// VK sleduje Win (OQ 44), jako u skutečné události.
+pub fn vk(k: KeyId) -> u32 {
+    let scan = u32::from(k.scan) | if k.extended { 0xE000 } else { 0 };
+    // SAFETY: jen převod kódu podle rozložení volajícího vlákna, nic nemění.
+    unsafe { MapVirtualKeyW(scan, MAPVK_VSC_TO_VK_EX) }
 }
 
 /// Krátký název na čepičku (Fáze 6, spec 1.3) pro klávesy, jejichž

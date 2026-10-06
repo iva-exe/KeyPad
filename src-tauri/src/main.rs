@@ -317,6 +317,7 @@ fn main() {
             gamepad::zrus_prirazeni,
             gamepad::uprav_klavesy,
             gamepad::odeber_ovladac,
+            gamepad::pridej_kartu,
             gamepad::pad_on,
             gamepad::pad_off,
             gamepad::pad_test,

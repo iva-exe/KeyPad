@@ -1,10 +1,9 @@
 <script lang="ts">
 	import Plus from 'lucide-svelte/icons/plus';
 
-	// „+ Ovladač": další karta pro dalšího hráče. Nic nepřipojí ani
-	// neuloží — jen ukáže kartu (zapne ji až její přepínač, princip 11).
-	// Prázdný přidaný ovladač po restartu zmizí (OQ 52); s klávesami
-	// zůstane, protože karty se odvozují z mapování.
+	// „+ Ovladač": další karta pro dalšího hráče. Nic nepřipojí — jen
+	// ukáže kartu a backend ji uloží (zapne ji až její přepínač, princip
+	// 11). Karta zůstane i bez kláves a po restartu, zmizí jen 🗑 (OQ 52).
 
 	interface Props {
 		/** Číslo ovladače, který přibude (0–3) — do bubliny a pro test okna. */

@@ -56,23 +56,6 @@ export const sbernice = $state({
 	chyba: ''
 });
 
-/**
- * Ovladače přidané v tomhle sezení: tlačítkem „+ Ovladač" a ty, kterým
- * uživatel vyprázdnil vstup (karta, se kterou pracuje, nezmizí
- * s poslední klávesou — schová ji jen 🗑). Neukládá se: prázdný přidaný
- * ovladač po restartu zmizí (OQ 52), ovladač s klávesami je vidět i bez toho.
- */
-export const pridane: number[] = $state([]);
-
-export function pridej(pad: number): void {
-	if (!pridane.includes(pad)) pridane.push(pad);
-}
-
-export function zapomenPridany(pad: number): void {
-	const i = pridane.indexOf(pad);
-	if (i >= 0) pridane.splice(i, 1);
-}
-
 /** Je ovladač zapnutý (nebo se právě zapíná)? */
 export function zapnuto(pad: number): boolean {
 	const s = pady[pad]?.state;

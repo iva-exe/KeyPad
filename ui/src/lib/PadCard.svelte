@@ -27,7 +27,6 @@
 		sbernicePripravena,
 		vyzkousej,
 		zapnuto,
-		zapomenPridany,
 		zkusZnovu
 	} from './pady.svelte';
 	import Prepinac from './Prepinac.svelte';
@@ -167,8 +166,9 @@
 	// Bublina neaktivního 🗑, nebo '' — odebrat jde jen vypnutý ovladač.
 	const neodebrat = $derived(procNeodebrat(p.state, maVsechnyKlavesy(klavesy.vazby, pad)));
 
+	// Klávesy i kartu odebere backend (karta se ukládá, OQ 52).
 	async function odebrat(): Promise<void> {
-		if (await odeberOvladac(pad)) zapomenPridany(pad);
+		await odeberOvladac(pad);
 	}
 </script>
 

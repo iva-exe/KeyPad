@@ -74,6 +74,7 @@ describe('zlaté soubory smlouvy', () => {
 	test('klavesy: tvar', () => {
 		expect(klice(klavesyJson)).toEqual([
 			'chyby',
+			'karty',
 			'konfigurace',
 			'rev',
 			'vazby',
@@ -83,6 +84,11 @@ describe('zlaté soubory smlouvy', () => {
 			'zpet'
 		]);
 		jeCislo(klavesy.rev);
+		expect(klice(klavesy.karty)).toEqual(['pady', 'rev']);
+		jeCislo(klavesy.karty.rev);
+		expect(klavesy.karty.pady[0]).toBe(0);
+		for (const p of klavesy.karty.pady) jeCislo(p);
+		expect(klavesy.karty.pady).toEqual([...klavesy.karty.pady].sort((a, b) => a - b));
 		jeKlavesa(klavesy.zkratka, true);
 		expect(typeof klavesy.zpet).toBe('boolean');
 		expect(['ok', 'obnovena', 'novejsi', 'necitelna', 'neulozena']).toContain(klavesy.konfigurace);
@@ -284,7 +290,7 @@ describe('karty', () => {
 		expect(viditelneKarty([], vypnute, [])).toEqual([0]);
 	});
 
-	test('s klávesami, zapnutý, přidaný', () => {
+	test('s klávesami, zapnutý, uložená karta', () => {
 		expect(viditelneKarty([{ pad: 2 }], vypnute, [])).toEqual([0, 2]);
 		expect(viditelneKarty([], ['off', 'off', 'off', 'on'], [])).toEqual([0, 3]);
 		expect(viditelneKarty([], ['off', 'connecting', 'off', 'off'], [])).toEqual([0, 1]);
@@ -301,8 +307,9 @@ describe('karty', () => {
 		expect(viditelneKarty([{ pad: 7 }], vypnute, [-1, 4])).toEqual([0]);
 	});
 
-	test('zlatý soubor: ovladače 1 a 2', () => {
+	test('zlatý soubor: ovladače 1 a 2 s klávesami, 4 jen s uloženou kartou (OQ 52)', () => {
 		expect(viditelneKarty(klavesy.vazby, vypnute, [])).toEqual([0, 1]);
+		expect(viditelneKarty(klavesy.vazby, vypnute, klavesy.karty.pady)).toEqual([0, 1, 3]);
 	});
 
 	test('další karta', () => {

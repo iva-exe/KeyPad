@@ -22,6 +22,7 @@ import klavesyJson from './testdata/klavesy.json';
 import ziveJson from './testdata/zive.json';
 import type {
 	Cil,
+	KartyInfo,
 	Klavesa,
 	KlavesyInfo,
 	Oznameni,
@@ -150,6 +151,20 @@ if (adresa.get('karty') === '4') {
 	vazby.sort((a, b) => poradi(a) - poradi(b));
 }
 let rev = klavesyJson.rev;
+/** Ovladače s kartou (OQ 52) — jako backend: 0 vždy, ovladač s klávesami taky. */
+const karty = new Set<number>([0, ...vazby.map((v) => v.pad)]);
+let kartyRev = 0;
+
+function kartyInfo(): KartyInfo {
+	return { rev: kartyRev, pady: [...karty].sort((a, b) => a - b) };
+}
+
+function pridejKartu(pad: number): void {
+	if (karty.has(pad)) return;
+	karty.add(pad);
+	kartyRev++;
+}
+
 /** Mapování před poslední změnou — pro „Zpět" (jen přesný předchůdce). */
 let predchozi: { rev: number; vazby: Vazba[] } | null = null;
 let konfigurace = (adresa.get('konfigurace') ?? 'ok') as StavKonfigurace;
@@ -225,7 +240,8 @@ function klavesyInfo(): KlavesyInfo {
 		chyby:
 			konfigurace === 'obnovena' || konfigurace === 'necitelna'
 				? ['řádek 7: expected value', 'vazba č. 3: neznámý vstup "skok"']
-				: []
+				: [],
+		karty: kartyInfo()
 	};
 }
 
@@ -396,6 +412,8 @@ function ohlasPad(pad: number): void {
 function uprav(z: ZmenaKlaves): void {
 	switch (z.typ) {
 		case 'vyprazdnit': {
+			// Karta s poslední klávesou nezmizí — schová ji jen 🗑 (OQ 52).
+			pridejKartu(z.pad);
 			const zbyle = vazby.filter((v) => !(v.pad === z.pad && v.vstup === z.vstup));
 			if (zbyle.length === vazby.length) return;
 			if (zbyle.length === 0) throw 'Poslední klávesu nejde odebrat.';
@@ -450,7 +468,14 @@ function obsluz(prikaz: string, a: Record<string, unknown>): unknown {
 			const zbyle = vazby.filter((v) => v.pad !== pad);
 			if (zbyle.length === 0) throw 'Nejdřív dej klávesy jinému ovladači.';
 			if (zbyle.length !== vazby.length) zmenVazby(zbyle);
-			return null;
+			if (karty.delete(pad)) kartyRev++;
+			return kartyInfo();
+		}
+		case 'pridej_kartu': {
+			const pad = cislo(a.pad);
+			if (pad === 0) throw 'Ovladač 1 má kartu vždy.';
+			pridejKartu(pad);
+			return kartyInfo();
 		}
 		case 'pad_on': {
 			const pad = cislo(a.pad);

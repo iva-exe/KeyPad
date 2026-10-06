@@ -25,14 +25,18 @@
 //! výstupem aplikace (sloty padů, atomiky okna, `SetEvent`), bez živé
 //! detekce i s ní (okno v popředí). Hook se do systému NEinstaluje,
 //! klávesy jsou syntetické a nikam nejdou. Vypíše p50/p99 a skončí
-//! chybou, když p99 přeleze 20 µs.
+//! chybou, když p99 přeleze 20 µs. Pro rozbor navíc cenu snímku
+//! klávesnice na téhle ploše (smyčka hook vlákna, ne callback, OQ 57):
+//! jen čte stav klávesnice do zahozeného enginu, nic nevypisuje.
 //!
 //! `mereni-instalace` (Fáze 6, riziko 2 a otázka 42): kolik stojí
 //! instalace a odebrání hooku — bez zapnutého ovladače se to děje při
 //! každém získání a ztrátě popředí oknem KeyPadu (Alt+Tab). Hook se
 //! instaluje na VLASTNÍ SKRYTÉ PLOŠE: LL hook vidí jen vstup plochy,
 //! na které běží jeho vlákno, a ta se nikdy nezobrazí — klávesnice
-//! vlastníka k němu nedojde. Callback jen předává dál.
+//! vlastníka k němu nedojde. Callback jen předává dál. Navíc změří
+//! snímek klávesnice, který v aplikaci každou instalaci doprovází (OQ 57)
+//! — na téže skryté ploše, kde Windows stav klávesnice nevracejí.
 //!
 //! Hook, výstup, sloty i názvy kláves jsou TYTÉŽ soubory, které používá
 //! aplikace (`#[path]`).
@@ -301,9 +305,8 @@ fn percentil(serazene: &[u64], q: f64) -> u64 {
     serazene.get(i).copied().unwrap_or(0)
 }
 
-/// Virtuální klávesa, jakou by událost nesla ve skutečném callbacku:
-/// dotaz Windows na neplatnou nulu může být levnější než na skutečnou
-/// klávesu a měření by pak slibovalo víc, než platí.
+/// Virtuální klávesa, jakou by událost nesla ve skutečném callbacku —
+/// podle ní callback sleduje Win (bity pravidla Win+klávesa).
 fn vk_klavesy(k: KeyId) -> u32 {
     let scan = u32::from(k.scan) | if k.extended { 0xE000 } else { 0 };
     // SAFETY: jen převod kódu podle rozložení klávesnice, nic nemění.
@@ -329,27 +332,23 @@ fn mereni() -> ExitCode {
         Mapping::default(),
         Arc::clone(&vystup),
         true,
-        true,
         vk_klavesy,
     );
     println!(
         "Měření zpracování události (syntetické klávesy, hook se neinstaluje), {MERENI_N} událostí:"
     );
     let mut v_limitu = true;
-    // Třetí řádek jen pro rozbor: bez dotazu na stav klávesnice Windows
-    // (GetAsyncKeyState — pravidlo Win+klávesa a převzetí klávesy OS),
-    // tedy kolik stojí samotný KeyPad. Do limitu se nepočítá.
-    for (zive, stav_klavesnice, popis) in [
-        (false, true, "bez živé detekce             "),
-        (true, true, "s živou detekcí (popředí)    "),
-        (true, false, "s živou, bez GetAsyncKeyState"),
+    // Na stav klávesnice se callback od opravy OQ 57 neptá vůbec —
+    // dřívější třetí řádek „bez GetAsyncKeyState" je teď první dva.
+    for (zive, popis) in [
+        (false, "bez živé detekce         "),
+        (true, "s živou detekcí (popředí)"),
     ] {
         let mut casy = hook::zmer_zpracovani(
             MERENI_N,
             Mapping::default(),
             Arc::clone(&vystup),
             zive,
-            stav_klavesnice,
             vk_klavesy,
         );
         casy.sort_unstable();
@@ -360,10 +359,21 @@ fn mereni() -> ExitCode {
         println!(
             "  {popis}  p50 {p50:>6} ns   p99 {p99:>6} ns   p99,9 {p999:>7} ns   max {max:>8} ns"
         );
-        if stav_klavesnice {
-            v_limitu &= p99 < MERENI_P99_NS;
-        }
+        v_limitu &= p99 < MERENI_P99_NS;
     }
+    // Snímek klávesnice (smyčka hook vlákna po instalaci hooku a po
+    // zapomenutí, ne callback) na téhle ploše — na skryté ploše
+    // `mereni-instalace` jde Windows pomalejší cestou. Jen čte stav
+    // klávesnice do zahozeného enginu, nic nevypisuje ani nevstřikuje.
+    // Do limitu se nepočítá (neběží v callbacku).
+    let mut snimky = hook::zmer_snimek(2_000, Mapping::default(), Arc::clone(&vystup));
+    snimky.sort_unstable();
+    println!(
+        "  snímek klávesnice (smyčka)  p50 {:>6} ns   p99 {:>6} ns   max {:>8} ns",
+        percentil(&snimky, 0.50),
+        percentil(&snimky, 0.99),
+        snimky.last().copied().unwrap_or(0)
+    );
     if v_limitu {
         println!("p99 pod {} µs — v pořádku", MERENI_P99_NS / 1000);
         ExitCode::SUCCESS
@@ -382,10 +392,18 @@ unsafe extern "system" fn propust(code: i32, wparam: WPARAM, lparam: LPARAM) -> 
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
+/// Kolik snímků klávesnice se změří v `mereni-instalace`.
+const SNIMKY_N: usize = 2_000;
+
 /// Instalace a odebrání hooku na skryté ploše: časy v ns (instalace,
-/// odebrání) pro každé kolo. Vlákno se na plochu přesune dřív, než
-/// vytvoří jakékoli okno nebo hook (jinak `SetThreadDesktop` selže).
-fn zmer_instalace(n: usize) -> Result<Vec<(u64, u64)>, String> {
+/// odebrání) pro každé kolo, a pak časy snímku klávesnice, který každou
+/// instalaci v aplikaci doprovází. Vlákno se na plochu přesune dřív, než
+/// vytvoří jakékoli okno nebo hook (jinak `SetThreadDesktop` selže);
+/// skrytá plocha není vstupní, takže snímek skutečnou klávesnici
+/// vlastníka nečte (Windows tam vrací nuly, cena volání je stejná).
+type Casy = (Vec<(u64, u64)>, Vec<u64>);
+
+fn zmer_instalace(n: usize) -> Result<Casy, String> {
     let jmeno = HSTRING::from(format!("KeyPadMereni{}", std::process::id()));
     // SAFETY: nová plocha s výchozími právy; handle zůstává otevřený po
     // celé měření (SetThreadDesktop ho potřebuje) a zavře se na konci.
@@ -420,14 +438,18 @@ fn zmer_instalace(n: usize) -> Result<Vec<(u64, u64)>, String> {
         // SAFETY: platný ukazatel na MSG.
         while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {}
     }
+    let vystup: Arc<dyn Vystup> = Arc::new(Fronta::new());
+    // Zahřátí se nepočítá.
+    let _ = hook::zmer_snimek(100, Mapping::default(), Arc::clone(&vystup));
+    let snimky = hook::zmer_snimek(SNIMKY_N, Mapping::default(), vystup);
     // Plochu zavře až konec vlákna (je mu přiřazená); handle se zahodí
     // s procesem. Plocha zanikne s posledním handlem a vláknem.
-    Ok(casy)
+    Ok((casy, snimky))
 }
 
 fn mereni_instalace() -> ExitCode {
     let vysledek = std::thread::spawn(|| zmer_instalace(INSTALACE_N)).join();
-    let casy = match vysledek {
+    let (casy, snimky) = match vysledek {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
             eprintln!("měření nejde: {e}");
@@ -458,8 +480,13 @@ fn mereni_instalace() -> ExitCode {
         casy.iter().map(|c| c.0 + c.1).collect(),
     );
     println!(
-        "Bez zapnutého ovladače: 1 instalace, když okno KeyPadu získá popředí, 1 odebrání, \
-         když ho ztratí (se schovaným oknem ani se zapnutým ovladačem žádné)."
+        "Snímek klávesnice po instalaci (smyčka hook vlákna, ne callback; {SNIMKY_N} snímků, \
+         GetAsyncKeyState přes všechny virtuální klávesy):"
+    );
+    radek("snímek", snimky);
+    println!(
+        "Bez zapnutého ovladače: 1 instalace (+ snímek), když okno KeyPadu získá popředí, \
+         1 odebrání, když ho ztratí (se schovaným oknem ani se zapnutým ovladačem žádné)."
     );
     ExitCode::SUCCESS
 }

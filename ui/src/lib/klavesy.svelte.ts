@@ -9,6 +9,7 @@
 // když se nějaké ztratí (`mezera`), okno si načte všechno znovu.
 import type {
 	Cil,
+	KartyInfo,
 	Klavesa,
 	KlavesyInfo,
 	Oznameni,
@@ -19,7 +20,6 @@ import type {
 	Vstup,
 	ZmenaKlaves
 } from './smlouva';
-import { pridej } from './pady.svelte';
 import { poslouchej, textChyby, zavolej } from './tauri';
 import { KRATKE, MAX_PADU, textOdmitnuti, textPresunu, VSTUPY } from './vstupy';
 import { nactiZive } from './zive.svelte';
@@ -35,7 +35,14 @@ export const klavesy = $state({
 	zpet: false,
 	konfigurace: 'ok' as StavKonfigurace,
 	zaloha: null as string | null,
-	chyby: [] as string[]
+	chyby: [] as string[],
+	/**
+	 * Ovladače s kartou (uložené v backendu, OQ 52) — karta zůstane i bez
+	 * kláves a po restartu, zmizí jen 🗑.
+	 */
+	karty: [0] as number[],
+	/** Pořadí seznamu karet; −1 = zatím nenačteno. */
+	kartyRev: -1
 });
 
 export const rezim = $state({
@@ -241,6 +248,37 @@ function prevezmiKlavesy(k: KlavesyInfo): void {
 	klavesy.konfigurace = k.konfigurace;
 	klavesy.zaloha = k.zaloha ?? null;
 	klavesy.chyby = k.chyby ?? [];
+	prevezmiKarty(k.karty);
+}
+
+/**
+ * Seznam karet od backendu. Odpověď příkazu a načtení kláves se můžou
+ * předběhnout — starší seznam se zahodí (`rev`).
+ */
+function prevezmiKarty(k: KartyInfo | null | undefined): void {
+	if (!k || !Array.isArray(k.pady) || k.rev < klavesy.kartyRev) return;
+	klavesy.kartyRev = k.rev;
+	klavesy.karty = [...k.pady];
+}
+
+/** Karta hned v okně, dřív než odpoví backend (ten ji uloží a potvrdí). */
+function ukazKartu(pad: number): void {
+	if (!klavesy.karty.includes(pad)) klavesy.karty = [...klavesy.karty, pad];
+}
+
+/**
+ * „+ Ovladač": karta ovladače i bez kláves. Backend ji uloží (OQ 52) —
+ * zůstane i po restartu, zmizí jen 🗑. Nic nepřipojí (princip 11).
+ */
+export async function pridejKartu(pad: number): Promise<void> {
+	ukazKartu(pad);
+	try {
+		prevezmiKarty(await zavolej<KartyInfo>('pridej_kartu', { pad }));
+	} catch (e) {
+		ukazZpravu(pad, textChyby(e), { chyba: true });
+		// Okno ukáže, co backend opravdu má.
+		void nactiKlavesy();
+	}
 }
 
 function prevezmiOznameni(o: Oznameni): void {
@@ -368,11 +406,10 @@ async function uprav(zmena: ZmenaKlaves, pad: number): Promise<boolean> {
 export async function vyprazdni(pad: number, vstup: Vstup): Promise<void> {
 	const pred = klavesy.rev;
 	// Karta, se kterou uživatel pracuje, zůstane až do 🗑, i když jí
-	// vyprázdní poslední klávesu. Ovladač s klávesami z config.json
-	// mezi přidanými v sezení není — jeho karta by po poslední klávese
-	// zmizela i se zprávou a „Zpět" (kap. 0: karta přidaná v sezení).
-	// Předem, ne po odpovědi: nové klávesy se můžou načíst dřív.
-	pridej(pad);
+	// vyprázdní poslední klávesu — backend ji při vyprázdnění uloží mezi
+	// karty (OQ 52). Tady jen předem, ne po odpovědi: nové klávesy se
+	// můžou načíst dřív a karta by na okamžik zmizela i se zprávou.
+	ukazKartu(pad);
 	if (await uprav({ typ: 'vyprazdnit', pad, vstup }, pad)) {
 		ukazZpravu(pad, `Vyprázdněno: ${KRATKE[vstup]}`, { zpet: true, ms: ZPET_MS, revPred: pred });
 	}
@@ -442,10 +479,10 @@ export function napovedaKarty(pad: number, pocet: number): Napoveda | null {
 	return null;
 }
 
-/** Odebere vypnutý ovladač 2–4 i s jeho klávesami. */
+/** Odebere vypnutý ovladač 2–4 i s jeho klávesami a kartou. */
 export async function odeberOvladac(pad: number): Promise<boolean> {
 	try {
-		await zavolej('odeber_ovladac', { pad });
+		prevezmiKarty(await zavolej<KartyInfo>('odeber_ovladac', { pad }));
 		return true;
 	} catch (e) {
 		ukazZpravu(pad, textChyby(e), { chyba: true });

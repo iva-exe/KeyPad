@@ -81,6 +81,20 @@ export interface KlavesyInfo {
 	 * a `necitelna`, jinak prázdné.
 	 */
 	chyby: string[];
+	/** Ovladače s kartou v okně (uložené v config.json, OQ 52). */
+	karty: KartyInfo;
+}
+
+/**
+ * Karty ovladačů v okně — ukládají se (OQ 52, rozhodl vlastník 6. 10.):
+ * karta zůstane i bez kláves a po restartu, zmizí jen 🗑. Část `klavesy`
+ * a odpověď příkazů `pridej_kartu` a `odeber_ovladac`.
+ */
+export interface KartyInfo {
+	/** Pořadí změny — starší seznam (odpověď po novější) se zahodí. */
+	rev: number;
+	/** Ovladače od 0, vzestupně; 0 vždy a ovladač s klávesami taky. */
+	pady: number[];
 }
 
 export type Rezim = 'disabled' | 'paused' | 'capturing' | 'binding' | 'no_hook';

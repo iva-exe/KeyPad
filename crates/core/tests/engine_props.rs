@@ -107,6 +107,14 @@ enum Op {
     /// Ovladač, důvod.
     Disable(usize, u8),
     Enable(usize),
+    /// Key-up, který hook neviděl (okno s právy správce v popředí, OQ 39):
+    /// klávesu pustí jen Windows. Jen u stisku, který Windows viděly —
+    /// ztracený key-up klávesy ovladače řeší pravidlo ztraceného key-upu.
+    LostRelease(usize),
+    /// Srovnání se stavem Windows na začátku přiřazování: klávesy OS, které
+    /// Windows nedrží, se zapomenou (`forget_os_key`) a ty, které drží
+    /// a engine o nich neví, se převezmou (snímek).
+    Reconcile,
     /// 0 = výchozí (vše na prvním ovladači); 1 = jiná zkratka (X), dvě
     /// klávesy na jednom směru, část kláves na druhém ovladači (SOCD
     /// pár); 2 = Esc namapovaný, zkratka na levém Shiftu, klávesy na
@@ -149,6 +157,8 @@ fn op() -> impl Strategy<Value = Op> {
         2 => (0..MAX_PADS, 0..3u8).prop_map(|(p, r)| Op::Disable(p, r)),
         4 => (0..MAX_PADS).prop_map(Op::Enable),
         1 => (0..4u8).prop_map(Op::SetMapping),
+        1 => (0..n).prop_map(Op::LostRelease),
+        1 => Just(Op::Reconcile),
     ]
 }
 
@@ -494,7 +504,7 @@ impl Model {
     }
 
     /// Klávesa, kterou drží OS a model o ní neví, se zapíše jako OS
-    /// (co dělá hook podle asynchronního stavu klávesnice).
+    /// (co dělá snímek klávesnice hooku po zapomenutí, OQ 57).
     fn adopt_os(&mut self, key: KeyId, now: u64) -> bool {
         if !mappable(key) || self.held.contains_key(&key) {
             return false;
@@ -508,6 +518,19 @@ impl Model {
                 last: now,
             },
         );
+        true
+    }
+
+    /// Klávesa OS, kterou Windows podle srovnání nedrží, se zapomene
+    /// i s ťuknutím, které na ni čeká. Ostatní vlastníci zůstávají.
+    fn forget_os(&mut self, key: KeyId) -> bool {
+        if self.held.get(&key).is_none_or(|h| h.owner != Owner::Os) {
+            return false;
+        }
+        self.held.remove(&key);
+        if self.tap == Some(key) {
+            self.tap = None;
+        }
         true
     }
 
@@ -800,11 +823,15 @@ struct Press {
     /// Rozhodnutí o potlačení při key-down.
     suppressed: bool,
     /// Engine záznam o stisku zapomněl (reset_held). Stisk, který OS
-    /// viděl, hook při dalším autorepeatu ohlásí jako klávesu OS (dál se
-    /// kontroluje). Spolknutý stisk je pro engine nový — jeho key-up jde
-    /// do OS, i když key-down nešel; ten se na principu 2 nekontroluje
-    /// (neškodný key-up navíc).
+    /// viděl, hned převezme snímek klávesnice jako klávesu OS (příznak
+    /// zase zhasne a dál se kontroluje). Zůstane jen u spolknutého stisku
+    /// — ten je pro engine nový a jeho key-up jde do OS, i když key-down
+    /// nešel; na principu 2 se nekontroluje (neškodný key-up navíc).
     forgotten: bool,
+    /// Klávesu fyzicky pustil uživatel a key-up dostaly jen Windows, hook
+    /// ho neviděl (`Op::LostRelease`). Engine o ní dál ví jako o klávese
+    /// OS, dokud ji nezapomene srovnání nebo nepřijde další událost.
+    lost: bool,
     /// Čas poslední události (kvůli pravidlu ztraceného key-upu).
     last: u64,
 }
@@ -950,7 +977,32 @@ impl World {
                 let ui = self.m.force(ForceReason::SessionLock);
                 self.m.held.clear();
                 self.m.emit_all = true;
-                (self.e.reset_held(ForceReason::SessionLock), ui)
+                let d = self.e.reset_held(ForceReason::SessionLock);
+                // Hned po zapomenutí udělá hook snímek klávesnice (mimo
+                // callback, OQ 57): klávesy, které OS drží (viděl jejich
+                // key-down), převezme jako klávesy OS — autorepeat
+                // i key-up pak jdou dál do OS a nic nevisí (princip 2
+                // platí i přes zapomenutí). Spolknutý stisk OS nedrží,
+                // takže ho snímek nevidí: pro engine je pak nový stisk.
+                // Puštěnou jen ve Windows (ztracený key-up) snímek nevidí
+                // a engine ji právě zapomněl: fyzicky už není dole.
+                self.physical.retain(|_, p| !p.lost);
+                let mut drzi_os: Vec<KeyId> = self
+                    .physical
+                    .iter()
+                    .filter(|(_, p)| !p.suppressed)
+                    .map(|(&k, _)| k)
+                    .collect();
+                drzi_os.sort();
+                for k in drzi_os {
+                    let a = self.e.adopt_os_key(k, now);
+                    let b = self.m.adopt_os(k, now);
+                    prop_assert_eq!(a, b, "snímek převzal {}", k);
+                    if let Some(p) = self.physical.get_mut(&k) {
+                        p.forgotten = false;
+                    }
+                }
+                (d, ui)
             }
             Op::Disable(p, r) => {
                 let reason = match r {
@@ -964,6 +1016,39 @@ impl World {
             Op::Enable(p) => {
                 let pad = pad_nr(p);
                 (self.e.enable(pad), self.m.enable(pad))
+            }
+            Op::LostRelease(i) => {
+                if let Some(p) = self
+                    .physical
+                    .get_mut(&KEYS[i])
+                    .filter(|p| !p.suppressed && !p.forgotten)
+                {
+                    p.lost = true;
+                }
+                return Ok(());
+            }
+            Op::Reconcile => {
+                // Windows drží právě klávesy, jejichž stisk viděly a které
+                // ještě nepustily.
+                for k in KEYS {
+                    let drzi_os = self
+                        .physical
+                        .get(&k)
+                        .is_some_and(|p| !p.suppressed && !p.lost);
+                    if drzi_os {
+                        let a = self.e.adopt_os_key(k, now);
+                        let b = self.m.adopt_os(k, now);
+                        prop_assert_eq!(a, b, "srovnání převzalo {}", k);
+                    } else {
+                        let a = self.e.forget_os_key(k);
+                        let b = self.m.forget_os(k);
+                        prop_assert_eq!(a, b, "srovnání zapomnělo {}", k);
+                    }
+                }
+                // Puštěné jen ve Windows: engine je zapomněl (nebo o nich
+                // nevěděl — nemapovatelné), fyzicky nejsou dole.
+                self.physical.retain(|_, p| !p.lost);
+                (Decision::NONE, None)
             }
             Op::SetMapping(v) => {
                 let (em, mm) = mapping_variant(v);
@@ -985,45 +1070,23 @@ impl World {
 
     fn press(&mut self, key: KeyId) -> Result<(Decision, Option<UiEvent>), TestCaseError> {
         let now = self.now;
-        // Klávesa, o které engine zapomněl (reset_held): hook se podívá
-        // do asynchronního stavu klávesnice. Drží-li ji OS (viděl její
-        // key-down), ohlásí ji enginu jako klávesu OS — autorepeat
-        // i key-up jdou pak dál do OS a nic nevisí (princip 2 platí
-        // i přes zapomenutí). Stisk, který OS neviděl (spolknutý), je
-        // pro engine nový stisk — LL hook autorepeat nerozliší.
-        //
-        // Hook se Windows ptá jen tehdy, když engine o novém stisku
-        // rozhoduje (`claims_new_press` — dotaz je drahý). Jinak musí
-        // převzetí i nový stisk dopadnout úplně stejně: ověří se na
-        // kopiích enginu, celým stavem.
-        if self.e.held(key).is_none() && !self.e.claims_new_press(key) {
-            let (mut prevzeti, mut novy) = (self.e.clone(), self.e.clone());
-            let _ = prevzeti.adopt_os_key(key, now);
-            let a = prevzeti.on_key(key, true, now);
-            let b = novy.on_key(key, true, now);
-            prop_assert_eq!(a, b, "převzetí × nový stisk {}", key);
-            prop_assert_eq!(
-                format!("{prevzeti:?}"),
-                format!("{novy:?}"),
-                "stav po převzetí × po novém stisku {}",
+        // Klávesa, o které engine zapomněl (reset_held): tu, kterou OS
+        // drží, převzal už snímek klávesnice při zapomenutí. Zbývá
+        // spolknutý stisk — ten OS neviděl a pro engine je to nový stisk
+        // (LL hook autorepeat nerozliší).
+        if let Some(p) = self.physical.get(&key).filter(|p| p.forgotten) {
+            prop_assert!(
+                p.suppressed,
+                "klávesu {} drží OS — měl ji převzít snímek",
                 key
             );
+            self.physical.remove(&key);
         }
-        match self.physical.get(&key).map(|p| (p.forgotten, p.suppressed)) {
-            Some((true, false)) => {
-                if self.e.claims_new_press(key) {
-                    let a = self.e.adopt_os_key(key, now);
-                    let b = self.m.adopt_os(key, now);
-                    prop_assert_eq!(a, b, "převzetí klávesy OS {}", key);
-                }
-                if let Some(p) = self.physical.get_mut(&key) {
-                    p.forgotten = false;
-                }
-            }
-            Some((true, true)) => {
-                self.physical.remove(&key);
-            }
-            _ => {}
+        // Klávesa puštěná jen ve Windows (ztracený key-up) je zase dole.
+        // Engine ji má pořád jako klávesu OS: stisk je pro něj autorepeat
+        // a jde Windows, stejně jako šel první stisk — nic nevisí.
+        if let Some(p) = self.physical.get_mut(&key) {
+            p.lost = false;
         }
         let (expected, want_ui) = self.m.key_down(key, now);
         let d = self.e.on_key(key, true, now);
@@ -1072,6 +1135,7 @@ impl World {
                     Press {
                         suppressed: d.suppress,
                         forgotten: false,
+                        lost: false,
                         last: now,
                     },
                 );

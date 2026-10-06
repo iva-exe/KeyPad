@@ -41,7 +41,7 @@ use keypad_core::{
 use serde::Deserialize;
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::config::{self, Konfigurace, StavKonfigurace, Ukladac};
+use crate::config::{self, Karty, Konfigurace, StavKonfigurace, Ukladac};
 use crate::platform::windows::hook::{
     ChybaUpravy, Hook, HookOdesilatel, HookPrikaz, Vystup, Zmena, WATCHDOG_MS,
 };
@@ -50,7 +50,9 @@ use crate::platform::windows::slot::Budik;
 use crate::platform::windows::vystup::{HookVystup, Rezim, RezimInfo, OZNAMENI_OBSAH};
 use crate::platform::windows::{klavesy, power, shell, zvuk};
 use crate::tray::TrayStav;
-use smlouva::{KlavesyInfo, KonfiguraceInfo, Oznameni, RevizeInfo, ZivaInfo, ZivyPad, ZmenaOkna};
+use smlouva::{
+    KartyInfo, KlavesyInfo, KonfiguraceInfo, Oznameni, RevizeInfo, ZivaInfo, ZivyPad, ZmenaOkna,
+};
 
 /// Tauri událost se změnou režimu (payload [`RezimInfo`]).
 pub const UDALOST_REZIM: &str = "rezim";
@@ -107,6 +109,11 @@ pub struct Zrcadlo {
     /// předchůdce (revize o jedna menší): jinak by vracel víc změn,
     /// než uživatel viděl.
     predchozi: Option<(u64, Arc<Mapping>)>,
+    /// Ovladače s kartou v okně (OQ 52) — ukládají se s klávesami.
+    karty: Karty,
+    /// Pořadí změny karet: odpověď příkazu a načtení kláves se můžou
+    /// předběhnout, starší seznam okno zahodí.
+    karty_rev: u64,
     konfigurace: StavKonfigurace,
     zaloha: Option<PathBuf>,
     /// Chyby nevalidního config.json ze startu — pro bublinu pruhu.
@@ -116,6 +123,7 @@ pub struct Zrcadlo {
 impl Zrcadlo {
     fn novy(
         m: Mapping,
+        karty: Karty,
         konfigurace: StavKonfigurace,
         zaloha: Option<PathBuf>,
         chyby: Vec<String>,
@@ -124,9 +132,34 @@ impl Zrcadlo {
             rev: 0,
             mapovani: Arc::new(m),
             predchozi: None,
+            karty,
+            karty_rev: 0,
             konfigurace,
             zaloha,
             chyby,
+        }
+    }
+
+    /// Karty po změně: `zmen` vrátí, jestli se něco změnilo — pak roste
+    /// pořadí. Vrací, jestli je co ukládat.
+    fn zmen_karty(&mut self, zmen: impl FnOnce(&mut Karty) -> bool) -> bool {
+        let zmeneno = zmen(&mut self.karty);
+        if zmeneno {
+            self.karty_rev += 1;
+        }
+        zmeneno
+    }
+
+    fn karty_info(&self) -> KartyInfo {
+        KartyInfo::z(self.karty_rev, self.karty)
+    }
+
+    /// Co se uloží: mapování a karty ze zrcadla, zvuk podle nabídky.
+    fn konfigurace(&self, zvuk: bool) -> Konfigurace {
+        Konfigurace {
+            mapovani: (*self.mapovani).clone(),
+            zvuk,
+            karty: self.karty,
         }
     }
 
@@ -246,6 +279,7 @@ pub fn spust(app: &tauri::App, nacteno: config::Nacteno) -> Result<(), String> {
     // taky), ukládá se až skutečná změna.
     let klavesy_zrcadlo = Arc::new(Mutex::new(Zrcadlo::novy(
         mapovani,
+        nacteno.konfigurace.karty,
         nacteno.stav,
         nacteno.zaloha.clone(),
         nacteno.chyby.clone(),
@@ -535,12 +569,10 @@ impl VlaknoOkna {
         if !z.prevezmi(rev, m) {
             return;
         }
-        // Pod zámkem zrcadla: „✓ Zvuk" ukládá taky pod ním, takže
-        // poslední uložení má vždy nejnovější mapování i zvuk.
-        self.ukladac.uloz(Konfigurace {
-            mapovani: (*z.mapovani).clone(),
-            zvuk: self.zvuk.load(Ordering::Acquire),
-        });
+        // Pod zámkem zrcadla: „✓ Zvuk" a karty ukládají taky pod ním,
+        // takže poslední uložení má vždy nejnovější mapování, karty i zvuk.
+        self.ukladac
+            .uloz(z.konfigurace(self.zvuk.load(Ordering::Acquire)));
         drop(z);
         let _ = self.app.emit(UDALOST_KLAVESY, RevizeInfo { rev });
     }
@@ -589,10 +621,7 @@ pub fn zvuk_z_nabidky(app: &AppHandle, zapnuto: bool) {
         o.zvuk.store(zapnuto, Ordering::Release);
         log::info!("zvuk {}", if zapnuto { "zapnutý" } else { "vypnutý" });
         let z = zamkni(&o.klavesy);
-        o.ukladac.uloz(Konfigurace {
-            mapovani: (*z.mapovani).clone(),
-            zvuk: zapnuto,
-        });
+        o.ukladac.uloz(z.konfigurace(zapnuto));
     }
 }
 
@@ -810,12 +839,13 @@ pub fn rezim(o: tauri::State<'_, Ovladani>) -> RezimInfo {
 /// má rozložení okna (přepnutí jazyka v okně se tak projeví).
 #[tauri::command]
 pub fn klavesy(o: tauri::State<'_, Ovladani>) -> KlavesyInfo {
-    let (rev, m, zpet, konfigurace, zaloha, chyby) = {
+    let (rev, m, zpet, karty, konfigurace, zaloha, chyby) = {
         let z = zamkni(&o.klavesy);
         (
             z.rev,
             Arc::clone(&z.mapovani),
             z.lze_vratit().is_some(),
+            z.karty_info(),
             z.konfigurace,
             z.zaloha.clone(),
             z.chyby.clone(),
@@ -825,11 +855,41 @@ pub fn klavesy(o: tauri::State<'_, Ovladani>) -> KlavesyInfo {
         rev,
         &m,
         zpet,
+        karty,
         konfigurace,
         zaloha.as_deref(),
         &chyby,
         klavesy::nazev,
     )
+}
+
+/// Ovladač 2–4 z okna (karty ovladače 1 se nikdo netýkají).
+fn druhy_az_ctvrty(pad: u8) -> Result<PadId, String> {
+    if pad == 0 {
+        return Err("Ovladač 1 má kartu vždy.".into());
+    }
+    PadId::new(usize::from(pad)).ok_or_else(|| NENI_OVLADAC.into())
+}
+
+/// Karty se změnily: uložit (pod zámkem zrcadla, ať poslední uložení má
+/// nejnovější mapování i karty) a vrátit nový seznam oknu.
+fn uloz_karty(o: &Ovladani, z: &Zrcadlo) -> KartyInfo {
+    o.ukladac
+        .uloz(z.konfigurace(o.zvuk.load(Ordering::Acquire)));
+    z.karty_info()
+}
+
+/// „+ Ovladač": karta ovladače 2–4 i bez kláves. Uloží se (OQ 52 —
+/// karta zůstane i po restartu, zmizí jen 🗑). Nic nepřipojí (princip 11).
+#[tauri::command]
+pub fn pridej_kartu(o: tauri::State<'_, Ovladani>, pad: u8) -> Result<KartyInfo, String> {
+    let id = druhy_az_ctvrty(pad)?;
+    let mut z = zamkni(&o.klavesy);
+    if !z.zmen_karty(|k| k.pridej(id)) {
+        return Ok(z.karty_info());
+    }
+    log::info!("karty: ovladač {} přidán", pad + 1);
+    Ok(uloz_karty(&o, &z))
 }
 
 /// Živý stav vstupů (snímek po návratu okna; změny chodí událostí
@@ -875,6 +935,14 @@ pub fn uprav_klavesy(o: tauri::State<'_, Ovladani>, zmena: ZmenaOkna) -> Result<
     let (z, popis) = match zmena {
         ZmenaOkna::Vyprazdnit { pad, vstup } => {
             let cil = cil_z_okna(pad, &vstup)?;
+            // Karta, se kterou uživatel pracuje, s poslední klávesou
+            // nezmizí — schová ji jen 🗑 (OQ 52). Dřív, než se změní
+            // klávesy: okno si je po změně načte i s kartami.
+            let mut zr = zamkni(&o.klavesy);
+            if zr.zmen_karty(|k| k.pridej(cil.pad)) {
+                let _ = uloz_karty(&o, &zr);
+            }
+            drop(zr);
             (
                 Zmena::VyprazdniVstup(cil),
                 format!(
@@ -908,9 +976,10 @@ pub fn uprav_klavesy(o: tauri::State<'_, Ovladani>, zmena: ZmenaOkna) -> Result<
 
 /// 🗑 Odebrat ovladač 2–4 (v okně až po potvrzení): jen vypnutý, a jen
 /// když mapování nezůstane prázdné. Plán → provedení → ověření: stav
-/// i pravidla kontroluje backend, okno jen zašedí tlačítko.
+/// i pravidla kontroluje backend, okno jen zašedí tlačítko. Klávesy
+/// i karta pryč (uloží se); vrací nový seznam karet.
 #[tauri::command(async)]
-pub fn odeber_ovladac(o: tauri::State<'_, Ovladani>, pad: u8) -> Result<(), String> {
+pub fn odeber_ovladac(o: tauri::State<'_, Ovladani>, pad: u8) -> Result<KartyInfo, String> {
     if pad == 0 {
         return Err("Ovladač 1 nejde odebrat.".into());
     }
@@ -924,8 +993,14 @@ pub fn odeber_ovladac(o: tauri::State<'_, Ovladani>, pad: u8) -> Result<(), Stri
         }
         r => {
             text_upravy(r)?;
+            let mut z = zamkni(&o.klavesy);
+            let karty = if z.zmen_karty(|k| k.odeber(id)) {
+                uloz_karty(&o, &z)
+            } else {
+                z.karty_info()
+            };
             log::info!("klávesy: ovladač {} odebrán", pad + 1);
-            Ok(())
+            Ok(karty)
         }
     }
 }
@@ -945,12 +1020,13 @@ pub fn test_klavesa(
         return Err("Testovací klávesy jsou vypnuté.".into());
     }
     let klavesa = keypad_core::KeyId { scan, extended: e0 };
-    // VK se v testu nečte: hook má místo stavu klávesnice podvrh.
+    // VK jako u skutečné události: podle ní hook sleduje Win (OQ 44)
+    // a test okna tak ověří i pravidlo Win+klávesa bez dotazu na Windows.
     posli_hooku(
         &o,
         HookPrikaz::TestKlavesa {
             klavesa,
-            vk: 0,
+            vk: klavesy::vk(klavesa),
             dolu,
         },
     )
@@ -1266,7 +1342,13 @@ mod tests {
         let m0 = Mapping::default();
         let m1 = bez(&m0, KeyId::W);
         let m3 = bez(&m1, KeyId::A);
-        let mut z = Zrcadlo::novy(m0.clone(), StavKonfigurace::Ok, None, Vec::new());
+        let mut z = Zrcadlo::novy(
+            m0.clone(),
+            Karty::PRVNI,
+            StavKonfigurace::Ok,
+            None,
+            Vec::new(),
+        );
         assert!(z.lze_vratit().is_none(), "po startu není co vrátit");
         assert!(z.prevezmi(1, Arc::new(m1.clone())));
         assert_eq!(z.lze_vratit().map(|m| (**m).clone()), Some(m0.clone()));
@@ -1279,6 +1361,38 @@ mod tests {
         assert!(z.prevezmi(4, Arc::new(m1.clone())));
         assert_eq!(z.lze_vratit().map(|m| (**m).clone()), Some(m3));
         assert_eq!(z.rev, 4);
+    }
+
+    /// Karty v zrcadle (OQ 52): pořadí roste jen se skutečnou změnou
+    /// (okno podle něj zahodí starší seznam), ovladač 1 se neodebere
+    /// a uložená konfigurace nese karty s mapováním ze zrcadla.
+    #[test]
+    fn karty_v_zrcadle() {
+        let p = |i| PadId::new(i).unwrap();
+        let mut z = Zrcadlo::novy(
+            Mapping::default(),
+            Karty::PRVNI,
+            StavKonfigurace::Ok,
+            None,
+            Vec::new(),
+        );
+        assert_eq!(z.karty_info().pady, vec![0]);
+        assert!(z.zmen_karty(|k| k.pridej(p(2))));
+        assert!(!z.zmen_karty(|k| k.pridej(p(2))), "už tam je");
+        assert!(!z.zmen_karty(|k| k.odeber(PadId::FIRST)), "ovladač 1 vždy");
+        let i = z.karty_info();
+        assert_eq!((i.rev, i.pady), (1, vec![0, 2]));
+        let k = z.konfigurace(false);
+        assert_eq!((k.karty, k.zvuk), (z.karty, false));
+        assert_eq!(k.mapovani, Mapping::default());
+        assert!(z.zmen_karty(|k| k.odeber(p(2))));
+        assert_eq!(z.karty_info().rev, 2);
+        assert_eq!(
+            druhy_az_ctvrty(0).map(PadId::index),
+            Err("Ovladač 1 má kartu vždy.".into())
+        );
+        assert_eq!(druhy_az_ctvrty(3).map(PadId::index), Ok(3));
+        assert!(druhy_az_ctvrty(4).is_err());
     }
 
     /// Chyby úprav jsou věty pro okno; prázdný vstup není chyba.
