@@ -664,8 +664,11 @@ impl Engine {
     /// Klávesa, kterou drží OS, ale engine o ní neví: hook neviděl její
     /// stisk (nainstaloval se, až když už byla dole, nebo `reset_held`
     /// zapomněl držené klávesy). Hook to zjistí jednorázovým snímkem
-    /// klávesnice MIMO callback, hned po instalaci a po zapomenutí —
-    /// v callbacku Windows hlásily dole i právě stisknutou klávesu (OQ 57).
+    /// klávesnice MIMO callback, hned po instalaci a po zapomenutí — stav
+    /// OS se mění až po hooku, takže o klávese, o které callback rozhoduje,
+    /// nic neřekne, a dotazy z callbacku dělaly ocas jeho ceny (OQ 57;
+    /// dřívější výklad, že kvůli nim nešlo přiřazovat, je nejspíš mylný,
+    /// OQ 60).
     /// Totéž pro nový stisk s drženou Win (Win+D patří Windows, OQ 44),
     /// tehdy PŘED [`Engine::on_key`].
     ///
@@ -1996,9 +1999,12 @@ mod tests {
     /// Klávesa převzatá jako klávesa Windows (snímek po instalaci hooku:
     /// držená před přiřazováním) se při přiřazování nepřiřadí — její
     /// autorepeat jde Windows. Po uvolnění se nový stisk přiřadí. Proto
-    /// hook převzetí nesmí dělat podle stavu klávesnice v callbacku: tam
-    /// Windows hlásily dole i právě stisknutou klávesu a nepřiřadilo se
-    /// nic, ani Esc nerušil (OQ 57).
+    /// hook převzetí nesmí dělat podle stavu klávesnice v callbacku: kdyby
+    /// Windows hlásily dole i právě stisknutou klávesu, převzala by se
+    /// a nepřiřadilo by se nic, ani Esc by nerušil. Stav OS se navíc mění
+    /// až po hooku, takže o rozhodované klávese nic neřekne, a dotazy
+    /// dělaly ocas ceny callbacku (OQ 57; výklad, že tohle u vlastníka
+    /// opravdu nastalo, je nejspíš mylný, OQ 60).
     #[test]
     fn prevzata_klavesa_se_neprirazuje_az_novy_stisk() {
         let mut e = Engine::new(Mapping::default());

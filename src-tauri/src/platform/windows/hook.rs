@@ -9,23 +9,34 @@
 //! a klávesy by šly do hry, i když má ovladač běžet.
 //!
 //! Co callback smí (Fáze 6, spec 2.3): zápis do slotů padů a do atomiků
-//! [`Vystup`]u (režim, oznámení, revize mapování, živý stav), `SetEvent`
+//! [`Vystup`]u (režim, oznámení, revize mapování, živý stav), přičtení do
+//! statických atomiků doručení ([`Doruceni`]) a při konci přiřazování
+//! v callbacku (Esc, uložení) i jejich čtení, `SetEvent`
 //! a `PostThreadMessageW` jen po panice do vlastní fronty. Nesmí kanál,
 //! `Mutex`, alokaci ani uvolnění, `log::`, `emit`, klon mapování — snímek
 //! mapování pro okno klonuje jen smyčka na povel [`HookPrikaz::Zverejni`]
-//! — a od opravy 6. 10. ani dotaz na stav klávesnice (`GetAsyncKeyState`):
-//! s oknem KeyPadu v popředí hlásil i klávesu, o které callback právě
-//! rozhoduje, takže se každý stisk převzal jako klávesa Windows a nešlo
-//! přiřadit nic (OQ 57). Klávesy, které Windows drží bez vědomí enginu,
-//! zjišťuje jednorázový snímek ve smyčce ([`snimek_klavesnice`]); na
-//! začátku přiřazování (okno KeyPadu ověřeně v popředí) navíc zapomene
-//! klávesy OS a bit Win, které Windows už nedrží — jejich key-up hook
-//! neviděl (okno s právy správce, OQ 39) a přiřazování by jinak nevzalo
-//! nic, ani Esc.
+//! — a od 6. 10. ani dotaz na stav klávesnice (`GetAsyncKeyState`): stav
+//! OS se mění až po hooku, takže o klávese, o které callback rozhoduje,
+//! nic neřekne, a právě dotazy dělaly ocas ceny callbacku (Fáze 6b).
+//! Klávesy, které Windows drží bez vědomí enginu, zjišťuje jednorázový
+//! snímek ve smyčce ([`snimek_klavesnice`]); na začátku přiřazování (okno
+//! KeyPadu ověřeně v popředí) navíc zapomene klávesy OS a bit Win, které
+//! Windows už nedrží — jejich key-up hook neviděl (okno s právy správce,
+//! OQ 39) a přiřazování by jinak nevzalo nic, ani Esc.
+//!
+//! Že přiřazování ve vydáních …1208 a …1504 nevzalo nic, nejspíš
+//! nezpůsoboval dotaz na stav klávesnice (výklad OQ 57), ale Raw Input:
+//! tao si zaregistroval klávesnici a s oknem vlastního procesu v popředí
+//! Windows LL hook téhož procesu podle cizích nálezů nevolají (OQ 60,
+//! [`super::raw_input`]). Přímo neověřeno — log …1504 („nepřiřazeno:
+//! nic") je silná nepřímá stopa, ne důkaz: některé stisky, souběh ani
+//! rozbitý engine se tehdy nepočítaly. Proto začátek přiřazování
+//! registraci ověří a řádek o konci přiřazování nese i počty doručení —
+//! kolikrát Windows callback vůbec zavolaly; potvrdí vlastník (Fáze 6c).
 //!
 //! Všechno ostatní (příkazy z okna, časovač přiřazování, snímek
-//! klávesnice, hlášení paniky a konce přiřazování do logu, popředí okna)
-//! dělá táž smyčka mimo callback.
+//! klávesnice, kontrola Raw Input, hlášení paniky a konce přiřazování do
+//! logu, popředí okna) dělá táž smyčka mimo callback.
 //!
 //! Vlákno s enginem běží celou dobu, samotný hook je ale v systému JEN
 //! tehdy, když ho engine potřebuje ([`potreba_hooku`]): je zapnutý aspoň
@@ -63,6 +74,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WH_KEYBOARD_LL, WINEVENT_OUTOFCONTEXT, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN,
     WM_SYSKEYUP, WM_TIMER,
 };
+
+// `super::`, ne `crate::platform::windows::` — soubor sdílí i příklad
+// `hook_selftest` (`#[path]`), kde moduly leží přímo v kořeni.
+use super::raw_input::RawInput;
 
 /// Ve frontě kanálu čekají příkazy (probuzení smyčky).
 const WM_PRIKAZ: u32 = WM_APP + 1;
@@ -569,7 +584,20 @@ struct Stav {
     /// než zkopíruje tep do slotu — watchdog tedy bere novější z obou,
     /// jinak by čerstvě zapnutý ovladač mohl hned vypadat zaseknutý.
     povoleno_ms: [u64; MAX_PADS],
+    /// Kontrola Raw Input klávesnice na začátku přiřazování ([`RAW_INPUT`]:
+    /// skutečná, v testech podvrh). Jen smyčka, nikdy callback.
+    raw_input: fn() -> RawInput,
+    /// Výsledek poslední kontroly — do řádku o konci přiřazování.
+    raw: RawInput,
 }
+
+/// Výchozí kontrola Raw Input: skutečná [`super::raw_input::kontrola`],
+/// v testech „ne". Registrace patří celému procesu a test `raw_input` ji
+/// mezitím souběžně mění — skutečná kontrola z testů hooku by mu ji rušila.
+#[cfg(not(test))]
+const RAW_INPUT: fn() -> RawInput = super::raw_input::kontrola;
+#[cfg(test)]
+const RAW_INPUT: fn() -> RawInput = || RawInput::Ne;
 
 impl Stav {
     fn novy(engine: Engine, vystup: Arc<dyn Vystup>, aktivni: fn(isize) -> bool) -> Stav {
@@ -590,6 +618,8 @@ impl Stav {
             win_ms: 0,
             instaluj: nainstaluj,
             povoleno_ms: [0; MAX_PADS],
+            raw_input: RAW_INPUT,
+            raw: RawInput::Nezjisteno,
         }
     }
 }
@@ -598,9 +628,11 @@ impl Stav {
 /// viděl key-down a key-up ještě ne (spolknuté události ho nemění).
 /// Nečeká, nezamyká.
 ///
-/// JEN ze snímku klávesnice ve smyčce, nikdy z callbacku: tam hlásil
-/// s oknem KeyPadu v popředí dole i klávesu, o které callback právě
-/// rozhodoval (OQ 57 — odvozeno z hlášení vlastníka, přímo neověřeno).
+/// JEN ze snímku klávesnice ve smyčce, nikdy z callbacku: o klávese, o které
+/// callback rozhoduje, stav OS nic neřekne (mění se až po hooku) a dotazy
+/// dělaly ocas ceny callbacku (OQ 57 — dřívější výklad, že kvůli nim nešlo
+/// přiřazovat, je nejspíš mylný; pravděpodobnější příčinou je Raw Input,
+/// přímo neověřeno, OQ 60).
 fn os_drzi(vk: u32) -> bool {
     let Ok(vk) = i32::try_from(vk) else {
         return false;
@@ -722,15 +754,15 @@ struct Snimek {
 /// klávese — stisk, který mezitím přijde, čeká ve frontě hooku, až se
 /// smyčka vrátí do `GetMessageW`, a snímek ho tedy nemůže zahrnout. Kdyby
 /// Windows asynchronní stav přece jen přepsaly dřív, než se zeptají
-/// hooku (tak se callback s oknem KeyPadu v popředí choval, OQ 57),
-/// převezme se nanejvýš stisk z těch pár desítek mikrosekund snímku
-/// a jde do Windows — bezpečná strana, nic nevisí.
+/// hooku, převezme se nanejvýš stisk z těch pár desítek mikrosekund
+/// snímku a jde do Windows — bezpečná strana, nic nevisí.
 ///
-/// S oknem cizího procesu v popředí asynchronní stav podle všeho vrací
-/// nuly (OQ 57) — snímek pak nic nepřevezme a klávesa držená přes
-/// zapomenutí je pro engine nový stisk. Stejně tak na zabezpečené ploše;
-/// po návratu z ní ale přijde další přepnutí plochy a s ním nový snímek.
-/// Proto se zapomíná jen při srovnání s oknem KeyPadu v popředí.
+/// Jestli asynchronní stav s oknem cizího procesu v popředí vrací nuly,
+/// nevíme (OQ 58 — dřívější předpoklad stál na mylném výkladu OQ 57).
+/// Kdyby ano, snímek nic nepřevezme a klávesa držená přes zapomenutí je
+/// pro engine nový stisk. Na zabezpečené ploše nuly vrací; po návratu
+/// z ní ale přijde další přepnutí plochy a s ním nový snímek. Proto se
+/// zapomíná jen při srovnání s oknem KeyPadu v popředí.
 fn snimek_klavesnice(srovnat: bool) -> Option<Snimek> {
     STAV.with(|s| {
         let mut g = s.borrow_mut();
@@ -805,7 +837,7 @@ fn snimek_klavesnice(srovnat: bool) -> Option<Snimek> {
 }
 
 /// Bity Win podle Windows — okno KeyPadu právě získalo popředí, takže
-/// stavu věřit lze (s cizím oknem v popředí nejspíš ne, OQ 58). Uvolnění
+/// stavu věřit lze (s cizím oknem v popředí to nevíme, OQ 58). Uvolnění
 /// Win, které callback minul (okno s právy správce), se tak srovná
 /// nejpozději návratem do okna. Jen smyčka, nikdy callback (OQ 57).
 fn srovnej_win(s: &mut Stav) {
@@ -871,9 +903,12 @@ fn nic_nedrzi(_vk: u32) -> bool {
 
 // ── Podvrh „Windows drží všechno" pro test okna (jen debug build) ──
 // Test okna běží se syntetickými klávesami a podvrhem „nic nedrží" —
-// tak prošla i verze, ve které se callback ptal `GetAsyncKeyState`
-// a s oknem KeyPadu v popředí nepřiřadil nic (OQ 57). S tímhle podvrhem
-// by takový callback slyšel „drží", stejně jako u vlastníka.
+// dotaz callbacku na stav klávesnice by tak prošel bez povšimnutí.
+// S tímhle podvrhem by takový callback slyšel „drží" o každé klávese
+// a nepřiřadil nic. (Že tohle nepřiřazovalo u vlastníka, je nejspíš
+// mylný výklad OQ 57 — pravděpodobnější příčinou je Raw Input, přímo
+// neověřeno, OQ 60; pravidlo „callback se neptá" platí dál a podvrh ho
+// hlídá.)
 
 #[cfg(debug_assertions)]
 thread_local! {
@@ -908,8 +943,7 @@ impl Drop for VUdalosti {
 
 /// Podvrh [`os_drzi`] pro `KEYPAD_TEST_OS_DRZI=vse` (s `KEYPAD_TEST_KLAVESY`):
 /// zpracování události by Windows tvrdily, že drží všechno — i klávesu,
-/// o které se právě rozhoduje (tak se `GetAsyncKeyState` choval v callbacku
-/// s oknem KeyPadu v popředí). Smyčka (snímek, srovnání při kliku na
+/// o které se právě rozhoduje. Smyčka (snímek, srovnání při kliku na
 /// čepičku, popředí) slyší „nic nedrží" jako u testovacích kláves. Kdyby
 /// se callback zase začal ptát, nepřiřadí se nic a Esc nezruší — test
 /// okna to pozná i z logu.
@@ -956,10 +990,16 @@ enum Neprirazeno {
     /// Poslal ji program, ne klávesnice — hook vstříknuté klávesy
     /// propouští a engine je nevidí.
     Vstrcena,
+    /// Klávesa, kterou engine už držel jako klávesu ovladače nebo
+    /// spolknutou (stisknutou před přiřazováním, za hry) — její stisk je
+    /// pro engine autorepeat.
+    UzDrzena,
+    /// Nic z toho — kdyby engine stisk odbyl jinak, ať nezmizí bez počtu.
+    Jine,
 }
 
 impl Neprirazeno {
-    const VSE: [Neprirazeno; 7] = [
+    const VSE: [Neprirazeno; 9] = [
         Neprirazeno::Modifikator,
         Neprirazeno::Win,
         Neprirazeno::SWin,
@@ -967,6 +1007,8 @@ impl Neprirazeno {
         Neprirazeno::Drzena,
         Neprirazeno::Zkratka,
         Neprirazeno::Vstrcena,
+        Neprirazeno::UzDrzena,
+        Neprirazeno::Jine,
     ];
 
     fn text(self) -> &'static str {
@@ -978,6 +1020,8 @@ impl Neprirazeno {
             Neprirazeno::Drzena => "držená Windows",
             Neprirazeno::Zkratka => "zkratka pauzy",
             Neprirazeno::Vstrcena => "vstříknutá",
+            Neprirazeno::UzDrzena => "už držená",
+            Neprirazeno::Jine => "jiné",
         }
     }
 }
@@ -1054,6 +1098,57 @@ impl Konec {
     }
 }
 
+// ── Doručení událostí (diagnostika, OQ 60) ─────────────────────────
+// Kolikrát Windows callback vůbec zavolaly. Log vlastníka (vydání …1504)
+// hlásil po každém přiřazování „nepřiřazeno: nic" a nešlo poznat, jestli
+// callback stisky dostal a nějak je odbyl, nebo nedostal vůbec (Raw
+// Input, OQ 60). Statické atomiky (Relaxed — jen počty, žádné pořadí):
+// callback do nich přičítá, a když přiřazování skončí v něm (Esc,
+// uložení — `sleduj_prirazovani` z `predej`), i je čte (`load`). Smyčka je
+// čte na začátku přiřazování a u konců, které nastanou v ní (klik jinam,
+// limit, vynucení). Obojí jen atomické operace — nic neblokuje
+// (princip 3). Nikdy identita klávesy.
+
+/// Každé volání callbacku (i se záporným kódem a jinou zprávou).
+static VOLANI: AtomicU32 = AtomicU32::new(0);
+/// Z toho stisky (WM_KEYDOWN, WM_SYSKEYDOWN), i autorepeat.
+static DOLU: AtomicU32 = AtomicU32::new(0);
+/// Událost našla stav enginu půjčený (zanořené volání) — propuštěna.
+static SOUBEH: AtomicU32 = AtomicU32::new(0);
+/// Událost bez stavu nebo s rozbitým enginem — propuštěna.
+static ROZBITY: AtomicU32 = AtomicU32::new(0);
+
+/// Počty doručení: stav čítačů, nebo rozdíl dvou stavů ([`Doruceni::od`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Doruceni {
+    volani: u32,
+    dolu: u32,
+    soubeh: u32,
+    rozbity: u32,
+}
+
+impl Doruceni {
+    /// Teď. Jen čtení atomiků — smí i z callbacku (konec přiřazování).
+    fn ted() -> Doruceni {
+        Doruceni {
+            volani: VOLANI.load(Ordering::Relaxed),
+            dolu: DOLU.load(Ordering::Relaxed),
+            soubeh: SOUBEH.load(Ordering::Relaxed),
+            rozbity: ROZBITY.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Kolik přibylo od `zacatek` (čítače přetékají dokola).
+    fn od(self, zacatek: Doruceni) -> Doruceni {
+        Doruceni {
+            volani: self.volani.wrapping_sub(zacatek.volani),
+            dolu: self.dolu.wrapping_sub(zacatek.dolu),
+            soubeh: self.soubeh.wrapping_sub(zacatek.soubeh),
+            rozbity: self.rozbity.wrapping_sub(zacatek.rozbity),
+        }
+    }
+}
+
 /// Běžící přiřazování z pohledu diagnostiky.
 #[derive(Clone, Copy, Debug)]
 struct Prirazovani {
@@ -1064,6 +1159,10 @@ struct Prirazovani {
     /// téže klávesy je autorepeat a nepočítá se (Windows opakují jen
     /// naposledy stisknutou klávesu).
     posledni: Option<(u32, u32, bool)>,
+    /// Čítače doručení na začátku.
+    doruceni: Doruceni,
+    /// Kontrola Raw Input při kliku na čepičku.
+    raw: RawInput,
 }
 
 /// Skončené přiřazování pro log.
@@ -1071,6 +1170,9 @@ struct Prirazovani {
 struct KonecPrirazovani {
     duvod: Konec,
     pocty: Pocty,
+    /// Doručení za dobu přiřazování (rozdíl čítačů).
+    doruceni: Doruceni,
+    raw: RawInput,
 }
 
 /// Sleduje začátek a konec přiřazování podle režimu po každém volání
@@ -1101,13 +1203,18 @@ fn sleduj_prirazovani(s: &mut Stav, d: &Decision) {
         s.konec_prirazovani = Some(KonecPrirazovani {
             duvod,
             pocty: p.pocty,
+            doruceni: Doruceni::ted().od(p.doruceni),
+            raw: p.raw,
         });
     }
+    let raw = s.raw;
     s.prirazovani = novy.map(|(cil, od_ms)| Prirazovani {
         cil,
         od_ms,
         pocty: Pocty::default(),
         posledni: None,
+        doruceni: Doruceni::ted(),
+        raw,
     });
 }
 
@@ -1141,9 +1248,34 @@ fn eviduj_stisk(s: &mut Stav, u: &Udalost, pred: Option<HeldKey>, s_win: bool, d
         _ if s_win => Neprirazeno::SWin,
         _ if pred.is_some_and(|h| h.owner == Owner::Os) => Neprirazeno::Drzena,
         _ if pred.is_none() && po.is_some_and(|h| h.owner == Owner::Os) => Neprirazeno::Modifikator,
-        _ => return,
+        // Klávesa ovladače nebo spolknutá držená z dřívějška: engine ji
+        // bere jako autorepeat a nic nerozhoduje.
+        _ if pred.is_some() => Neprirazeno::UzDrzena,
+        _ => Neprirazeno::Jine,
     };
     p.pocty.pridej(duvod);
+}
+
+/// Řádek o konci přiřazování (bez „přiřazování skončilo: "): důvod, počty
+/// nepřiřazených stisků, doručení a kontrola Raw Input. Jen smyčka
+/// (alokuje). Nikdy identita klávesy (OQ 33).
+fn radek_konce(k: &KonecPrirazovani, ztraceno: u16) -> String {
+    let navic = if ztraceno > 0 {
+        format!(" (a {ztraceno} dřívějších bez záznamu)")
+    } else {
+        String::new()
+    };
+    let d = k.doruceni;
+    format!(
+        "{} — nepřiřazeno: {}{navic} · callback {}× (stisků {}, souběh {}, rozbitý {}) · raw input klávesnice: {}",
+        k.duvod.text(),
+        k.pocty.text(),
+        d.volani,
+        d.dolu,
+        d.soubeh,
+        d.rozbity,
+        k.raw.text()
+    )
 }
 
 /// Zaloguje skončené přiřazování (jen smyčka — callback logovat nesmí).
@@ -1157,16 +1289,32 @@ fn zaloguj_prirazovani() {
         })
     });
     if let Some((k, ztraceno)) = konec {
-        let navic = if ztraceno > 0 {
-            format!(" (a {ztraceno} dřívějších bez záznamu)")
-        } else {
-            String::new()
-        };
-        log::info!(
-            "přiřazování skončilo: {} — nepřiřazeno: {}{navic}",
-            k.duvod.text(),
-            k.pocty.text()
-        );
+        log::info!("přiřazování skončilo: {}", radek_konce(&k, ztraceno));
+    }
+}
+
+/// Kontrola Raw Input klávesnice při kliku na čepičku (OQ 60): kdyby ji
+/// proces měl, s oknem KeyPadu v popředí by callback podle cizích nálezů
+/// nedostal nic. Ve
+/// smyčce, nikdy v callbacku (alokuje, volá do jádra Windows). Výsledek
+/// nese řádek o konci přiřazování; když nebyl „ne", zapíše se hned.
+fn over_raw_input() {
+    let Some(kontrola) = STAV.with(|s| s.borrow().as_ref().map(|s| s.raw_input)) else {
+        return;
+    };
+    let r = kontrola();
+    STAV.with(|s| {
+        if let Some(s) = s.borrow_mut().as_mut() {
+            s.raw = r;
+        }
+    });
+    match r {
+        RawInput::Ne => {}
+        RawInput::NejdeZrusit => log::error!(
+            "přiřazování: raw input klávesnice: {} — hook klávesy nejspíš nedostane (OQ 60)",
+            r.text()
+        ),
+        _ => log::warn!("přiřazování: raw input klávesnice: {} (OQ 60)", r.text()),
     }
 }
 
@@ -1802,6 +1950,10 @@ fn proved(p: HookPrikaz) {
     match p {
         HookPrikaz::Prirad { cil, druh } => match prijmi_prirazovani() {
             Ok(()) => {
+                // Dřív, než se začne čekat na stisk: Raw Input klávesnice
+                // by s oknem KeyPadu v popředí hook podle všeho umlčel
+                // (OQ 60).
+                over_raw_input();
                 // Okno KeyPadu je teď ověřeně v popředí — jediná chvíle,
                 // kdy stavu klávesnice Windows věříme natolik, abychom
                 // podle něj zapomínali. Zastaralý modifikátor, Esc nebo bit
@@ -1933,6 +2085,10 @@ fn predej(s: &mut Stav, u: Option<&Udalost>, d: &Decision) {
 /// `extern "system"` (proces by skončil) a hlavně nesmí nechat
 /// klávesnici v nejasném stavu (princip 1).
 unsafe extern "system" fn callback(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // Úplně první: že Windows callback vůbec zavolaly (OQ 60 — s Raw
+    // Input klávesnice v procesu by podle všeho nezavolaly). Jen přičtení
+    // do atomiku.
+    VOLANI.fetch_add(1, Ordering::Relaxed);
     // Záporný kód = „nesahat, jen předat dál" (dokumentace hooku).
     if code == HC_ACTION as i32 && lparam.0 != 0 {
         // SAFETY: u HC_ACTION ukazuje lParam na KBDLLHOOKSTRUCT platnou
@@ -1961,6 +2117,9 @@ fn zpracuj(wparam: WPARAM, kb: &KBDLLHOOKSTRUCT) -> bool {
         WM_KEYUP | WM_SYSKEYUP => false,
         _ => return false,
     };
+    if dolu {
+        DOLU.fetch_add(1, Ordering::Relaxed);
+    }
     zpracuj_udalost(&Udalost::z(kb, dolu))
 }
 
@@ -1972,11 +2131,14 @@ fn zpracuj_udalost(u: &Udalost) -> bool {
     let _v_udalosti = VUdalosti::zacni();
     STAV.with(|s| {
         // Zanořené volání (nemělo by nastat — callback nic nepumpuje)
-        // nebo vlákno bez stavu: propustit, nikdy neblokovat.
+        // nebo vlákno bez stavu: propustit, nikdy neblokovat. Ale ne bez
+        // počtu — do řádku o konci přiřazování (OQ 60).
         let Ok(mut s) = s.try_borrow_mut() else {
+            SOUBEH.fetch_add(1, Ordering::Relaxed);
             return false;
         };
         let Some(s) = s.as_mut().filter(|s| !s.rozbity) else {
+            ROZBITY.fetch_add(1, Ordering::Relaxed);
             return false;
         };
         let ted = ted_ms();
@@ -2275,9 +2437,8 @@ mod tests {
         STAV.with(|st| *st.borrow_mut() = Some(s));
     }
 
-    /// OS drží všechno — i klávesu, o které se právě rozhoduje (tak se
-    /// `GetAsyncKeyState` choval v callbacku s oknem KeyPadu v popředí,
-    /// OQ 57).
+    /// OS drží všechno — i klávesu, o které se právě rozhoduje (výklad
+    /// OQ 57, nejspíš mylný — OQ 60; callback se ptát nesmí tak jako tak).
     fn vse_drzi(_vk: u32) -> bool {
         true
     }
@@ -2771,9 +2932,10 @@ mod tests {
     }
 
     /// Přiřazování a hra fungují, i když by Windows tvrdily, že drží
-    /// všechno — přesně tak se `GetAsyncKeyState` choval v callbacku
-    /// s oknem KeyPadu v popředí a nešlo přiřadit nic, ani Esc nerušil
-    /// (hlášení vlastníka 6. 10., OQ 57).
+    /// všechno — tak OQ 57 vykládala hlášení vlastníka 6. 10. (nešlo
+    /// přiřadit nic, ani Esc nerušil). Výklad je nejspíš mylný
+    /// (pravděpodobnější příčinou je Raw Input, přímo neověřeno, OQ 60);
+    /// test hlídá pravidlo „callback se neptá" dál.
     #[test]
     fn prirazovani_funguje_i_kdyz_os_drzi_vse() {
         let z = Arc::new(Zaznam::default());
@@ -3361,6 +3523,215 @@ mod tests {
             Some(Konec::Okno)
         );
         assert!(s_stavem(|s| s.prirazovani.is_none()));
+    }
+
+    /// Stisk klávesy, kterou engine už drží jako klávesu ovladače
+    /// (stisknutou za hry před klikem na čepičku), je „už držená" — dřív
+    /// zmizel bez počtu. Co by engine odbyl jinak, je „jiné".
+    #[test]
+    fn uz_drzena_a_jine_se_pocitaji() {
+        let z = Arc::new(Zaznam::default());
+        priprav(&z);
+        assert!(zavolej(0, WM_KEYDOWN, &kb_vk(0x76, 0, 0x87)), "F24 hraje");
+        nastav_popredi(true);
+        okno(Some(7), true);
+        proved(HookPrikaz::Prirad {
+            cil: PadAction::first(Action::Button(PadButton::B)),
+            druh: BindKind::Replace,
+        });
+        podvrhni_os(nesmi_se_ptat);
+        assert!(matches!(rezim(), Mode::Binding { .. }));
+        // Autorepeat F24 je pro engine opakování klávesy ovladače; počítá
+        // se jednou.
+        zavolej(0, WM_KEYDOWN, &kb_vk(0x76, 0, 0x87));
+        zavolej(0, WM_KEYDOWN, &kb_vk(0x76, 0, 0x87));
+        // „Jiné": stisk nikým nedržené klávesy, o kterém engine nic neřekl
+        // (podvržené rozhodnutí bez oznámení — skutečný engine tak stisk
+        // při přiřazování neodbude, počet je pojistka).
+        s_stavem(|s| {
+            let u = Udalost {
+                klavesa: KeyId::new(0x22),
+                scan: 0x22,
+                vk: 0x47,
+                flags: 0,
+                dolu: true,
+            };
+            eviduj_stisk(s, &u, None, false, &Decision::NONE);
+        });
+        let p = s_stavem(|s| s.prirazovani.map(|p| p.pocty)).expect("přiřazuje se");
+        assert_eq!(p.text(), "1× už držená, 1× jiné");
+        assert!(klavesa(0x01, true), "Esc");
+        assert!(klavesa(0x01, false));
+    }
+
+    /// Vstříknutý Esc (SendInput, klávesnice na obrazovce) hook při
+    /// přiřazování jen započte a propustí — do okna tedy dojde a okno
+    /// přiřazování zruší samo (`escRusiPrirazeni` → `ZrusPrirazeni`,
+    /// Fáze 6c). Backend ho sám nezruší; v logu „okno — nepřiřazeno:
+    /// 1× vstříknutá". Tak to popisují komentáře okna i ROADMAP (nález
+    /// revize: dřív tvrdily, že do okna dojde jen Esc, který hook nedostal).
+    #[test]
+    fn vstriknuty_esc_projde_do_okna_a_zrusi_ho_okno() {
+        let z = Arc::new(Zaznam::default());
+        priprav_s(&z, Mapping::default());
+        nastav_popredi(true);
+        okno(Some(7), true);
+        proved(HookPrikaz::Prirad {
+            cil: PadAction::first(Action::Button(PadButton::B)),
+            druh: BindKind::Replace,
+        });
+        podvrhni_os(nesmi_se_ptat);
+        assert!(matches!(rezim(), Mode::Binding { .. }));
+        assert!(
+            !zavolej(0, WM_KEYDOWN, &kb_vk(0x01, LLKHF_INJECTED.0, 0x1B)),
+            "vstříknutý Esc projde do okna"
+        );
+        assert!(!zavolej(
+            0,
+            WM_KEYUP,
+            &kb_vk(0x01, LLKHF_INJECTED.0 | LLKHF_UP.0, 0x1B)
+        ));
+        assert!(
+            matches!(rezim(), Mode::Binding { .. }),
+            "backend vstříknutý Esc nebere jako zrušení"
+        );
+        assert_eq!(s_stavem(|s| s.konec_prirazovani), None);
+        // Okno Esc dostalo a přiřazování zrušilo.
+        proved(HookPrikaz::ZrusPrirazeni);
+        let k = s_stavem(|s| s.konec_prirazovani).expect("konec zaznamenán");
+        assert_eq!(k.duvod, Konec::Okno);
+        assert_eq!(k.pocty.text(), "1× vstříknutá");
+        assert!(s_stavem(|s| s.prirazovani.is_none()));
+    }
+
+    /// Čítače doručení (OQ 60) rostou s každým voláním callbacku — i se
+    /// záporným kódem a jinou zprávou —, se stiskem, se souběhem (stav
+    /// enginu půjčený) i s rozbitým enginem. Patří celému procesu a testy
+    /// běží souběžně, proto „aspoň".
+    #[test]
+    fn doruceni_pocita_volani_stisky_soubeh_i_rozbity() {
+        let z = Arc::new(Zaznam::default());
+        priprav(&z);
+        let pred = Doruceni::ted();
+        assert!(zavolej(0, WM_KEYDOWN, &kb(0x76, 0)));
+        assert!(zavolej(0, WM_KEYUP, &kb(0x76, LLKHF_UP.0)));
+        assert!(!zavolej(-1, WM_KEYDOWN, &kb(0x76, 0)));
+        assert!(!zavolej(0, WM_TIMER, &kb(0x76, 0)));
+        let d = Doruceni::ted().od(pred);
+        assert!(d.volani >= 4 && d.dolu >= 1, "{d:?}");
+        // Souběh: zanořené volání najde stav půjčený — klávesa projde.
+        let pred = Doruceni::ted();
+        STAV.with(|s| {
+            let _pujceno = s.borrow_mut();
+            assert!(!zavolej(0, WM_KEYDOWN, &kb(0x76, 0)));
+        });
+        let d = Doruceni::ted().od(pred);
+        assert!(d.volani >= 1 && d.soubeh >= 1, "{d:?}");
+        // Rozbitý engine.
+        s_stavem(|s| s.rozbity = true);
+        let pred = Doruceni::ted();
+        assert!(!zavolej(0, WM_KEYDOWN, &kb(0x76, 0)));
+        assert!(Doruceni::ted().od(pred).rozbity >= 1);
+        // Čítače přetékají dokola.
+        let zacatek = Doruceni {
+            volani: u32::MAX,
+            ..Doruceni::default()
+        };
+        let konec = Doruceni {
+            volani: 2,
+            ..Doruceni::default()
+        };
+        assert_eq!(konec.od(zacatek).volani, 3);
+    }
+
+    thread_local! {
+        /// Kolikrát se kdo zeptal na Raw Input (podvrh kontroly).
+        static RAW_KONTROLY: Cell<u32> = const { Cell::new(0) };
+    }
+
+    fn raw_odregistrovano() -> RawInput {
+        RAW_KONTROLY.with(|k| k.set(k.get() + 1));
+        RawInput::Odregistrovano
+    }
+
+    /// Klik na čepičku ověří Raw Input klávesnice (smyčka, ne callback)
+    /// a konec přiřazování nese výsledek i doručení za dobu přiřazování
+    /// (OQ 60).
+    #[test]
+    fn prirazovani_overi_raw_input_a_konec_nese_doruceni() {
+        let z = Arc::new(Zaznam::default());
+        priprav_s(&z, Mapping::default());
+        nastav_popredi(true);
+        okno(Some(7), true);
+        s_stavem(|s| s.raw_input = raw_odregistrovano);
+        RAW_KONTROLY.with(|k| k.set(0));
+        proved(HookPrikaz::Prirad {
+            cil: PadAction::first(Action::Button(PadButton::B)),
+            druh: BindKind::Replace,
+        });
+        assert_eq!(RAW_KONTROLY.with(Cell::get), 1, "klik Raw Input ověřil");
+        assert_eq!(
+            s_stavem(|s| s.prirazovani.map(|p| p.raw)),
+            Some(RawInput::Odregistrovano)
+        );
+        // Ctrl+F (zkratka Windows — samotné ťuknutí Ctrl by se přiřadilo),
+        // pak Esc.
+        assert!(!zavolej(0, WM_KEYDOWN, &kb_vk(0x1D, 0, 0xA2)));
+        assert!(!zavolej(0, WM_KEYDOWN, &kb_vk(0x21, 0, 0x46)));
+        assert!(!zavolej(0, WM_KEYUP, &kb_vk(0x21, LLKHF_UP.0, 0x46)));
+        assert!(!zavolej(0, WM_KEYUP, &kb_vk(0x1D, LLKHF_UP.0, 0xA2)));
+        assert!(klavesa(0x01, true), "Esc");
+        assert_eq!(
+            RAW_KONTROLY.with(Cell::get),
+            1,
+            "callback se na Raw Input neptá"
+        );
+        let k = s_stavem(|s| s.konec_prirazovani).expect("konec zaznamenán");
+        assert_eq!((k.duvod, k.raw), (Konec::Esc, RawInput::Odregistrovano));
+        assert!(
+            k.doruceni.volani >= 3 && k.doruceni.dolu >= 2,
+            "{:?}",
+            k.doruceni
+        );
+        assert!(klavesa(0x01, false));
+        zaloguj_prirazovani();
+        assert_eq!(s_stavem(|s| s.konec_prirazovani), None);
+    }
+
+    /// Řádek o konci přiřazování: důvod, počty, doručení, Raw Input — nic
+    /// jiného (OQ 33). Tvar čte i `tools\okno-test.ps1`.
+    #[test]
+    fn radek_konce_jen_duvod_a_pocty() {
+        let mut pocty = Pocty::default();
+        pocty.pridej(Neprirazeno::Win);
+        pocty.pridej(Neprirazeno::UzDrzena);
+        let k = KonecPrirazovani {
+            duvod: Konec::Esc,
+            pocty,
+            doruceni: Doruceni {
+                volani: 12,
+                dolu: 5,
+                soubeh: 1,
+                rozbity: 0,
+            },
+            raw: RawInput::Ne,
+        };
+        assert_eq!(
+            radek_konce(&k, 0),
+            "Esc — nepřiřazeno: 1× Win, 1× už držená · callback 12× (stisků 5, souběh 1, \
+             rozbitý 0) · raw input klávesnice: ne"
+        );
+        let k = KonecPrirazovani {
+            duvod: Konec::Okno,
+            pocty: Pocty::default(),
+            doruceni: Doruceni::default(),
+            raw: RawInput::Odregistrovano,
+        };
+        assert_eq!(
+            radek_konce(&k, 2),
+            "okno — nepřiřazeno: nic (a 2 dřívějších bez záznamu) · callback 0× (stisků 0, \
+             souběh 0, rozbitý 0) · raw input klávesnice: ano — odregistrováno"
+        );
     }
 
     /// Konec přiřazování v callbacku (Esc) smyčku sám neprobudí — callback

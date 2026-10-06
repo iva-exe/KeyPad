@@ -15,8 +15,10 @@
 # během přiřazování, restart (klávesy i karta zůstanou), poškozenou
 # konfiguraci, prázdnou kartu ovladače 2 po konci procesu (Fáze 6b) a
 # přiřazení s Esc s podvrhem „Windows drží všechno" (KEYPAD_TEST_OS_DRZI,
-# OQ 57). Z logu testovací instance ověří řádky „přiřazování skončilo"
-# (důvod a počty, nikdy klávesa). Snímky okna ukládá do -Snimky
+# OQ 57) a Esc do okna, který hook nevidí (Fáze 6c, OQ 60). Z logu
+# testovací instance ověří řádky „přiřazování skončilo" (důvod, počty
+# a doručení, nikdy klávesa) a „raw input klávesnice: ne" při každém startu
+# i přiřazování (OQ 60). Snímky okna ukládá do -Snimky
 # (Page.captureScreenshot), na konci uklidí proces i plochu.
 #
 # PROČ SKRYTÁ PLOCHA: na počítači vlastníka může běžet hra. Okno na jeho
@@ -629,12 +631,20 @@ function LogRadky {
     return @($text -split "`r?`n" | Where-Object { $_ })
 }
 
-# Diagnostika přiřazování (Fáze 6b): na konci každého přiřazování jeden
-# řádek s důvodem konce a počty nepřiřazených stisků podle kategorií.
-# Nic jiného v něm být nesmí — hlavně ne identita klávesy (OQ 33: log
-# se posílá při hlášení chyby).
-$katDiag = '(modifikátor|Win|s Win|nemapovatelná|držená Windows|zkratka pauzy|vstříknutá)'
-$script:reDiag = '^(uloženo|Esc|limit 10 s|okno|vynuceno) — nepřiřazeno: (nic|\d+× ' + $katDiag + '(, \d+× ' + $katDiag + ')*)( \(a \d+ dřívějších bez záznamu\))?$'
+# Diagnostika přiřazování (Fáze 6b, 6c): na konci každého přiřazování
+# jeden řádek s důvodem konce, počty nepřiřazených stisků podle kategorií,
+# počty doručení (kolikrát Windows zavolaly callback hooku) a kontrolou
+# Raw Input klávesnice (OQ 60). Nic jiného v něm být nesmí — hlavně ne
+# identita klávesy (OQ 33: log se posílá při hlášení chyby).
+$katDiag = '(modifikátor|Win|s Win|nemapovatelná|držená Windows|zkratka pauzy|vstříknutá|už držená|jiné)'
+$script:reDiag = '^(uloženo|Esc|limit 10 s|okno|vynuceno) — nepřiřazeno: (nic|\d+× ' + $katDiag + '(, \d+× ' + $katDiag + ')*)( \(a \d+ dřívějších bez záznamu\))?' +
+    ' · callback \d+× \(stisků \d+, souběh \d+, rozbitý \d+\) · raw input klávesnice: (ne|ano — odregistrováno|ano — nejde zrušit|nezjištěno)$'
+# Doručení a Raw Input v testu okna: klávesy posílá `test_klavesa` MIMO
+# callback (touž funkcí, ale ne přes Windows) a hook na skryté ploše
+# skutečný vstup nedostane (LL hook vidí jen vstup plochy svého vlákna),
+# takže callback 0× je správně. Kdyby nebyl, šly by do testovací instance
+# klávesy z plochy vlastníka. Raw Input klávesnice proces mít nesmí.
+$script:konecDoruceni = ' · callback 0× (stisků 0, souběh 0, rozbitý 0) · raw input klávesnice: ne'
 
 # Text za „přiřazování skončilo: " ze všech řádků logu (všechna spuštění).
 function KonceLogu {
@@ -649,9 +659,11 @@ function DalsiKonec([int]$Od) {
     return $script:konecLogu
 }
 
+# $Cekany = důvod a počty („Esc — nepřiřazeno: 1× Win"); doručení
+# a Raw Input se doplní (viz $script:konecDoruceni).
 function OverKonec([int]$Od, [string]$Cekany) {
     $r = DalsiKonec $Od
-    Over ('log: „přiřazování skončilo: ' + $Cekany + '“') ($r -eq $Cekany) $r
+    Over ('log: „přiřazování skončilo: ' + $Cekany + ' · …“') ($r -ceq ($Cekany + $script:konecDoruceni)) $r
 }
 
 # Rozbalí kartu (akordeon: klik na už rozbalenou kartu by ji sbalil).
@@ -926,6 +938,17 @@ function ScenarUpravy {
     $n0 = @(KonceLogu).Count
     $null = StiskMysi 'main.panel'
     Over 'klik jinam přiřazování zruší' (Cekej '__kpt.app().dataset.rezim === "disabled" && __kpt.app().dataset.oznameni === "zruseno"')
+    OverKonec $n0 'okno — nepřiřazeno: nic'
+
+    # Esc, který došel až do okna (Fáze 6c, OQ 60): hook ho nedostal — tak
+    # by to vypadalo s Raw Input klávesnice v procesu (do okna dojde i Esc
+    # vstříknutý přes SendInput, který hook propustí). CDP pošle klávesu
+    # jen do WebView testovací instance, hook ji nevidí: zrušit musí okno.
+    $null = Klik 'section.karta[data-pad="1"] [data-vstup="x"] .telo'
+    $null = Cekej '__kpt.app().dataset.rezim === "binding"'
+    $n0 = @(KonceLogu).Count
+    OknuKlavesa 'Escape' 'Escape' 27
+    Over 'Esc do okna (hook ho nevidí) přiřazování zruší' (Cekej '__kpt.app().dataset.rezim === "disabled"')
     OverKonec $n0 'okno — nepřiřazeno: nic'
 
     # 10 s bez klávesy: přiřazování skončí samo (limit jádra).
@@ -1255,6 +1278,16 @@ try {
             $duvody = @($konce | ForEach-Object { ($_ -split ' — ')[0] } | Sort-Object -Unique)
             $vsechny = -not @('uloženo', 'Esc', 'limit 10 s', 'okno' | Where-Object { $duvody -notcontains $_ })
             Over ('log: ' + $konce.Count + '× „přiřazování skončilo“ (uloženo, Esc, limit, okno) — jen důvod a počty, bez identity klávesy') ($konce.Count -gt 0 -and $vsechny -and $spatne.Count -eq 0) @{ duvody = $duvody; spatne = $spatne }
+            # Raw Input klávesnice (OQ 60): kontrola při startu (každé
+            # spuštění) i při každém kliku na čepičku — vždy „ne", nikdy „ano"
+            # (to by znamenalo, že tao/Tauri klávesnici zaregistrovaly znovu
+            # a hook s oknem v popředí nedostane nic).
+            $raw = @($radky | Where-Object { $_ -match 'raw input klávesnice: ' })
+            $rawNe = @($raw | Where-Object { $_ -match 'raw input klávesnice: ne\b' })
+            $rawAno = @($raw | Where-Object { $_ -match 'raw input klávesnice: (ano|nezjištěno)' })
+            $starty = @($radky | Where-Object { $_ -match ' KeyPad: start KeyPad ' }).Count
+            $priStartu = @($radky | Where-Object { $_ -match ' KeyPad: raw input klávesnice: ne$' }).Count
+            Over ('log: „raw input klávesnice: ne“ při každém startu (' + $priStartu + ' z ' + $starty + ') i při přiřazování, nikdy „ano“') ($starty -ge 1 -and $priStartu -eq $starty -and $rawNe.Count -gt $priStartu -and $rawAno.Count -eq 0) @{ starty = $starty; priStartu = $priStartu; ne = $rawNe.Count; ano = $rawAno }
             $dotazy = @($radky | Where-Object { $_ -match 'zeptal na stav klávesnice' })
             Over 'log: callback se na stav klávesnice nezeptal (OQ 57)' ($dotazy.Count -eq 0) $dotazy
             $chyby = @($radky | Where-Object { $_ -cmatch '\bERROR\b' })

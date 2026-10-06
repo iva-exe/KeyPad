@@ -50,6 +50,11 @@ mod hook;
 #[allow(dead_code, reason = "příklad používá jen názvy, ne krátké názvy")]
 #[path = "../src/platform/windows/klavesy.rs"]
 mod klavesy;
+/// Hook ověřuje Raw Input klávesnice na začátku přiřazování (OQ 60);
+/// příklad nepřiřazuje, modul jen potřebuje, aby se hook přeložil.
+#[allow(dead_code, reason = "příklad nepřiřazuje — kontrolu volá jen hook")]
+#[path = "../src/platform/windows/raw_input.rs"]
+mod raw_input;
 #[allow(dead_code, reason = "měření potřebuje jen zápis, čtení je pro okno")]
 #[path = "../src/platform/windows/slot.rs"]
 mod slot;

@@ -71,6 +71,11 @@ features = [
     "Win32_System_Variant",
     # SetWinEventHook — přepnutí plochy (UAC, Ctrl+Alt+Del) v hook vlákně
     "Win32_UI_Accessibility",
+    # Get/RegisterRawInputDevices — proces nesmí mít klávesnici v Raw
+    # Input, jinak Windows s oknem KeyPadu v popředí jeho hook podle cizích
+    # nálezů nevolají (raw_input.rs, OQ 60; přímo neověřeno, pravidlo
+    # platí preventivně). Obě funkce má user32 od XP.
+    "Win32_UI_Input",
     # GetKeyNameTextW — názvy kláves podle rozložení
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Input_XboxController",

@@ -7,7 +7,7 @@
 // (revize B5: stisk na přepínači a puštění jinde, pravý klik na čepičku).
 // Důvěryhodný vstup v celém okně ověřuje test na skryté ploše (B6).
 import { describe, expect, test } from 'bun:test';
-import { type Stisk, vytvorStraz } from './klavesnice';
+import { escRusiPrirazeni, type Stisk, vytvorStraz } from './klavesnice';
 
 function stisk(key: string, ctrlKey = false): Stisk {
 	return { key, ctrlKey, altKey: false, metaKey: false };
@@ -93,5 +93,39 @@ describe('stráž kláves', () => {
 		expect(s.dolu({ key: 'Tab', ctrlKey: true, altKey: false, metaKey: false }, false, false)).toBe(true);
 		expect(s.dolu({ key: 'Tab', ctrlKey: false, altKey: true, metaKey: false }, false, false)).toBe(true);
 		expect(s.dolu(MEZERNIK, true, false)).toBe(true);
+	});
+});
+
+// Esc do okna během přiřazování (OQ 60): dojde sem, když ho hook nedostal
+// nebo propustil jako vstříknutý — a pak má přiřazování zrušit, ne nechat
+// čekat do limitu. Skutečný Esc živý hook spolkne a sem nedojde.
+describe('Esc v okně', () => {
+	const esc = (mod: Partial<Stisk & { shiftKey: boolean }> = {}) => ({
+		key: 'Escape',
+		ctrlKey: false,
+		altKey: false,
+		metaKey: false,
+		shiftKey: false,
+		...mod
+	});
+
+	test('samotný Esc při přiřazování ho zruší', () => {
+		expect(escRusiPrirazeni(esc(), true)).toBe(true);
+	});
+
+	test('mimo přiřazování nic', () => {
+		expect(escRusiPrirazeni(esc(), false)).toBe(false);
+	});
+
+	test('s modifikátorem nic (zkratky, ne zrušení)', () => {
+		for (const mod of [{ ctrlKey: true }, { altKey: true }, { metaKey: true }, { shiftKey: true }]) {
+			expect(escRusiPrirazeni(esc(mod), true)).toBe(false);
+		}
+	});
+
+	test('jiná klávesa nic', () => {
+		for (const key of ['Esc', 'Enter', ' ', 'w', 'Backspace']) {
+			expect(escRusiPrirazeni(esc({ key }), true)).toBe(false);
+		}
 	});
 });

@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { nactiAplikaci } from './lib/aplikace.svelte';
-	import { hlidejKlavesnici } from './lib/klavesnice';
+	import { escRusiPrirazeni, hlidejKlavesnici } from './lib/klavesnice';
 	import {
 		cilPrirazeni,
 		klavesy,
@@ -77,6 +77,16 @@
 		zrusPrirazeni();
 	}
 
+	/**
+	 * Esc, který došel až do okna, přiřazování zruší — hook ho buď
+	 * nedostal (OQ 60), nebo propustil jako vstříknutý (SendInput);
+	 * skutečný Esc živý hook spolkne a do okna nedojde. Autorepeat ne:
+	 * zrušení už letí do backendu.
+	 */
+	function klavesa(e: KeyboardEvent): void {
+		if (!e.repeat && escRusiPrirazeni(e, cilPrirazeni() !== null)) zrusPrirazeni();
+	}
+
 	onMount(() => {
 		const konecStraze = hlidejKlavesnici();
 		void nactiAplikaci();
@@ -103,7 +113,7 @@
 	});
 </script>
 
-<svelte:window onpointerdowncapture={stiskMysi} />
+<svelte:window onpointerdowncapture={stiskMysi} onkeydown={klavesa} />
 
 <!-- data-*: stav okna pro test na skryté ploše (B6) — režim a poslední
      oznámení přímo, bez čtení textů. -->

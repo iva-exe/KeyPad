@@ -1,12 +1,14 @@
 //! Win32 kód aplikace: hook klávesnice, virtuální pad (ViGEmBus),
 //! uspání, konec relace Windows, ukončení z instalátoru, spuštění
-//! instalátoru ViGEmBus a odkazů, zvuk pozastavení.
+//! instalátoru ViGEmBus a odkazů, zvuk pozastavení, kontrola Raw Input
+//! klávesnice (ta by hook s oknem KeyPadu v popředí podle všeho umlčela).
 
 pub mod dll;
 pub mod hook;
 pub mod klavesy;
 pub mod pad;
 pub mod power;
+pub mod raw_input;
 pub mod relace;
 pub mod shell;
 pub mod slot;

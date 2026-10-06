@@ -42,6 +42,23 @@ function modifikator(e: Stisk): boolean {
 }
 
 /**
+ * Esc do okna během přiřazování přiřazování zruší. Skutečný Esc
+ * z klávesnice běžně spolkne engine v hooku (a přiřazování zruší sám), do
+ * WebView vůbec nedojde. Dojde sem, když ho hook nedostal (Raw Input
+ * klávesnice v procesu — OQ 60, hook mimo systém) — přiřazování by pak
+ * čekalo do 10s limitu a Esc by „nefungoval" —, a taky když ho hook
+ * propustil: vstříknutý Esc (SendInput, klávesnice na obrazovce) engine
+ * při přiřazování jen započte jako „vstříknutá" a pustí dál. Okno ho od
+ * skutečného nerozliší a zruší přiřazování taky (v logu „okno —
+ * nepřiřazeno: 1× vstříknutá"); rozlišit by to musel backend, nestojí to
+ * za to. Nic se nezdvojí: spolknutý Esc sem nedojde. Jen samotný Esc —
+ * Shift+Esc, Ctrl+Esc a spol. jsou zkratky, ne zrušení.
+ */
+export function escRusiPrirazeni(e: Stisk & { shiftKey: boolean }, prirazuje: boolean): boolean {
+	return prirazuje && e.key === 'Escape' && !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey;
+}
+
+/**
  * Ctrl+C s označeným textem (chyba, cesta k záloze): kopírování nic
  * nepřepne ani neposune, a chybu má jít zkopírovat.
  */

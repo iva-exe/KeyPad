@@ -284,6 +284,17 @@ fn main() {
     over_webview2();
 
     let aplikace = tauri::Builder::default()
+        // Žádný Raw Input (OQ 60). Tao si při startu zaregistruje myš
+        // i klávesnici (výchozí `Unfocused` = RIDEV_DEVNOTIFY na jeho skryté
+        // okno) a procesu s klávesnicí v Raw Input Windows s vlastním oknem
+        // v popředí podle cizích nálezů nevolají jeho LL hook — nejspíš
+        // proto vydání …1504 nepřiřadilo nic (přímo neověřeno, potvrdí
+        // vlastník, ROADMAP Fáze 6c). Platí preventivně tak jako tak.
+        // `Always` = RIDEV_REMOVE; události zařízení (DeviceEvent) KeyPad
+        // nepotřebuje. NIKDY `Never` — to je RIDEV_INPUTSINK, klávesnice
+        // i na pozadí. Že registrace opravdu zmizela, ověří
+        // `raw_input::kontrola` v `setup`.
+        .device_event_filter(tauri::DeviceEventFilter::Always)
         // MUSÍ být první plugin (vyžaduje dokumentace pluginu). Druhé
         // spuštění nevyrobí další proces — jen ukáže okno toho běžícího
         // a samo hned skončí. Dvě instance by se ve Fázi 3 praly
@@ -361,6 +372,22 @@ fn main() {
             okno::nastav_pozadi(&w);
             // F5, Ctrl+R, Ctrl+P… — okno je aplikace, ne prohlížeč (spec 1.8).
             okno::vypni_zkratky_prohlizece(&w);
+            // Raw Input klávesnice by s oknem KeyPadu v popředí hook podle
+            // všeho umlčel (OQ 60). Builder ho vypíná — tady se to ověří, ne
+            // předpokládá (princip 8); zbytek zruší a ověří znovu. Totéž
+            // dělá hook vlákno na začátku každého přiřazování.
+            use platform::windows::raw_input::{kontrola, RawInput};
+            match kontrola() {
+                RawInput::Ne => log::info!("raw input klávesnice: ne"),
+                r @ (RawInput::Odregistrovano | RawInput::Nezjisteno) => {
+                    log::warn!("raw input klávesnice: {} (OQ 60)", r.text());
+                }
+                r @ RawInput::NejdeZrusit => log::error!(
+                    "raw input klávesnice: {} — s oknem KeyPadu v popředí hook \
+                     klávesy nejspíš nedostane (přiřazování, živé svícení; OQ 60)",
+                    r.text()
+                ),
+            }
             // Klávesy a ✓ Zvuk z %APPDATA%\KeyPad\config.json (Fáze 6/7).
             // Načtení nic nezapisuje; soubor vzniká až první změnou.
             let nacteno = config::nacti_z(updater::config_path().as_deref());
