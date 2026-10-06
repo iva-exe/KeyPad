@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc dfe9ac9cedddf11c6f7454a2cacf95fb46b26627581c2928bb1b082845e56945 # shrinks to ops = [Press(18), StartBinding(0, 0, false), Press(0)]
+cc 933c736984e643e8b9d21348706984b975b34f17ade6c5d56ba791b8387227f3 # shrinks to ops = [StartBinding(0, 0, false), Press(15), Release(0)]
+cc 2d2a4348010e63d7fca05c779d112c7ba415658a253ce7444c9f6e37ef7e67ac # shrinks to ops = [Press(8), StartBinding(0, 0, false), Press(18)]

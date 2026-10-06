@@ -160,6 +160,118 @@ button {
 	background: transparent;
 }
 
+/* ═══ Jen KeyPad — barvy virtuálních ovladačů ═══
+ * Mimo tokeny sdílené s WinSentem: WinSent ovladače nemá. Barva je
+ * identita ovladače (pruh a odznak karty, svítící čepičky), ne stav —
+ * proto žádná nesedí na --ok, --warn ani --danger (ne tyrkys, ne citron)
+ * a nikdy nestojí sama, vždy je u ní číslo. Nejčastější dvojice 1+2 má
+ * nejvzdálenější odstín. Pevná podle čísla, bez výběru (OQ 51). */
+:root {
+	--pad-1: #60a5fa;
+	--pad-2: #f472b6;
+	--pad-3: #a78bfa;
+	--pad-4: #67e8f9;
+	/* Text na plné barvě ovladače (svítící čepička, odznak). */
+	--na-barve: #0e0f12;
+}
+[data-pad='1'] {
+	--barva: var(--pad-1);
+}
+[data-pad='2'] {
+	--barva: var(--pad-2);
+}
+[data-pad='3'] {
+	--barva: var(--pad-3);
+}
+[data-pad='4'] {
+	--barva: var(--pad-4);
+}
+
+/* ── mikroanimace (jen tyhle čtyři; „Omezit pohyb" je vypne pravidlem níž) ──
+ * Jednorázové spouští akce `prehraj` (lib/motion.ts) přidáním třídy,
+ * proto jsou tady globálně, ne ve stylech komponent. */
+
+/* Přiřazovaná čepička: pulz v barvě ovladače. */
+@keyframes kp-pulz {
+	0%,
+	100% {
+		background-color: color-mix(in srgb, var(--barva) 12%, transparent);
+	}
+	50% {
+		background-color: color-mix(in srgb, var(--barva) 34%, transparent);
+	}
+}
+
+/* Odmítnutá klávesa: zatřesení 6 px / 160 ms. Přes `transform` —
+   posun hlavičky páčky jede vlastností `translate`, takže se nepřebijí. */
+@keyframes kp-zatreseni {
+	0%,
+	100% {
+		transform: none;
+	}
+	20% {
+		transform: translateX(-6px);
+	}
+	45% {
+		transform: translateX(6px);
+	}
+	70% {
+		transform: translateX(-3px);
+	}
+	90% {
+		transform: translateX(3px);
+	}
+}
+.kp-zatreseni {
+	animation: kp-zatreseni 160ms linear;
+}
+
+/* Uložená klávesa: čepička blikne plnou barvou ovladače. */
+@keyframes kp-zablesk {
+	from {
+		background-color: var(--barva);
+		border-color: var(--barva);
+		color: var(--na-barve);
+	}
+}
+.kp-zablesk {
+	animation: kp-zablesk 160ms ease-out;
+}
+
+/* Klávesa odsud odešla jinam: jantarově (upozornění, ne chyba). */
+@keyframes kp-zablesk-presun {
+	from {
+		background-color: color-mix(in srgb, var(--warn) 55%, transparent);
+		border-color: var(--warn);
+	}
+}
+.kp-zablesk-presun {
+	animation: kp-zablesk-presun 320ms ease-out;
+}
+
+/* Odznak karty, ze které klávesa odešla. */
+@keyframes kp-zablesk-odznak {
+	from {
+		box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 75%, transparent);
+	}
+}
+.kp-zablesk-odznak {
+	animation: kp-zablesk-odznak 320ms ease-out;
+}
+
+/* Přepínač jednou pulzne: zkratka bez zapnutého ovladače. */
+@keyframes kp-pulz-jednou {
+	from {
+		box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent);
+	}
+	to {
+		box-shadow: 0 0 0 7px transparent;
+	}
+}
+.kp-pulz-jednou {
+	animation: kp-pulz-jednou 420ms ease-out;
+}
+
 /* CSS přechody vypne tohle pravidlo. Přechody Svelte (transition:)
    jedou přes Web Animations API, na které CSS nedosáhne — ty hlídá
    lib/motion.ts. */

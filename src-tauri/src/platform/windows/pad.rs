@@ -884,20 +884,42 @@ pub struct VigemBackend {
     /// by ovladač byl v tomhle stavu. Na testy okna bez skutečného padu
     /// a na PC, kde se virtuální pad právě připojit nemá (třeba během
     /// hry); zapíše se do logu. Viz [`simulace_z_promenne`].
-    simulace: Option<BusState>,
+    simulace: Option<Simulace>,
     /// `KEYPAD_VIGEM_STARY` — tvářit se, že ViGEmBus potřebuje
     /// aktualizaci (test okna; instalátor se pak nespouští).
     simulace_stary: bool,
 }
 
-/// `KEYPAD_BEZ_VIGEM`: nenastavená = skutečný ViGEmBus; `vypnuty` =
+/// Co se místo skutečného ViGEmBus předstírá (`KEYPAD_BEZ_VIGEM`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Simulace {
+    /// ViGEmBus v tomhle stavu — zapnout nejde.
+    Sbernice(BusState),
+    /// Připojený pad bez ViGEmBus: zapnutí, stavy i tep projdou, ale nic
+    /// se nikam neposílá. Test okna na skryté ploše (Fáze 6, B6) tak
+    /// vidí zapnutý ovladač a „hra" svítí — bez virtuálního zařízení,
+    /// které by uviděly hry vlastníka. Jen debug build.
+    Pad,
+}
+
+/// `KEYPAD_BEZ_VIGEM` podle buildu: simulovaný pad (`pad`) jen
+/// v ladicím buildu — release ho bere jako chybějící ViGEmBus.
+fn simulace_z_promenne(hodnota: Option<&std::ffi::OsStr>) -> Option<Simulace> {
+    simulace_z(hodnota, cfg!(debug_assertions))
+}
+
+/// `KEYPAD_BEZ_VIGEM`: nenastavená = skutečný ViGEmBus; `pad` =
+/// simulovaný připojený pad (jen `ladici` build); `vypnuty` =
 /// nainstalovaný, ale vypnutý ve Správci zařízení (rada „zapni ho");
 /// `zbytek` = zbyla jen služba, bez zařízení i záznamu v Aplikacích
 /// (rada s adresou ruční instalace); cokoli jiného = ViGEmBus v systému
 /// není (nabídka instalace).
-fn simulace_z_promenne(hodnota: Option<&std::ffi::OsStr>) -> Option<BusState> {
+fn simulace_z(hodnota: Option<&std::ffi::OsStr>, ladici: bool) -> Option<Simulace> {
     let h = hodnota?;
-    Some(if h.eq_ignore_ascii_case("vypnuty") {
+    if h.eq_ignore_ascii_case("pad") && ladici {
+        return Some(Simulace::Pad);
+    }
+    Some(Simulace::Sbernice(if h.eq_ignore_ascii_case("vypnuty") {
         BusState::InstalledNotRunning {
             device: Some(DeviceStatus {
                 problem: Some(22),
@@ -913,7 +935,7 @@ fn simulace_z_promenne(hodnota: Option<&std::ffi::OsStr>) -> Option<BusState> {
         }
     } else {
         BusState::NotInstalled
-    })
+    }))
 }
 
 impl Backend for VigemBackend {
@@ -929,8 +951,10 @@ impl Backend for VigemBackend {
     }
 
     fn over_sbernici(&mut self) -> Result<(), VigemError> {
-        if self.simulace.is_some() {
-            return Err(VigemError::BusMissing);
+        match self.simulace {
+            Some(Simulace::Pad) => return Ok(()),
+            Some(Simulace::Sbernice(_)) => return Err(VigemError::BusMissing),
+            None => {}
         }
         // Spojení se hned zavře (Drop): otevřený handle by držel ovladač
         // v paměti a jeho aktualizace by pak chtěla restart.
@@ -938,15 +962,19 @@ impl Backend for VigemBackend {
     }
 
     fn stary_ovladac(&mut self) -> bool {
-        self.simulace_stary || updater::vigembus::needs_update()
+        // V simulaci jen podle KEYPAD_VIGEM_STARY: test okna nesmí
+        // záviset na ovladači, který má vlastník nainstalovaný.
+        self.simulace_stary || (self.simulace.is_none() && updater::vigembus::needs_update())
     }
 
     fn pripoj(&mut self) -> Result<(), VigemError> {
         // Starý target (nemělo by nastat) nejdřív pryč — dva by si braly
         // dva sloty XInput.
         self.odpoj();
-        if self.simulace.is_some() {
-            return Err(VigemError::BusMissing);
+        match self.simulace {
+            Some(Simulace::Pad) => return Ok(()),
+            Some(Simulace::Sbernice(_)) => return Err(VigemError::BusMissing),
+            None => {}
         }
         let bus = Bus::connect()?;
         // Při chybě se `bus` zahodí = zavře.
@@ -956,18 +984,33 @@ impl Backend for VigemBackend {
     }
 
     fn stav_sbernice(&mut self) -> BusState {
-        self.simulace.unwrap_or_else(updater::vigembus::state)
+        match self.simulace {
+            Some(Simulace::Sbernice(s)) => s,
+            // Simulovaný pad sběrnici „má" (sem se nedojde — chybějící
+            // sběrnici nikdy nehlásí); skutečný stav se v simulaci nečte.
+            Some(Simulace::Pad) => BusState::Ready,
+            None => updater::vigembus::state(),
+        }
     }
 
     fn cekej_na_pripravenost(&mut self) -> Result<(), VigemError> {
+        if self.simulace == Some(Simulace::Pad) {
+            return Ok(());
+        }
         self.pad.as_mut().ok_or(VigemError::Gone)?.wait_ready()
     }
 
     fn slot(&mut self) -> Result<u32, VigemError> {
+        if self.simulace == Some(Simulace::Pad) {
+            return Ok(0);
+        }
         self.pad.as_mut().ok_or(VigemError::Gone)?.user_index()
     }
 
     fn posli(&mut self, report: XusbReport) -> Result<(), VigemError> {
+        if self.simulace == Some(Simulace::Pad) {
+            return Ok(());
+        }
         self.pad.as_mut().ok_or(VigemError::Gone)?.submit(report)
     }
 
@@ -1154,7 +1197,10 @@ impl Pady {
     pub fn spust(oznam: Oznam) -> Result<Pady, String> {
         let simulace = simulace_z_promenne(std::env::var_os("KEYPAD_BEZ_VIGEM").as_deref());
         if let Some(s) = simulace {
-            log::warn!("KEYPAD_BEZ_VIGEM: ViGEmBus se nepoužije (simulace: {s:?})");
+            log::warn!(
+                "KEYPAD_BEZ_VIGEM: ViGEmBus se nepoužije (simulace: {s:?}) — instalátor se \
+                 nespouští, zvuk mlčí"
+            );
         }
         let stary = std::env::var_os("KEYPAD_VIGEM_STARY").is_some();
         if stary {
@@ -2376,19 +2422,73 @@ mod tests {
     #[test]
     fn simulace_chybejiciho_a_vypnuteho_vigembus() {
         use std::ffi::OsStr;
-        assert_eq!(simulace_z_promenne(None), None);
+        for ladici in [false, true] {
+            assert_eq!(simulace_z(None, ladici), None);
+            assert_eq!(
+                simulace_z(Some(OsStr::new("1")), ladici),
+                Some(Simulace::Sbernice(BusState::NotInstalled))
+            );
+            assert!(matches!(
+                simulace_z(Some(OsStr::new("vypnuty")), ladici),
+                Some(Simulace::Sbernice(BusState::InstalledNotRunning { device: Some(d), .. }))
+                    if d.problem == Some(22)
+            ));
+            assert!(matches!(
+                simulace_z(Some(OsStr::new("zbytek")), ladici),
+                Some(Simulace::Sbernice(BusState::InstalledNotRunning {
+                    device: None,
+                    ..
+                }))
+            ));
+        }
+        // Simulovaný pad jen v ladicím buildu; release ho bere jako
+        // chybějící ViGEmBus (nic nepředstírá).
         assert_eq!(
-            simulace_z_promenne(Some(OsStr::new("1"))),
-            Some(BusState::NotInstalled)
+            simulace_z(Some(OsStr::new("pad")), true),
+            Some(Simulace::Pad)
         );
-        assert!(matches!(
-            simulace_z_promenne(Some(OsStr::new("vypnuty"))),
-            Some(BusState::InstalledNotRunning { device: Some(d), .. }) if d.problem == Some(22)
-        ));
-        assert!(matches!(
-            simulace_z_promenne(Some(OsStr::new("zbytek"))),
-            Some(BusState::InstalledNotRunning { device: None, .. })
-        ));
+        assert_eq!(
+            simulace_z(Some(OsStr::new("PAD")), true),
+            Some(Simulace::Pad)
+        );
+        assert_eq!(
+            simulace_z(Some(OsStr::new("pad")), false),
+            Some(Simulace::Sbernice(BusState::NotInstalled))
+        );
+        assert_eq!(
+            simulace_z_promenne(Some(OsStr::new("pad"))),
+            simulace_z(Some(OsStr::new("pad")), cfg!(debug_assertions))
+        );
+    }
+
+    /// `KEYPAD_BEZ_VIGEM=pad`: ovladač se zapne a hraje (stavy i tep),
+    /// aniž by se otevřel ViGEmBus; vypnutí ho zase vypne.
+    #[test]
+    fn simulovany_pad_se_zapne_a_tepe() {
+        let b = VigemBackend {
+            pad: None,
+            simulace: Some(Simulace::Pad),
+            simulace_stary: false,
+        };
+        let status = Arc::new(PadStatus::new(0));
+        let oznam: Oznam = Arc::new(|_: &PadInfo| {});
+        let mut s = Smycka::new(b, Arc::clone(&status), oznam);
+        s.start();
+        assert_eq!(status.stav(), PadStav::Off);
+        assert!(!status.snapshot().needs_update);
+        s.prikaz(PadPrikaz::Zapnout);
+        assert_eq!(status.stav(), PadStav::On);
+        assert_eq!(status.snapshot().player, Some(1));
+        assert!(status.heartbeat_ms() > 0, "tep běží");
+        s.prikaz(PadPrikaz::Stav(PadState {
+            thumb_lx: AXIS_MAX,
+            ..PadState::NEUTRAL
+        }));
+        s.krok();
+        assert_eq!(status.stav(), PadStav::On, "stav prošel");
+        assert!(s.b.pad.is_none(), "žádné skutečné zařízení");
+        s.prikaz(PadPrikaz::Vypnout);
+        assert_eq!(status.stav(), PadStav::Off);
     }
 
     /// `pad_status` čte stav z jiného vlákna než pad vlákno zapisuje —

@@ -72,10 +72,32 @@ pub fn webview_data_dir() -> Option<PathBuf> {
     std::env::var_os("LOCALAPPDATA").map(|p| PathBuf::from(p).join(APP_IDENTIFIER))
 }
 
-/// Náhradní místo logu, když složka s `.exe` není zapisovatelná:
-/// `%APPDATA%\KeyPad`.
+/// `%APPDATA%\KeyPad`: konfigurace ([`config_path`]) a náhradní místo
+/// logu, když složka s `.exe` není zapisovatelná.
 pub fn roaming_dir() -> Option<PathBuf> {
     std::env::var_os("APPDATA").map(|p| PathBuf::from(p).join(APP_NAME))
+}
+
+/// Název souboru konfigurace (klávesy ovladačů, zvuk). JSON, ne TOML:
+/// parser `serde_json` v aplikaci už je, `toml` by ji zvětšil o 323 KiB
+/// (naměřeno, Fáze 6).
+pub const CONFIG_FILE: &str = "config.json";
+
+/// Záloha nevalidní konfigurace vedle [`CONFIG_FILE`]: aplikace do ní
+/// odloží soubor, který nejde načíst, a platí výchozí klávesy. Patří
+/// uživateli stejně jako konfigurace — odinstalace ji nemaže.
+pub const CONFIG_BACKUP_FILE: &str = "config.invalid.json";
+
+/// Konfigurace aplikace: `%APPDATA%\KeyPad\config.json`.
+///
+/// Proč ne vedle `KeyPad.exe`: instalační složku aktualizace přepisuje
+/// a odinstalace maže, kdežto klávesy patří uživateli a mají přežít
+/// obojí. Proč roaming, a ne `%LOCALAPPDATA%`: v cestovním profilu jde
+/// mapování s uživatelem na další počítač. Jeden zdroj pravdy — aplikace
+/// soubor čte a píše, odinstalace v téže složce ([`roaming_dir`]) nechá
+/// konfiguraci i zálohu a hlásí, že zůstaly.
+pub fn config_path() -> Option<PathBuf> {
+    roaming_dir().map(|d| d.join(CONFIG_FILE))
 }
 
 /// Zjistí commit, na kterém větev `main` právě stojí.
@@ -391,5 +413,15 @@ mod tests {
     fn instalace_je_v_profilu() {
         let d = install_dir();
         assert!(d.ends_with(r"Programs\KeyPad"), "{}", d.display());
+    }
+
+    /// Konfigurace leží v `%APPDATA%\KeyPad`, ne vedle programu — jen se
+    /// spočítá cesta, soubor se nečte ani nezakládá.
+    #[test]
+    fn konfigurace_je_v_roamingu() {
+        let p = config_path().expect("APPDATA je ve Windows vždy nastavená");
+        assert!(p.ends_with(r"KeyPad\config.json"), "{}", p.display());
+        assert_eq!(p.parent(), roaming_dir().as_deref());
+        assert!(!p.starts_with(install_dir()));
     }
 }

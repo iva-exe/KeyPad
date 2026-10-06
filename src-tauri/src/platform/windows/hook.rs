@@ -8,13 +8,22 @@
 //! Windows jinak po `LowLevelHooksTimeout` hook potichu odeberou
 //! a klávesy by šly do hry, i když má ovladač běžet.
 //!
+//! Co callback smí (Fáze 6, spec 2.3): zápis do slotů padů a do atomiků
+//! [`Vystup`]u (režim, oznámení, revize mapování, živý stav), `SetEvent`,
+//! `GetAsyncKeyState` a `PostThreadMessageW` jen po panice do vlastní
+//! fronty. Nesmí kanál, `Mutex`, alokaci ani uvolnění, `log::`, `emit`
+//! ani klon mapování — snímek mapování pro okno klonuje jen smyčka na
+//! povel [`HookPrikaz::Zverejni`].
+//!
 //! Všechno ostatní (příkazy z okna, časovač přiřazování, hlášení paniky
-//! do logu) dělá táž smyčka mimo callback.
+//! do logu, popředí okna) dělá táž smyčka mimo callback.
 //!
 //! Vlákno s enginem běží celou dobu, samotný hook je ale v systému JEN
-//! tehdy, když ho engine potřebuje — je zapnutý aspoň jeden ovladač
-//! (nebo se přiřazuje klávesa). Jinak KeyPad na klávesnici vůbec nesahá
-//! (princip 10) a nic nemůže zdržet psaní v jiných programech.
+//! tehdy, když ho engine potřebuje ([`potreba_hooku`]): je zapnutý aspoň
+//! jeden ovladač (nebo se přiřazuje klávesa), nebo je okno KeyPadu
+//! v popředí (živé klávesy v okně, Fáze 6). Jinak KeyPad na klávesnici
+//! vůbec nesahá (princip 10) a nic nemůže zdržet psaní v jiných
+//! programech.
 
 use std::cell::RefCell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -24,8 +33,8 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
 use keypad_core::{
-    Decision, DisabledReason, Engine, ForceReason, KeyId, Mapping, Mode, PadId, PadState,
-    PadUpdates, MAX_PADS,
+    BindKind, Decision, DisabledReason, Engine, ForceReason, KeyId, LiveInputs, Mapping,
+    MappingError, Mode, PadAction, PadId, PadState, PadUpdates, MAX_PADS,
 };
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -34,8 +43,9 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, KillTimer, PeekMessageW, PostThreadMessageW,
-    SetTimer, SetWindowsHookExW, UnhookWindowsHookEx, EVENT_SYSTEM_DESKTOPSWITCH, HC_ACTION, HHOOK,
+    CallNextHookEx, DispatchMessageW, GetAncestor, GetForegroundWindow, GetMessageW, KillTimer,
+    PeekMessageW, PostThreadMessageW, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx,
+    EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_FOREGROUND, GA_ROOT, HC_ACTION, HHOOK,
     KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, MSG, PM_NOREMOVE, WH_KEYBOARD_LL,
     WINEVENT_OUTOFCONTEXT, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
     WM_TIMER,
@@ -45,6 +55,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const WM_PRIKAZ: u32 = WM_APP + 1;
 /// Callback spadl do paniky — smyčka to zaloguje (callback logovat nesmí).
 const WM_PANIKA: u32 = WM_APP + 2;
+/// Okno KeyPadu získalo nebo ztratilo popředí (callback WinEventu): ať
+/// smyčka projde hlídáním hooku. Callback WinEventu běží uvnitř
+/// `GetMessageW`, takže sám smyčku neotočí.
+const WM_POPREDI: u32 = WM_APP + 3;
 
 /// Krok časovače při přiřazování klávesy. Timeout přiřazování je 10 s;
 /// o čtvrt vteřiny později je pořád „po deseti vteřinách". Časovač běží
@@ -56,6 +70,9 @@ const TIK_MS: u32 = 250;
 /// `hook_selftest` (`#[path]`) a dotaz jde přes podvrhnutelné `os_drzi`.
 const VK_LWIN: u32 = 0x5B;
 const VK_RWIN: u32 = 0x5C;
+/// Bity levé a pravé Win v `Stav::win`.
+const WIN_L: u8 = 1;
+const WIN_R: u8 = 2;
 
 /// Watchdog (Fáze 5): ovladač, jehož pad vlákno déle nemluvilo s ViGEm,
 /// je zaseknutý. Keep-alive chodí každých 200 ms — 1 s je pět
@@ -111,8 +128,8 @@ impl Udalost {
 ///
 /// **Volá se i z callbacku hooku** — implementace nesmí blokovat,
 /// alokovat, logovat ani brát zámek sdílený s jiným vláknem: jen
-/// atomiky a události Windows (princip 3). Ve Fázi 4 tudy jde stav
-/// padu do atomického slotu pad vlákna a režim do okna.
+/// atomiky a události Windows (princip 3). Výjimkou je jen
+/// [`Vystup::mapovani`], které volá výhradně smyčka.
 pub trait Vystup: Send + Sync {
     /// `udalost` je `None` u příkazů, přeinstalace, paniky a konce hooku.
     /// Vstříknuté klávesy přicházejí s `Decision::NONE` — engine je
@@ -130,22 +147,30 @@ pub trait Vystup: Send + Sync {
     fn tep_ms(&self, _pad: PadId) -> Option<u64> {
         None
     }
+
+    /// Živý stav vstupů pro okno — jen s viditelným oknem. Callback
+    /// i smyčka: jen atomiky.
+    fn zive(&self, _z: &[LiveInputs; MAX_PADS]) {}
+
+    /// Revize mapování enginu. Callback i smyčka: jen atomik.
+    fn revize(&self, _rev: u64) {}
+
+    /// Snímek mapování pro okno. JEN smyčka (povel `Zverejni`) — klonuje.
+    fn mapovani(&self, _rev: u64, _m: &Mapping) {}
 }
 
 /// Příkazy hook vláknu. Každý vede na volání enginu a jeho rozhodnutí
 /// jde do [`Vystup`]u stejně jako rozhodnutí o klávese.
-#[derive(Debug, Clone)]
-#[allow(dead_code, reason = "Mapovani použije Fáze 6–7 (editor, konfigurace)")]
+#[derive(Debug)]
 pub enum HookPrikaz {
-    /// Nové mapování (v režimu Gamepad nejdřív vynutí Klávesnici).
-    Mapovani(Box<Mapping>),
     /// Ovladač se připojil — engine ho povolí (z `Disabled` na
     /// Klávesnici, nikdy sám na Gamepad).
     Povol(PadId),
     /// Ovladač není — jeho klávesy jdou zase do Windows; poslední
-    /// vypnutý → `Disabled` (a hook ze systému zmizí).
+    /// vypnutý → `Disabled` (a hook ze systému zmizí, není-li okno
+    /// v popředí).
     Zakaz(PadId, DisabledReason),
-    /// Přepnout Klávesnice ↔ Gamepad (tlačítko v okně).
+    /// Přepnout Klávesnice ↔ Gamepad (nabídka ikony).
     Prepni,
     /// Uživatel zapnul ovladač přepínačem: zachytávat. Z pozastavení se
     /// hook předtím nainstaluje znovu — Windows ho mohli potichu odebrat
@@ -158,7 +183,68 @@ pub enum HookPrikaz {
     Zapomen(ForceReason),
     /// Odhooknout a nainstalovat znovu (Windows mohli hook potichu
     /// odebrat). Držené klávesy se zapomenou.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "posílá hook_selftest; aplikace přeinstaluje přes Zachytavej"
+        )
+    )]
     Preinstaluj,
+    /// Hlavní okno je vidět (jeho HWND), nebo je schované či
+    /// minimalizované (`None`). Jen s viditelným oknem hook počítá živý
+    /// stav a hlídá popředí; schování zruší přiřazování.
+    Okno(Option<isize>),
+    /// Klik na čepičku: přiřazovat klávesu. Přijme se, jen když je okno
+    /// V TU CHVÍLI v popředí — klávesu stisknutou jinde (hra, chat) by
+    /// přiřazování spolklo.
+    Prirad { cil: PadAction, druh: BindKind },
+    /// Esc, klik jinam v okně: přiřazování skončí beze změny.
+    ZrusPrirazeni,
+    /// Úprava mapování z editoru, i za hry (bez pozastavení, OQ 43).
+    /// Odpověď jde kanálem `bounded(1)` přes `try_send` — smyčka na okno
+    /// nikdy nečeká. Bez odpovědi (rozbitý engine) skončí příkaz okna
+    /// chybou kanálu.
+    Uprav {
+        zmena: Zmena,
+        odpoved: Sender<Result<(), ChybaUpravy>>,
+    },
+    /// Vlákno okna chce snímek mapování (revize je novější než jeho
+    /// zrcadlo): `Vystup::mapovani` s aktuální revizí. Klon jen tady,
+    /// nikdy v callbacku.
+    Zverejni,
+    /// Syntetická klávesa pro testy okna na skryté ploše (místo
+    /// `SendInput`, který by šel do OS). Jde STEJNOU funkcí jako callback
+    /// ([`zpracuj_udalost`]). Jen v debug buildu.
+    #[cfg(debug_assertions)]
+    TestKlavesa { klavesa: KeyId, vk: u32, dolu: bool },
+}
+
+/// Co se má s mapováním udělat ([`HookPrikaz::Uprav`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Zmena {
+    /// `×` nebo pravý klik na čepičku: vstup bez kláves.
+    VyprazdniVstup(PadAction),
+    /// Odebraný ovladač: všechny jeho klávesy pryč.
+    VymazOvladac(PadId),
+    /// „Výchozí klávesy" ovladače 1 (klávesy jiných ovladačů nebere, OQ 49).
+    VychoziPrvni,
+    /// „Zpět": vrátit předchozí mapování — jen když je mapování pořád
+    /// v revizi `kdyz_revize` (nikdo ho mezitím nezměnil).
+    Obnov {
+        mapovani: Box<Mapping>,
+        kdyz_revize: u64,
+    },
+}
+
+/// Proč úprava mapování neprošla.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChybaUpravy {
+    /// Pravidla mapování (poslední vazba, …).
+    Mapovani(MappingError),
+    /// Mapování se mezitím změnilo — „Zpět" by vrátilo něco jiného, než
+    /// uživatel viděl.
+    Zastarale,
 }
 
 /// Stav hooku pro ostatní vlákna.
@@ -170,6 +256,10 @@ pub struct HookStatus {
     paniky: AtomicU32,
     /// Po panice selhal i úklid: engine se už nepoužívá, hook je pryč.
     rozbity: AtomicBool,
+    /// Poslední pokus o instalaci selhal — další neúspěch už jde do logu
+    /// jen jako `debug` (bez zapnutého ovladače se zkouší s každou
+    /// zprávou smyčky, dokud je okno v popředí).
+    chyba: AtomicBool,
 }
 
 #[allow(
@@ -232,11 +322,12 @@ pub struct Hook {
 )]
 impl Hook {
     /// Spustí vlákno s enginem. Samotný hook se do systému dostane až
-    /// s prvním povoleným ovladačem ([`HookPrikaz::Povol`]).
+    /// s prvním povoleným ovladačem ([`HookPrikaz::Povol`]) nebo s oknem
+    /// v popředí ([`HookPrikaz::Okno`]).
     ///
     /// Engine startuje jako vždy v `Disabled { PadNotConnected }`.
     pub fn spust(mapovani: Mapping, vystup: Arc<dyn Vystup>) -> Result<Hook, String> {
-        spust_s(mapovani, vystup, || Ok(()))
+        spust_s(mapovani, vystup, || Ok(()), je_v_popredi)
     }
 
     pub fn status(&self) -> &Arc<HookStatus> {
@@ -278,11 +369,14 @@ impl Drop for Hook {
 }
 
 /// Jako [`Hook::spust`], jen vlákno nejdřív zavolá `pred` — testy tak
-/// hook instalují na skryté ploše, ne na ploše vlastníka.
+/// hook instalují na skryté ploše, ne na ploše vlastníka — a popředí
+/// okna zjišťuje `aktivni` (testy ho podvrhnou: skrytá plocha popředí
+/// nemá).
 fn spust_s(
     mapovani: Mapping,
     vystup: Arc<dyn Vystup>,
     pred: impl FnOnce() -> Result<(), String> + Send + 'static,
+    aktivni: fn(isize) -> bool,
 ) -> Result<Hook, String> {
     let status = Arc::new(HookStatus::default());
     let (tx, rx) = crossbeam_channel::unbounded();
@@ -299,7 +393,8 @@ fn spust_s(
                     let nouze = Arc::clone(&vystup);
                     let stav = Arc::clone(&st);
                     let vysledek = catch_unwind(AssertUnwindSafe(|| {
-                        vlakno(Engine::new(mapovani), vystup, stav, rx, &hotovo_tx)
+                        let s = Stav::novy(Engine::new(mapovani), vystup, aktivni);
+                        vlakno(s, stav, rx, &hotovo_tx)
                     }));
                     if vysledek.is_err() {
                         po_panice_vlakna(&*nouze, &st);
@@ -330,7 +425,8 @@ fn spust_s(
 /// Hook vlákno spadlo mimo callback (engine, výstup). Hook zmizí se
 /// skončením vlákna (Windows ho odeberou samy), klávesy jdou do OS —
 /// ale ovladače by si nechaly poslední stav a pad vlákna by ho dál
-/// posílala. Proto všem neutrál a okno se dozví, že nic nezachytává.
+/// posílala. Proto všem neutrál a okno se dozví, že nic nezachytává
+/// a nic nesvítí.
 fn po_panice_vlakna(vystup: &dyn Vystup, status: &HookStatus) {
     status.nainstalovan.store(false, Ordering::Release);
     status.rozbity.store(true, Ordering::Release);
@@ -351,6 +447,7 @@ fn po_panice_vlakna(vystup: &dyn Vystup, status: &HookStatus) {
                 reason: DisabledReason::PadError,
             },
         );
+        vystup.zive(&[LiveInputs::EMPTY; MAX_PADS]);
         vystup.hook_chyba(true);
     }));
     log::error!("hook vlákno spadlo — ovladače dostaly neutrál, klávesy jdou do Windows");
@@ -366,10 +463,52 @@ struct Stav {
     /// Drží OS klávesu s daným VK? Skutečně [`os_drzi`], v testech
     /// podvrh (skutečný stav klávesnice testy měnit nesmí).
     os_drzi: fn(u32) -> bool,
+    /// Je okno s tímhle HWND v popředí? Skutečně [`je_v_popredi`],
+    /// v testech podvrh.
+    aktivni: fn(isize) -> bool,
+    /// HWND viditelného hlavního okna; `None` = schované nebo
+    /// minimalizované. Jen s viditelným oknem se počítá živý stav.
+    okno: Option<isize>,
+    /// Okno je v popředí (podle posledního `EVENT_SYSTEM_FOREGROUND`).
+    /// Jen tehdy jsou vidět i klávesy, které patří Windows (soukromí:
+    /// psaní do jiného programu okno vidět nemá), a jen tehdy smí být hook
+    /// v systému bez zapnutého ovladače.
+    okno_aktivni: bool,
+    /// Popředí viditelného okna se hlídá (WinEvent je zaregistrovaný).
+    /// Bez toho se okno nikdy nebere jako aktivní a přiřazování se
+    /// nepřijme — ztrátu popředí by nic neohlásilo a přiřazování by
+    /// spolklo klávesu napsanou v jiném programu.
+    sledovano: bool,
+    /// Levá a pravá Win ([`WIN_L`], [`WIN_R`]), jak je callback viděl
+    /// stisknout a pustit. Win jde vždy do OS, takže tudy projde každá
+    /// její událost; Windows se pak na Win ptají, jen když je podle toho
+    /// dole ([`drzi_win`]).
+    win: u8,
+    /// Instalace hooku do systému. Skutečně [`nainstaluj`], v testech
+    /// podvrh — selhání skutečné instalace se vyvolat nedá.
+    instaluj: fn() -> Result<HHOOK, String>,
     /// Kdy engine ovladač povolil. Pad vlákno ohlásí „zapnuto" dřív,
     /// než zkopíruje tep do slotu — watchdog tedy bere novější z obou,
     /// jinak by čerstvě zapnutý ovladač mohl hned vypadat zaseknutý.
     povoleno_ms: [u64; MAX_PADS],
+}
+
+impl Stav {
+    fn novy(engine: Engine, vystup: Arc<dyn Vystup>, aktivni: fn(isize) -> bool) -> Stav {
+        Stav {
+            engine,
+            vystup,
+            rozbity: false,
+            os_drzi,
+            aktivni,
+            okno: None,
+            okno_aktivni: false,
+            sledovano: false,
+            win: 0,
+            instaluj: nainstaluj,
+            povoleno_ms: [0; MAX_PADS],
+        }
+    }
 }
 
 /// Drží OS klávesu? Asynchronní stav klávesnice: v LL hooku je to stav
@@ -381,6 +520,102 @@ fn os_drzi(vk: u32) -> bool {
     };
     // SAFETY: jen čte asynchronní stav klávesy.
     (unsafe { GetAsyncKeyState(vk) } as u16) & 0x8000 != 0
+}
+
+/// Bit Win ([`WIN_L`], [`WIN_R`]) podle virtuální klávesy; `0` = jiná
+/// klávesa. Podle VK, ne scan kódu: stav OS se vede po VK a vstříknutá
+/// Win (klávesnice na obrazovce) scan kód mít nemusí.
+fn bit_win(vk: u32) -> u8 {
+    match vk {
+        VK_LWIN => WIN_L,
+        VK_RWIN => WIN_R,
+        _ => 0,
+    }
+}
+
+/// Drží OS Win (pravidlo Win+klávesa, OQ 44)? Bez Win „dole" podle
+/// callbacku se Windows neptá — každý dotaz je volání jádra a právě ty
+/// tvořily ocas p99 zpracování klávesy. Win „dole" se ale ověří a bit
+/// opraví: její uvolnění mohl callback minout (zabezpečená plocha po
+/// Win+L, hook mimo systém) a zastaralý bit by jinak posílal Windows
+/// každý další stisk. Volá se z callbacku — jen `GetAsyncKeyState`.
+fn drzi_win(s: &mut Stav) -> bool {
+    if s.win == 0 {
+        return false;
+    }
+    let mut drzi = 0;
+    for (bit, vk) in [(WIN_L, VK_LWIN), (WIN_R, VK_RWIN)] {
+        if s.win & bit != 0 && (s.os_drzi)(vk) {
+            drzi |= bit;
+        }
+    }
+    s.win = drzi;
+    drzi != 0
+}
+
+/// Srovná bity Win se stavem Windows. Po instalaci hooku a po přepnutí
+/// plochy: stisk Win, který callback neviděl (hook ještě nebyl v systému,
+/// Win stisknutá na jiné ploše), by jinak pravidlo Win+klávesa minulo.
+fn srovnej_win() {
+    STAV.with(|s| {
+        if let Some(s) = s.borrow_mut().as_mut() {
+            s.win = [(WIN_L, VK_LWIN), (WIN_R, VK_RWIN)]
+                .into_iter()
+                .filter(|&(_, vk)| (s.os_drzi)(vk))
+                .fold(0, |a, (bit, _)| a | bit);
+        }
+    });
+}
+
+/// Podvrh [`os_drzi`]: OS nic nedrží. Testy a syntetické klávesy
+/// (`KEYPAD_TEST_KLAVESY`) — skutečná klávesnice vlastníka nesmí
+/// rozhodovat o klávese, kterou poslal test.
+#[cfg(any(test, debug_assertions))]
+fn nic_nedrzi(_vk: u32) -> bool {
+    false
+}
+
+/// Je hlavní okno (`hwnd`) v popředí? Kořen okna v popředí, ne
+/// `WindowEvent::Focused` z tao: ten v Tauri skládá fokus WebView2, ne
+/// popředí (tauri-runtime-wry 2.11, spec 3 bod 11). Jen porovnání HWND
+/// — na cizí proces se nesahá (OQ 39).
+fn je_v_popredi(hwnd: isize) -> bool {
+    // SAFETY: jen čte handle okna v popředí a jeho kořen; neplatný
+    // handle dá neplatný výsledek, nic víc.
+    unsafe {
+        let f = GetForegroundWindow();
+        !f.is_invalid() && GetAncestor(f, GA_ROOT).0 as isize == hwnd
+    }
+}
+
+/// Podvrh [`je_v_popredi`] pro test okna na skryté ploše
+/// (`KEYPAD_TEST_POPREDI`): skrytá plocha popředí nemá, viditelné okno
+/// se tam bere jako aktivní.
+#[cfg(debug_assertions)]
+fn vzdy_aktivni(_hwnd: isize) -> bool {
+    true
+}
+
+/// Ladicí proměnná prostředí je nastavená na `1`.
+#[cfg(debug_assertions)]
+fn ladici(jmeno: &str) -> bool {
+    std::env::var_os(jmeno).is_some_and(|v| v == "1")
+}
+
+/// Test okna na skryté ploše (B6): klávesy posílá test příkazem, ne
+/// klávesnice, a skrytá plocha nemá popředí. Jen debug build — release
+/// proměnné nečte vůbec.
+#[cfg(debug_assertions)]
+fn ladici_podvrhy(mut stav: Stav) -> Stav {
+    if ladici("KEYPAD_TEST_KLAVESY") {
+        log::warn!("KEYPAD_TEST_KLAVESY: hook nečte stav klávesnice (testovací klávesy)");
+        stav.os_drzi = nic_nedrzi;
+    }
+    if ladici("KEYPAD_TEST_POPREDI") {
+        log::warn!("KEYPAD_TEST_POPREDI: viditelné okno se bere jako okno v popředí");
+        stav.aktivni = vzdy_aktivni;
+    }
+    stav
 }
 
 thread_local! {
@@ -400,8 +635,7 @@ fn ted_ms() -> u64 {
 }
 
 fn vlakno(
-    engine: Engine,
-    vystup: Arc<dyn Vystup>,
+    stav: Stav,
     status: Arc<HookStatus>,
     rx: Receiver<HookPrikaz>,
     hotovo: &Sender<Result<u32, String>>,
@@ -414,18 +648,14 @@ fn vlakno(
     // SAFETY: bez parametrů.
     let tid = unsafe { GetCurrentThreadId() };
 
-    STAV.with(|s| {
-        *s.borrow_mut() = Some(Stav {
-            engine,
-            vystup,
-            rozbity: false,
-            os_drzi,
-            povoleno_ms: [0; MAX_PADS],
-        })
-    });
-    // Hook zatím ne: bez zapnutého ovladače ho engine nepotřebuje.
+    #[cfg(debug_assertions)]
+    let stav = ladici_podvrhy(stav);
+    STAV.with(|s| *s.borrow_mut() = Some(stav));
+    // Hook zatím ne: bez zapnutého ovladače a okna v popředí ho engine
+    // nepotřebuje.
     let mut hook = HHOOK::default();
     let plocha = hlidej_plochu();
+    let mut popredi: Option<HWINEVENTHOOK> = None;
     let _ = hotovo.send(Ok(tid));
 
     let mut casovac = 0usize;
@@ -464,10 +694,16 @@ fn vlakno(
                             });
                             s_enginem(|e| e.enable(pad));
                         }
-                        p => s_enginem(|e| prikaz(e, p, ted_ms())),
+                        HookPrikaz::Okno(h) => {
+                            popredi = hlidej_popredi(popredi, h.is_some());
+                            okno(h, popredi.is_some());
+                        }
+                        p => proved(p),
                     }
                 }
             }
+            // Popředí se změnilo — stačí projít hlídáním hooku níž.
+            WM_POPREDI => {}
             WM_TIMER if msg.hwnd.is_invalid() => {
                 s_enginem(|e| e.tick(ted_ms()));
             }
@@ -509,7 +745,7 @@ fn vlakno(
         // SAFETY: časovač vlákna vytvořený v `hlidej_casovac`.
         let _ = unsafe { KillTimer(None, casovac) };
     }
-    if let Some(h) = plocha {
+    for h in [plocha, popredi].into_iter().flatten() {
         // SAFETY: handle z SetWinEventHook, odebírá se právě jednou.
         let _ = unsafe { UnhookWinEvent(h) };
     }
@@ -568,6 +804,168 @@ fn prepnuti_plochy() {
         );
     }
     s_enginem(|e| e.reset_held(ForceReason::DesktopSwitch));
+    // Win+L: uvolnění Win je už na zabezpečené ploše a callback ho nevidí.
+    srovnej_win();
+}
+
+/// Popředí se hlídá jen s viditelným oknem (`chci`): schované okno
+/// popředí mít nemůže a WinEvent by jen budil smyčku při každém Alt+Tab
+/// (princip 10). `None` = hlídat nejde nebo není proč.
+fn hlidej_popredi(h: Option<HWINEVENTHOOK>, chci: bool) -> Option<HWINEVENTHOOK> {
+    match (h, chci) {
+        (None, true) => {
+            // SAFETY: callback je funkce tohoto modulu a žije po celý běh;
+            // WINEVENT_OUTOFCONTEXT = volá se ze smyčky zpráv tohoto
+            // vlákna, do cizích procesů se nic nevkládá.
+            let h = unsafe {
+                SetWinEventHook(
+                    EVENT_SYSTEM_FOREGROUND,
+                    EVENT_SYSTEM_FOREGROUND,
+                    None,
+                    Some(popredi_se_zmenilo),
+                    0,
+                    0,
+                    WINEVENT_OUTOFCONTEXT,
+                )
+            };
+            if h.is_invalid() {
+                log::warn!(
+                    "popředí okna nejde hlídat — okno neukáže živé klávesy a nepřijme přiřazování"
+                );
+                None
+            } else {
+                Some(h)
+            }
+        }
+        (Some(h), false) => {
+            // SAFETY: handle z SetWinEventHook, odebírá se právě jednou.
+            let _ = unsafe { UnhookWinEvent(h) };
+            None
+        }
+        (h, _) => h,
+    }
+}
+
+/// Callback změny popředí. Běží ve smyčce hook vlákna (ne v LL hooku);
+/// panika nesmí přes hranici FFI.
+unsafe extern "system" fn popredi_se_zmenilo(
+    _hook: HWINEVENTHOOK,
+    _udalost: u32,
+    _okno: HWND,
+    _objekt: i32,
+    _potomek: i32,
+    _vlakno: u32,
+    _cas: u32,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(zmena_popredi));
+}
+
+/// Okno získalo nebo ztratilo popředí (mimo FFI, ať to jde otestovat).
+///
+/// Ztráta popředí zruší přiřazování: klávesu by jinak spolklo, i když
+/// uživatel už píše jinam (Alt+Tab do chatu, OQ 42). Živý stav se
+/// přepočítá (klávesy Windows jen v popředí) a smyčka si pošle
+/// `WM_POPREDI`, ať projde hlídáním hooku.
+fn zmena_popredi() {
+    let zmeneno = STAV.with(|s| {
+        let Ok(mut g) = s.try_borrow_mut() else {
+            return false;
+        };
+        let Some(s) = g.as_mut().filter(|s| !s.rozbity) else {
+            return false;
+        };
+        let Some(h) = s.okno else {
+            return false;
+        };
+        let aktivni = (s.aktivni)(h);
+        // Přiřazování ruší každá událost bez popředí, nejen přechod
+        // z aktivního okna: zpráva o aktivaci mohla dojít až po přijetí
+        // kliku, a pak by ztráta jako přechod nevypadala.
+        let prirazuje = matches!(s.engine.mode(), Mode::Binding { .. });
+        if aktivni == s.okno_aktivni && (aktivni || !prirazuje) {
+            return false;
+        }
+        s.okno_aktivni = aktivni;
+        let d = if aktivni {
+            Decision::NONE
+        } else {
+            s.engine.cancel_binding(ted_ms())
+        };
+        predej(s, None, &d);
+        true
+    });
+    if zmeneno {
+        // SAFETY: jen zpráva do fronty vlastního vlákna; nečeká.
+        unsafe {
+            let _ = PostThreadMessageW(GetCurrentThreadId(), WM_POPREDI, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+/// Okno je vidět (`Some(hwnd)`), nebo ne. `sledovano` = popředí se hlídá
+/// (WinEvent je zaregistrovaný); bez toho se okno nikdy nebere jako
+/// aktivní — hook by jinak mohl zůstat v systému i s oknem na pozadí.
+fn okno(h: Option<isize>, sledovano: bool) {
+    STAV.with(|s| {
+        let mut g = s.borrow_mut();
+        let Some(s) = g.as_mut().filter(|s| !s.rozbity) else {
+            return;
+        };
+        match h {
+            Some(h) => {
+                s.okno = Some(h);
+                s.sledovano = sledovano;
+                s.okno_aktivni = sledovano && (s.aktivni)(h);
+                // Přiřazovat jde jen v okně v popředí, jehož popředí se
+                // hlídá — jinak by ho nic nezrušilo.
+                let d = if s.okno_aktivni {
+                    Decision::NONE
+                } else {
+                    s.engine.cancel_binding(ted_ms())
+                };
+                predej(s, None, &d);
+            }
+            None => {
+                s.okno = None;
+                s.okno_aktivni = false;
+                s.sledovano = false;
+                // Přiřazovat jde jen v okně, které je vidět.
+                let d = s.engine.cancel_binding(ted_ms());
+                predej(s, None, &d);
+                // Schované okno nic neukazuje — a příští ukázání nesmí
+                // na okamžik rozsvítit klávesy, které už nikdo nedrží.
+                s.vystup.zive(&[LiveInputs::EMPTY; MAX_PADS]);
+            }
+        }
+    });
+}
+
+/// Smí začít přiřazování? Jen když je okno V TU CHVÍLI v popředí (ne
+/// podle poslední události — klik mohl přijít z okna, které mezitím
+/// popředí ztratilo) a jeho popředí se hlídá: bez hlídání by přiřazování
+/// nezrušila ztráta popředí a spolklo by klávesu napsanou v jiném
+/// programu (spec 2.4).
+///
+/// Přijetí rovnou zapíše `okno_aktivni`: zpráva o aktivaci okna ještě
+/// nemusela dojít a ztráta popředí se pozná jako přechod z aktivního.
+fn prijmi_prirazovani() -> Result<(), &'static str> {
+    STAV.with(|s| {
+        let mut g = s.borrow_mut();
+        let Some(s) = g.as_mut().filter(|s| !s.rozbity) else {
+            return Err("engine není");
+        };
+        let Some(h) = s.okno else {
+            return Err("okno KeyPadu není vidět");
+        };
+        if !s.sledovano {
+            return Err("popředí okna se nehlídá");
+        }
+        if !(s.aktivni)(h) {
+            return Err("okno KeyPadu není v popředí");
+        }
+        s.okno_aktivni = true;
+        Ok(())
+    })
 }
 
 /// Režim enginu (`None` = stav je pryč nebo rozbitý).
@@ -580,34 +978,69 @@ fn rezim() -> Option<Mode> {
     })
 }
 
-/// Hook je v systému právě tehdy, když ho engine potřebuje: mimo
-/// `Disabled` (zapnutý ovladač, přiřazování). Po odebrání se držené
-/// klávesy zapomenou — jejich key-upy hook neuvidí a zastaralý záznam
-/// by příští stisk téže klávesy vzal jako autorepeat.
+/// Má být hook v systému? (spec 2.4)
+///
+/// - zapnutý ovladač (hra, pauza) nebo přiřazování → ano, popředí okna na
+///   to nikdy nesahá (neztratí se klávesy hráče);
+/// - bez ovladače jen s oknem KeyPadu v popředí (živé klávesy, Scroll
+///   Lock → „zapni ovladač");
+/// - rozbitý engine (`None`) → ne, callback by jen propouštěl.
+fn potreba_hooku(rezim: Option<Mode>, okno_aktivni: bool) -> bool {
+    match rezim {
+        None => false,
+        Some(Mode::Disabled { .. }) => okno_aktivni,
+        Some(Mode::Keyboard | Mode::Gamepad | Mode::Binding { .. }) => true,
+    }
+}
+
+/// Hook je v systému právě tehdy, když ho engine potřebuje
+/// ([`potreba_hooku`]). Po odebrání se držené klávesy zapomenou — jejich
+/// key-upy hook neuvidí a zastaralý záznam by příští stisk téže klávesy
+/// vzal jako autorepeat.
 fn hlidej_hook(hook: HHOOK, status: &HookStatus) -> HHOOK {
-    let potreba = rezim().is_some_and(|m| !matches!(m, Mode::Disabled { .. }));
-    match (potreba, hook.is_invalid()) {
-        (true, true) => match nainstaluj() {
+    let (rezim, okno_aktivni) = STAV.with(|s| {
+        s.borrow()
+            .as_ref()
+            .filter(|s| !s.rozbity)
+            .map_or((None, false), |s| (Some(s.engine.mode()), s.okno_aktivni))
+    });
+    // Bez zapnutého ovladače je hook v systému jen kvůli oknu: instalace
+    // a odebrání při každém Alt+Tab jdou do logu jen jako `debug`.
+    let kvuli_oknu = matches!(rezim, Some(Mode::Disabled { .. }));
+    match (potreba_hooku(rezim, okno_aktivni), hook.is_invalid()) {
+        (true, true) => match instaluj() {
             Ok(h) => {
                 status.nainstalovan.store(true, Ordering::Release);
                 status.instalaci.fetch_add(1, Ordering::AcqRel);
+                status.chyba.store(false, Ordering::Release);
                 nahlas_chybu(false);
-                log::info!("hook klávesnice nainstalován (zapnutý ovladač)");
+                if kvuli_oknu {
+                    log::debug!("hook klávesnice nainstalován (okno v popředí)");
+                } else {
+                    log::info!("hook klávesnice nainstalován (zapnutý ovladač)");
+                }
                 h
             }
             Err(e) => {
                 // Klávesy jdou do Windows — bezpečná strana (princip 1).
-                // Zachytávání bez hooku by jen předstíralo, že běží.
-                if rezim() == Some(Mode::Gamepad) {
+                // Zachytávání bez hooku by jen předstíralo, že běží,
+                // a přiřazování by čekalo na klávesu, kterou nikdo
+                // neuvidí.
+                if matches!(rezim, Some(Mode::Gamepad | Mode::Binding { .. })) {
                     s_enginem(|e| e.force_keyboard(ForceReason::HookReinstalled));
                 }
                 nahlas_chybu(true);
-                log::error!("hook klávesnice nejde nainstalovat: {e}");
+                if status.chyba.swap(true, Ordering::AcqRel) {
+                    log::debug!("hook klávesnice pořád nejde nainstalovat: {e}");
+                } else {
+                    log::error!("hook klávesnice nejde nainstalovat: {e}");
+                }
                 hook
             }
         },
         (false, true) => {
             // Hook už není potřeba — ani jeho chyba.
+            status.chyba.store(false, Ordering::Release);
             nahlas_chybu(false);
             hook
         }
@@ -615,11 +1048,28 @@ fn hlidej_hook(hook: HHOOK, status: &HookStatus) -> HHOOK {
             odhookni(hook);
             status.nainstalovan.store(false, Ordering::Release);
             s_enginem(|e| e.reset_held(ForceReason::HookReinstalled));
-            log::info!("hook klávesnice odebrán (žádný zapnutý ovladač)");
+            if kvuli_oknu {
+                log::debug!("hook klávesnice odebrán (okno není v popředí)");
+            } else {
+                log::info!("hook klávesnice odebrán (žádný zapnutý ovladač)");
+            }
             HHOOK::default()
         }
         _ => hook,
     }
+}
+
+/// Hook do systému ([`Stav::instaluj`]). Po instalaci srovná bity Win
+/// s Windows — stisk Win před instalací callback neviděl.
+fn instaluj() -> Result<HHOOK, String> {
+    let f = STAV.with(|s| {
+        s.borrow()
+            .as_ref()
+            .map_or(nainstaluj as fn() -> Result<HHOOK, String>, |s| s.instaluj)
+    });
+    let h = f()?;
+    srovnej_win();
+    Ok(h)
 }
 
 fn nainstaluj() -> Result<HHOOK, String> {
@@ -649,16 +1099,18 @@ fn preinstaluj(stary: HHOOK, status: &HookStatus) -> HHOOK {
         odhookni(stary);
     }
     s_enginem(|e| e.reset_held(ForceReason::HookReinstalled));
-    match nainstaluj() {
+    match instaluj() {
         Ok(h) => {
             status.nainstalovan.store(true, Ordering::Release);
             status.instalaci.fetch_add(1, Ordering::AcqRel);
+            status.chyba.store(false, Ordering::Release);
             nahlas_chybu(false);
             log::info!("hook klávesnice přeinstalován");
             h
         }
         Err(e) => {
             status.nainstalovan.store(false, Ordering::Release);
+            status.chyba.store(true, Ordering::Release);
             nahlas_chybu(true);
             log::error!("hook klávesnice nejde znovu nainstalovat: {e}");
             HHOOK::default()
@@ -695,18 +1147,99 @@ fn hlidej_casovac(casovac: usize) -> usize {
     }
 }
 
+/// Příkaz, který nepotřebuje stav smyčky (hook, WinEventy).
+fn proved(p: HookPrikaz) {
+    let ted = ted_ms();
+    match p {
+        HookPrikaz::Prirad { cil, druh } => match prijmi_prirazovani() {
+            Ok(()) => s_enginem(|e| e.start_binding(cil, druh, ted)),
+            Err(proc) => log::debug!("přiřazování: {proc} — klik se nepřijímá"),
+        },
+        HookPrikaz::ZrusPrirazeni => s_enginem(|e| e.cancel_binding(ted)),
+        HookPrikaz::Uprav { zmena, odpoved } => {
+            if let Some(r) = uprav(zmena, ted) {
+                let _ = odpoved.try_send(r);
+            }
+        }
+        HookPrikaz::Zverejni => zverejni(),
+        #[cfg(debug_assertions)]
+        HookPrikaz::TestKlavesa { klavesa, vk, dolu } => {
+            let u = Udalost {
+                klavesa,
+                scan: u32::from(klavesa.scan),
+                vk,
+                flags: if klavesa.extended {
+                    LLKHF_EXTENDED.0
+                } else {
+                    0
+                },
+                dolu,
+            };
+            let _ = zpracuj_udalost(&u);
+        }
+        p => s_enginem(|e| prikaz(e, p, ted)),
+    }
+}
+
+/// Příkazy, které jsou jen voláním enginu.
 fn prikaz(e: &mut Engine, p: HookPrikaz, ted: u64) -> Decision {
     match p {
-        HookPrikaz::Mapovani(m) => e.set_mapping(*m),
         HookPrikaz::Povol(pad) => e.enable(pad),
         HookPrikaz::Zakaz(pad, duvod) => e.disable(pad, duvod),
         HookPrikaz::Prepni => e.toggle(ted),
         HookPrikaz::Zachytavej => e.capture(ted),
         HookPrikaz::Vynut(duvod) => e.force_keyboard(duvod),
         HookPrikaz::Zapomen(duvod) => e.reset_held(duvod),
-        // Přeinstalaci dělá smyčka; bez hooku v systému není co dělat.
-        HookPrikaz::Preinstaluj => Decision::NONE,
+        // Přeinstalaci, okno, přiřazování, úpravy a snímek dělá smyčka
+        // (`proved`); bez hooku v systému není co přeinstalovat.
+        _ => Decision::NONE,
     }
+}
+
+/// Úprava mapování z editoru: klon mapování (ve smyčce, ne v callbacku)
+/// → operace nad ním (všechno, nebo nic) → `replace_mapping` bez
+/// vynucení Klávesnice (OQ 43). `None` = engine je rozbitý, odpověď se
+/// neposílá.
+fn uprav(zmena: Zmena, ted: u64) -> Option<Result<(), ChybaUpravy>> {
+    STAV.with(|s| {
+        let mut g = s.borrow_mut();
+        let s = g.as_mut().filter(|s| !s.rozbity)?;
+        let mut m = s.engine.mapping().clone();
+        let r = match zmena {
+            Zmena::VyprazdniVstup(t) => m.unbind_target(t).map(drop),
+            Zmena::VymazOvladac(pad) => m.clear_pad(pad).map(drop),
+            Zmena::VychoziPrvni => {
+                m = m.defaults_for_first_pad();
+                Ok(())
+            }
+            Zmena::Obnov {
+                mapovani,
+                kdyz_revize,
+            } => {
+                if s.engine.mapping_rev() != kdyz_revize {
+                    return Some(Err(ChybaUpravy::Zastarale));
+                }
+                m = *mapovani;
+                Ok(())
+            }
+        };
+        if let Err(e) = r {
+            return Some(Err(ChybaUpravy::Mapovani(e)));
+        }
+        let d = s.engine.replace_mapping(m, ted);
+        predej(s, None, &d);
+        Some(Ok(()))
+    })
+}
+
+/// Snímek mapování pro okno — klon jen tady, ve smyčce.
+fn zverejni() {
+    STAV.with(|s| {
+        if let Some(s) = s.borrow().as_ref().filter(|s| !s.rozbity) {
+            s.vystup
+                .mapovani(s.engine.mapping_rev(), s.engine.mapping());
+        }
+    });
 }
 
 /// Zavolá engine mimo callback a rozhodnutí předá dál.
@@ -715,9 +1248,21 @@ fn s_enginem(f: impl FnOnce(&mut Engine) -> Decision) {
         let mut s = s.borrow_mut();
         if let Some(s) = s.as_mut().filter(|s| !s.rozbity) {
             let d = f(&mut s.engine);
-            s.vystup.rozhodnuti(None, &d, s.engine.mode());
+            predej(s, None, &d);
         }
     });
+}
+
+/// Rozhodnutí enginu → výstup: stavy padů a režim (s oznámením),
+/// revize mapování a — jen s viditelným oknem — živý stav vstupů.
+/// Společné pro callback i smyčku, ať okno dostane totéž, odkudkoli
+/// změna přišla. Jen atomiky a `SetEvent` (volá se z callbacku).
+fn predej(s: &Stav, u: Option<&Udalost>, d: &Decision) {
+    s.vystup.rozhodnuti(u, d, s.engine.mode());
+    s.vystup.revize(s.engine.mapping_rev());
+    if s.okno.is_some() {
+        s.vystup.zive(&s.engine.live_inputs(s.okno_aktivni));
+    }
 }
 
 /// Callback `WH_KEYBOARD_LL`.
@@ -754,7 +1299,13 @@ fn zpracuj(wparam: WPARAM, kb: &KBDLLHOOKSTRUCT) -> bool {
         WM_KEYUP | WM_SYSKEYUP => false,
         _ => return false,
     };
-    let u = Udalost::z(kb, dolu);
+    zpracuj_udalost(&Udalost::z(kb, dolu))
+}
+
+/// Jádro callbacku: jedna událost → engine → výstup. `true` = potlačit.
+/// Touž funkcí jde i syntetická klávesa testů
+/// ([`HookPrikaz::TestKlavesa`]) a měření `hook_selftest -- mereni`.
+fn zpracuj_udalost(u: &Udalost) -> bool {
     STAV.with(|s| {
         // Zanořené volání (nemělo by nastat — callback nic nepumpuje)
         // nebo vlákno bez stavu: propustit, nikdy neblokovat.
@@ -764,9 +1315,18 @@ fn zpracuj(wparam: WPARAM, kb: &KBDLLHOOKSTRUCT) -> bool {
         let Some(s) = s.as_mut().filter(|s| !s.rozbity) else {
             return false;
         };
+        // Win sleduje callback sám (OQ 44): i vstříknutá mění stav OS.
+        let win = bit_win(u.vk);
+        if win != 0 {
+            if u.dolu {
+                s.win |= win;
+            } else {
+                s.win &= !win;
+            }
+        }
         if u.vstrcena() {
             s.vystup
-                .rozhodnuti(Some(&u), &Decision::NONE, s.engine.mode());
+                .rozhodnuti(Some(u), &Decision::NONE, s.engine.mode());
             return false;
         }
         let ted = ted_ms();
@@ -775,7 +1335,7 @@ fn zpracuj(wparam: WPARAM, kb: &KBDLLHOOKSTRUCT) -> bool {
         // ani psát. Proto Klávesnice; zachytávání vrátí zkratka.
         if s.engine.mode() == Mode::Gamepad && zaseknuty(s, ted) {
             let d = s.engine.force_keyboard(ForceReason::Watchdog);
-            s.vystup.rozhodnuti(None, &d, s.engine.mode());
+            predej(s, None, &d);
         }
         // Key-down klávesy, o které engine neví, patří OS, když:
         // - OS tu klávesu drží: hook ji neviděl stisknout (nainstaloval se
@@ -787,14 +1347,18 @@ fn zpracuj(wparam: WPARAM, kb: &KBDLLHOOKSTRUCT) -> bool {
         //   (engine ji nesleduje) — kdyby hook druhou klávesu spolkl jako
         //   klávesu ovladače, Windows by viděly osamělou Win a otevřely
         //   Start.
-        if dolu
+        // Ptá se jen u stisku, o kterém engine rozhoduje (zkratka,
+        // přiřazování, klávesa ovladače při hře): jinde by převzetí
+        // dopadlo stejně jako nový stisk a dotaz na Windows je drahý.
+        if u.dolu
             && s.engine.held(u.klavesa).is_none()
-            && ((s.os_drzi)(u.vk) || (s.os_drzi)(VK_LWIN) || (s.os_drzi)(VK_RWIN))
+            && s.engine.claims_new_press(u.klavesa)
+            && ((s.os_drzi)(u.vk) || drzi_win(s))
         {
             let _ = s.engine.adopt_os_key(u.klavesa, ted);
         }
-        let d = s.engine.on_key(u.klavesa, dolu, ted);
-        s.vystup.rozhodnuti(Some(&u), &d, s.engine.mode());
+        let d = s.engine.on_key(u.klavesa, u.dolu, ted);
+        predej(s, Some(u), &d);
         d.suppress
     })
 }
@@ -822,7 +1386,7 @@ fn po_panice() {
             if let Ok(mut s) = s.try_borrow_mut() {
                 if let Some(s) = s.as_mut() {
                     let d = s.engine.reset_held(ForceReason::HookPanic);
-                    s.vystup.rozhodnuti(None, &d, s.engine.mode());
+                    predej(s, None, &d);
                 }
             }
         })
@@ -844,10 +1408,76 @@ fn po_panice() {
     }
 }
 
+/// Měření pro `hook_selftest -- mereni`: `n` syntetických událostí
+/// (stisky a uvolnění prvních kláves mapování, až šest držených naráz)
+/// TOUŽ funkcí jako callback, na volajícím vlákně a bez hooku v systému
+/// — nic nejde do OS ani do hry. Ovladač 1 zachytává, takže každá
+/// událost projde celou cestou až do slotu padu; `zive` = s viditelným
+/// oknem v popředí (živý stav navíc); `stav_klavesnice` = `false` místo
+/// `GetAsyncKeyState` podvrh „nic nedrží" (oddělí cenu dotazu na Windows
+/// od ceny KeyPadu); `vk` = virtuální klávesa události — dotaz na
+/// skutečnou VK nemusí stát tolik co na neplatnou nulu. Vrací ns na
+/// událost.
+#[doc(hidden)]
+#[allow(dead_code, reason = "měří jen příklad hook_selftest (-- mereni)")]
+pub fn zmer_zpracovani(
+    n: usize,
+    mapovani: Mapping,
+    vystup: Arc<dyn Vystup>,
+    zive: bool,
+    stav_klavesnice: bool,
+    vk: fn(KeyId) -> u32,
+) -> Vec<u64> {
+    let klavesy: Vec<KeyId> = mapovani.bindings().map(|(k, _)| k).take(6).collect();
+    let vk: Vec<u32> = klavesy.iter().map(|&k| vk(k)).collect();
+    let mut engine = Engine::new(mapovani);
+    let _ = engine.enable(PadId::FIRST);
+    let _ = engine.capture(ted_ms());
+    let mut s = Stav::novy(engine, vystup, je_v_popredi);
+    // Watchdog se počítá, ale nesmí zachytávání vypnout: tep padu tu
+    // nikdo nepíše.
+    s.povoleno_ms = [u64::MAX; MAX_PADS];
+    if !stav_klavesnice {
+        s.os_drzi = |_| false;
+    }
+    if zive {
+        s.okno = Some(1);
+        s.okno_aktivni = true;
+    }
+    let predchozi = STAV.with(|st| st.borrow_mut().replace(s));
+    let mut drzeno = vec![false; klavesy.len()];
+    let mut casy = Vec::with_capacity(n);
+    for i in 0..n {
+        let j = i % klavesy.len();
+        let k = klavesy[j];
+        drzeno[j] = !drzeno[j];
+        let u = Udalost {
+            klavesa: k,
+            scan: u32::from(k.scan),
+            vk: vk[j],
+            flags: if k.extended { LLKHF_EXTENDED.0 } else { 0 },
+            dolu: drzeno[j],
+        };
+        let t = std::time::Instant::now();
+        let p = zpracuj_udalost(&u);
+        let dt = t.elapsed();
+        std::hint::black_box(p);
+        casy.push(u64::try_from(dt.as_nanos()).unwrap_or(u64::MAX));
+    }
+    STAV.with(|st| *st.borrow_mut() = predchozi);
+    casy
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use keypad_core::{Action, ModeCause, PadAction, PadButton, PadState, UiEvent};
+    use crate::platform::windows::slot::{Budik, StavSlot};
+    use crate::platform::windows::vystup::HookVystup;
+    use keypad_core::{
+        Action, BindingCancel, ModeCause, PadAction, PadButton, PadState, StickDir, UiEvent,
+    };
+    use std::cell::Cell;
+    use std::sync::atomic::AtomicU64;
     use std::sync::Mutex;
     use windows::Win32::UI::WindowsAndMessaging::{KBDLLHOOKSTRUCT_FLAGS, LLKHF_UP};
 
@@ -870,10 +1500,18 @@ mod tests {
         panikar: AtomicU32,
         volani: AtomicU32,
         /// Tep ovladačů pro watchdog (0 = výstup ho nezná).
-        tep: std::sync::atomic::AtomicU64,
+        tep: AtomicU64,
+        zive: Mutex<Vec<[LiveInputs; MAX_PADS]>>,
+        revize: AtomicU64,
+        mapovani: Mutex<Vec<(u64, Mapping)>>,
+        hook_chyba: Mutex<Vec<bool>>,
     }
 
     impl Vystup for Zaznam {
+        fn hook_chyba(&self, chyba: bool) {
+            self.hook_chyba.lock().unwrap().push(chyba);
+        }
+
         fn rozhodnuti(&self, u: Option<&Udalost>, d: &Decision, rezim: Mode) {
             let n = self.volani.fetch_add(1, Ordering::AcqRel) + 1;
             let p = self.panikar.load(Ordering::Acquire);
@@ -889,12 +1527,41 @@ mod tests {
         fn tep_ms(&self, _pad: PadId) -> Option<u64> {
             Some(self.tep.load(Ordering::Acquire)).filter(|&t| t != 0)
         }
+
+        fn zive(&self, z: &[LiveInputs; MAX_PADS]) {
+            self.zive.lock().unwrap().push(*z);
+        }
+
+        fn revize(&self, rev: u64) {
+            self.revize.store(rev, Ordering::Release);
+        }
+
+        fn mapovani(&self, rev: u64, m: &Mapping) {
+            self.mapovani.lock().unwrap().push((rev, m.clone()));
+        }
     }
 
     impl Zaznam {
         fn posledni(&self) -> Radek {
             *self.rozhodnuti.lock().unwrap().last().unwrap()
         }
+
+        fn posledni_zive(&self) -> Option<[LiveInputs; MAX_PADS]> {
+            self.zive.lock().unwrap().last().copied()
+        }
+    }
+
+    thread_local! {
+        /// Podvrh popředí okna pro testy na vlákně testu.
+        static AKTIVNI: Cell<bool> = const { Cell::new(false) };
+    }
+
+    fn podvrh_aktivni(_hwnd: isize) -> bool {
+        AKTIVNI.with(Cell::get)
+    }
+
+    fn nastav_popredi(v: bool) {
+        AKTIVNI.with(|a| a.set(v));
     }
 
     /// Stav callbacku na tomhle vlákně bez skutečného hooku: engine
@@ -909,19 +1576,9 @@ mod tests {
         let _ = engine.toggle(0);
         assert_eq!(engine.mode(), Mode::Gamepad);
         let vystup: Arc<dyn Vystup> = z.clone();
-        STAV.with(|s| {
-            *s.borrow_mut() = Some(Stav {
-                engine,
-                vystup,
-                rozbity: false,
-                os_drzi: nic_nedrzi,
-                povoleno_ms: [0; MAX_PADS],
-            })
-        });
-    }
-
-    fn nic_nedrzi(_vk: u32) -> bool {
-        false
+        let mut s = Stav::novy(engine, vystup, podvrh_aktivni);
+        s.os_drzi = nic_nedrzi;
+        STAV.with(|st| *st.borrow_mut() = Some(s));
     }
 
     fn vse_drzi(_vk: u32) -> bool {
@@ -951,6 +1608,35 @@ mod tests {
         }
     }
 
+    /// Událost s virtuální klávesou (Win, Alt — hook podle ní sleduje Win).
+    fn kb_vk(scan: u32, flags: u32, vk: u32) -> KBDLLHOOKSTRUCT {
+        KBDLLHOOKSTRUCT {
+            vkCode: vk,
+            ..kb(scan, flags)
+        }
+    }
+
+    /// Levá (`false`) nebo pravá Win dolů / nahoru — skutečnými kódy
+    /// (scan s E0 a VK), jak je posílá klávesnice.
+    fn win(prava: bool, dolu: bool) -> bool {
+        let (scan, vk) = if prava { (0x5C, 0x5C) } else { (0x5B, 0x5B) };
+        let flags = LLKHF_EXTENDED.0 | if dolu { 0 } else { LLKHF_UP.0 };
+        zavolej(
+            0,
+            if dolu { WM_KEYDOWN } else { WM_KEYUP },
+            &kb_vk(scan, flags, vk),
+        )
+    }
+
+    /// Levý Alt dolů / nahoru (VK_LMENU; s Altem chodí WM_SYS…).
+    fn alt(dolu: bool) -> bool {
+        zavolej(
+            0,
+            if dolu { WM_SYSKEYDOWN } else { WM_KEYUP },
+            &kb_vk(0x38, if dolu { 0 } else { LLKHF_UP.0 }, 0xA4),
+        )
+    }
+
     /// Callback zavolaný přímo — tak, jak ho volají Windows.
     fn zavolej(code: i32, zprava: u32, kb: &KBDLLHOOKSTRUCT) -> bool {
         let r = unsafe {
@@ -969,6 +1655,10 @@ mod tests {
 
     fn rezim() -> Mode {
         STAV.with(|s| s.borrow().as_ref().unwrap().engine.mode())
+    }
+
+    fn s_stavem<T>(f: impl FnOnce(&mut Stav) -> T) -> T {
+        STAV.with(|s| f(s.borrow_mut().as_mut().unwrap()))
     }
 
     #[test]
@@ -1114,54 +1804,68 @@ mod tests {
         );
     }
 
-    /// Callback nic nealokuje — ani při stisku, autorepeatu, key-upu,
-    /// přepnutí zkratkou, nemapovatelné či vstříknuté klávese, ani když
-    /// OS drží Win a klávesa se převezme jako klávesa OS.
+    /// Callback nic nealokuje ani neuvolňuje — při stisku, autorepeatu,
+    /// key-upu, přepnutí zkratkou, nemapovatelné či vstříknuté klávese,
+    /// když OS drží Win (klávesa se převezme jako klávesa OS), s oknem
+    /// (živý stav) i bez něj a při přiřazování (oznámení uloženo,
+    /// odmítnuto, ťuknutí Altem). Výstup je skutečný `HookVystup` (sloty,
+    /// atomiky, `SetEvent`).
     #[test]
     fn callback_nealokuje() {
-        struct Tichy(AtomicU32);
-        impl Vystup for Tichy {
-            fn rozhodnuti(&self, _: Option<&Udalost>, _: &Decision, _: Mode) {
-                self.0.fetch_add(1, Ordering::Relaxed);
-            }
-        }
+        // Scroll Lock (přepnutí / odmítnutí), AltGr, média, vstříknutá,
+        // Alt (ťuknutí při přiřazování), W (uložení při přiřazování),
+        // šipka, Win. (scan, příznaky, VK)
+        let udalosti = [
+            (0x46, 0, 0x91),
+            (0x21D, 0, 0xA2),
+            (0, 0, 0xB3),
+            (0x1E, LLKHF_INJECTED.0, 0x41),
+            (0x38, 0, 0xA4),
+            (0x11, 0, 0x57),
+            (0x48, LLKHF_EXTENDED.0, 0x26),
+            (0x5B, LLKHF_EXTENDED.0, 0x5B),
+        ];
         // Skutečný dotaz na stav klávesy — i ten musí být bez alokace;
-        // podvrh „drží Win“ projde větví převzetí klávesy OS.
+        // podvrh „drží Win“ projde větví převzetí klávesy OS. Celé kolo
+        // běží s Win dole podle callbacku: skutečný dotaz bit Win opraví,
+        // podvrh ho potvrdí.
         let dotazy: [fn(u32) -> bool; 2] = [os_drzi, jen_win];
+        let cil = PadAction::first(Action::Button(PadButton::B));
         for dotaz in dotazy {
-            let mut engine = Engine::new(Mapping::default());
-            let _ = engine.enable(PadId::FIRST);
-            let vystup: Arc<dyn Vystup> = Arc::new(Tichy(AtomicU32::new(0)));
-            STAV.with(|s| {
-                *s.borrow_mut() = Some(Stav {
-                    engine,
-                    vystup,
-                    rozbity: false,
-                    os_drzi: dotaz,
-                    povoleno_ms: [0; MAX_PADS],
-                })
-            });
-            // Scroll Lock (přepnutí), W, šipka, AltGr, média, vstříknutá,
-            // Win.
-            let udalosti = [
-                (0x46, 0),
-                (0x11, 0),
-                (0x48, LLKHF_EXTENDED.0),
-                (0x21D, 0),
-                (0, 0),
-                (0x1E, LLKHF_INJECTED.0),
-                (0x5B, LLKHF_EXTENDED.0),
-            ];
-            let pred = crate::testy_alokace::pocet();
-            for _ in 0..3 {
-                for &(scan, flags) in &udalosti {
-                    let k = kb(scan, flags);
-                    zavolej(0, WM_KEYDOWN, &k);
-                    zavolej(0, WM_KEYDOWN, &k);
-                    zavolej(0, WM_KEYUP, &kb(scan, flags | LLKHF_UP.0));
+            for okno in [None, Some(7isize)] {
+                for prirazuje in [false, true] {
+                    let sloty: [Arc<StavSlot>; MAX_PADS] =
+                        std::array::from_fn(|_| Arc::new(StavSlot::new().unwrap()));
+                    let budik = Arc::new(Budik::new().unwrap());
+                    let vystup: Arc<dyn Vystup> = Arc::new(HookVystup::new(sloty, budik));
+                    let mut engine = Engine::new(Mapping::default());
+                    let _ = engine.enable(PadId::FIRST);
+                    let mut s = Stav::novy(engine, vystup, |_| true);
+                    s.os_drzi = dotaz;
+                    s.okno = okno;
+                    s.okno_aktivni = okno.is_some();
+                    STAV.with(|st| *st.borrow_mut() = Some(s));
+                    for _ in 0..3 {
+                        if prirazuje {
+                            s_enginem(|e| e.start_binding(cil, BindKind::Replace, ted_ms()));
+                        }
+                        let pred = crate::testy_alokace::pocet();
+                        win(false, true);
+                        for &(scan, flags, vk) in &udalosti {
+                            let k = kb_vk(scan, flags, vk);
+                            zavolej(0, WM_KEYDOWN, &k);
+                            zavolej(0, WM_KEYDOWN, &k);
+                            zavolej(0, WM_KEYUP, &kb_vk(scan, flags | LLKHF_UP.0, vk));
+                        }
+                        win(false, false);
+                        assert_eq!(
+                            crate::testy_alokace::pocet(),
+                            pred,
+                            "alokace v callbacku (okno {okno:?}, přiřazuje {prirazuje})"
+                        );
+                    }
                 }
             }
-            assert_eq!(crate::testy_alokace::pocet(), pred, "alokace v callbacku");
         }
     }
 
@@ -1183,6 +1887,7 @@ mod tests {
         let l = KeyId::L;
         assert!(Mapping::default().target(l).is_some(), "L je namapovaná");
         podvrhni_os(jen_win);
+        assert!(!win(false, true), "Win jde do Windows");
         assert!(!zavolej(0, WM_KEYDOWN, &kb_l(0)), "Win+L do Windows");
         let (u, d, m) = z.posledni();
         assert_eq!((u.unwrap().klavesa, m), (l, Mode::Gamepad));
@@ -1193,6 +1898,7 @@ mod tests {
         );
         // Autorepeat i key-up zůstávají Windows, i když Win mezitím pustil.
         podvrhni_os(nic_nedrzi);
+        assert!(!win(false, false));
         assert!(!zavolej(0, WM_KEYDOWN, &kb_l(0)));
         assert!(!zavolej(0, WM_KEYUP, &kb_l(LLKHF_UP.0)));
         assert_eq!(z.posledni().1.pads, PadUpdates::NONE);
@@ -1209,8 +1915,10 @@ mod tests {
         assert!(zavolej(0, WM_KEYUP, &kb_l(LLKHF_UP.0)));
         // Pravá Win stejně.
         podvrhni_os(jen_pravou_win);
+        assert!(!win(true, true));
         assert!(!zavolej(0, WM_KEYDOWN, &kb_l(0)), "pravá Win+L do Windows");
         assert!(!zavolej(0, WM_KEYUP, &kb_l(LLKHF_UP.0)));
+        assert!(!win(true, false));
     }
 
     /// Win+L při přiřazování: L jde do Windows a nepřiřadí se;
@@ -1223,9 +1931,14 @@ mod tests {
         let l = KeyId::L;
         STAV.with(|s| {
             let mut g = s.borrow_mut();
-            let _ = g.as_mut().unwrap().engine.start_binding(cil, ted_ms());
+            let _ = g
+                .as_mut()
+                .unwrap()
+                .engine
+                .start_binding(cil, BindKind::Replace, ted_ms());
         });
         podvrhni_os(jen_win);
+        assert!(!win(false, true));
         assert!(!zavolej(0, WM_KEYDOWN, &kb_l(0)), "Win+L do Windows");
         assert!(!zavolej(0, WM_KEYUP, &kb_l(LLKHF_UP.0)));
         let (_, d, m) = z.posledni();
@@ -1238,10 +1951,672 @@ mod tests {
         assert_ne!(mapovani.target(l), Some(cil));
         // Bez Win se L přiřadí (stisk přiřazování spolkne).
         podvrhni_os(nic_nedrzi);
+        assert!(!win(false, false));
         assert!(zavolej(0, WM_KEYDOWN, &kb_l(0)));
         assert!(
             matches!(z.posledni().1.ui, Some(UiEvent::BindingSaved { key, target, .. }) if key == l && target == cil)
         );
+    }
+
+    thread_local! {
+        /// Kolikrát se callback zeptal Windows na stav klávesy.
+        static DOTAZY: Cell<u32> = const { Cell::new(0) };
+    }
+
+    fn dotazy() -> u32 {
+        DOTAZY.with(Cell::get)
+    }
+
+    /// Počítaný podvrh: OS nic nedrží.
+    fn pocitej_nic(_vk: u32) -> bool {
+        DOTAZY.with(|d| d.set(d.get() + 1));
+        false
+    }
+
+    /// Počítaný podvrh: OS drží levou Win.
+    fn pocitej_win(vk: u32) -> bool {
+        DOTAZY.with(|d| d.set(d.get() + 1));
+        vk == VK_LWIN
+    }
+
+    /// Dotaz na Windows (volání jádra, ocas p99) jde jen od nového stisku,
+    /// o kterém engine rozhoduje — a na Win jen tehdy, když ji callback
+    /// viděl stisknout. Zastaralý bit Win (uvolnění na zabezpečené
+    /// ploše) se při dotazu opraví.
+    #[test]
+    fn windows_se_pta_jen_kdyz_je_proc() {
+        let z = Arc::new(Zaznam::default());
+        priprav_s(&z, Mapping::default());
+        DOTAZY.with(|d| d.set(0));
+        podvrhni_os(pocitej_nic);
+        let klavesa = |scan: u32, dolu: bool| {
+            zavolej(
+                0,
+                if dolu { WM_KEYDOWN } else { WM_KEYUP },
+                &kb(scan, if dolu { 0 } else { LLKHF_UP.0 }),
+            )
+        };
+        // Klávesa ovladače při hře: jen na sebe, na Win ne.
+        assert!(klavesa(0x11, true), "W hraje");
+        assert_eq!(dotazy(), 1);
+        // Autorepeat, key-up a nenamapovaný Tab se neptají vůbec.
+        klavesa(0x11, true);
+        klavesa(0x11, false);
+        assert!(!klavesa(0x0F, true));
+        klavesa(0x0F, false);
+        assert_eq!(dotazy(), 1);
+        // Pozastaveno: W patří OS tak jako tak.
+        let _ = s_stavem(|s| s.engine.toggle(0));
+        assert!(!klavesa(0x11, true));
+        klavesa(0x11, false);
+        assert_eq!(dotazy(), 1);
+        let _ = s_stavem(|s| s.engine.toggle(0));
+
+        // Win dole podle callbacku → ověří se u Windows a W jde Windows.
+        podvrhni_os(pocitej_win);
+        assert!(!win(false, true));
+        assert!(!klavesa(0x11, true), "Win+W Windows");
+        klavesa(0x11, false);
+        assert_eq!(dotazy(), 3, "W a levá Win");
+        // Uvolnění Win callback minul (zabezpečená plocha): Windows řeknou
+        // „není dole", bit se opraví a další stisk se na Win neptá.
+        podvrhni_os(pocitej_nic);
+        assert!(klavesa(0x1E, true), "A hraje");
+        assert_eq!(dotazy(), 5, "A a levá Win");
+        assert_eq!(s_stavem(|s| s.win), 0);
+        klavesa(0x1E, false);
+        assert!(klavesa(0x20, true), "D hraje");
+        assert_eq!(dotazy(), 6, "jen D");
+        klavesa(0x20, false);
+    }
+
+    /// Po instalaci hooku a po přepnutí plochy se bity Win srovnají
+    /// s Windows — Win stisknutou, když hook nebyl v systému, by pravidlo
+    /// Win+klávesa jinak minulo.
+    #[test]
+    fn win_se_srovna_po_instalaci_a_prepnuti_plochy() {
+        let z = Arc::new(Zaznam::default());
+        priprav_s(&z, Mapping::default());
+        s_stavem(|s| s.instaluj = || Ok(HHOOK(std::ptr::without_provenance_mut(0x1000))));
+        podvrhni_os(jen_win);
+        let status = HookStatus::default();
+        // Podvržený handle se vrací volajícímu — nikdy se neodhookne.
+        let h = hlidej_hook(HHOOK::default(), &status);
+        assert!(!h.is_invalid() && status.nainstalovan());
+        assert_eq!(s_stavem(|s| s.win), WIN_L, "Win držená před instalací");
+        assert!(!zavolej(0, WM_KEYDOWN, &kb_l(0)), "Win+L Windows");
+        assert!(!zavolej(0, WM_KEYUP, &kb_l(LLKHF_UP.0)));
+        podvrhni_os(nic_nedrzi);
+        prepnuti_plochy();
+        assert_eq!(s_stavem(|s| s.win), 0, "Win puštěná na jiné ploše");
+    }
+
+    /// Nepovedená instalace hooku (spec 2.4, oprava B4): přiřazování —
+    /// ze hry i bez ovladače s oknem v popředí — se zruší vynucením,
+    /// na Gamepad se nevrací a okno se dozví, že klávesy sledovat nejde.
+    /// Zachytávání bez hooku skončí na Klávesnici.
+    #[test]
+    fn nepovedena_instalace_zrusi_prirazovani_i_zachytavani() {
+        let cil = PadAction::first(Action::Button(PadButton::A));
+        for (prirazuje, s_ovladacem) in [(true, true), (true, false), (false, true)] {
+            let z = Arc::new(Zaznam::default());
+            priprav(&z);
+            s_stavem(|s| s.instaluj = || Err("zkušební chyba".into()));
+            if !s_ovladacem {
+                let _ = s_stavem(|s| {
+                    s.engine
+                        .disable(PadId::FIRST, DisabledReason::PadNotConnected)
+                });
+                nastav_popredi(true);
+                okno(Some(7), true);
+            }
+            if prirazuje {
+                let _ = s_stavem(|s| s.engine.start_binding(cil, BindKind::Replace, ted_ms()));
+            }
+            let status = HookStatus::default();
+            assert!(hlidej_hook(HHOOK::default(), &status).is_invalid());
+            assert!(!status.nainstalovan());
+            let m = rezim();
+            let pripad = format!("přiřazuje {prirazuje}, ovladač {s_ovladacem}: {m:?}");
+            assert!(
+                !matches!(m, Mode::Binding { .. } | Mode::Gamepad),
+                "{pripad}"
+            );
+            assert_eq!(matches!(m, Mode::Disabled { .. }), !s_ovladacem, "{pripad}");
+            let cekane = if prirazuje {
+                UiEvent::BindingCancelled {
+                    reason: BindingCancel::Forced(ForceReason::HookReinstalled),
+                }
+            } else {
+                UiEvent::ModeChanged {
+                    mode: Mode::Keyboard,
+                    cause: ModeCause::Forced(ForceReason::HookReinstalled),
+                }
+            };
+            assert_eq!(z.posledni().1.ui, Some(cekane), "{pripad}");
+            assert_eq!(z.hook_chyba.lock().unwrap().last(), Some(&true), "{pripad}");
+        }
+    }
+
+    /// Alt+Tab z okna při přiřazování (kontrolní seznam vlastníka, bod
+    /// 10; OQ 55): Alt i Tab jdou do Windows, ty přepnou okno a ztráta
+    /// popředí přiřazování zruší — mapování beze změny. Samotné ťuknutí
+    /// Altem se přiřadí při uvolnění.
+    #[test]
+    fn alt_tab_pri_prirazovani_ho_zrusi_a_tuknuti_altem_priradi() {
+        let z = Arc::new(Zaznam::default());
+        priprav_s(&z, Mapping::default());
+        let cil = PadAction::first(Action::Button(PadButton::A));
+        nastav_popredi(true);
+        okno(Some(7), true);
+        proved(HookPrikaz::Prirad {
+            cil,
+            druh: BindKind::Replace,
+        });
+        assert!(matches!(rezim(), Mode::Binding { .. }));
+        let pred = mapovani_enginu();
+        assert!(!alt(true), "Alt Windows");
+        assert!(
+            !zavolej(0, WM_SYSKEYDOWN, &kb_vk(0x0F, 0, 0x09)),
+            "Tab Windows"
+        );
+        assert!(matches!(rezim(), Mode::Binding { .. }), "nic nepřiřazeno");
+        nastav_popredi(false);
+        zmena_popredi();
+        assert_eq!(
+            z.posledni().1.ui,
+            Some(UiEvent::BindingCancelled {
+                reason: BindingCancel::Gui
+            })
+        );
+        assert_eq!(rezim(), Mode::Gamepad, "zpět do hry");
+        assert!(!zavolej(0, WM_KEYUP, &kb_vk(0x0F, LLKHF_UP.0, 0x09)));
+        assert!(!alt(false), "key-up Altu Windows jako key-down");
+        assert_eq!(mapovani_enginu(), pred);
+
+        nastav_popredi(true);
+        zmena_popredi();
+        proved(HookPrikaz::Prirad {
+            cil,
+            druh: BindKind::Replace,
+        });
+        assert!(!alt(true));
+        assert!(matches!(rezim(), Mode::Binding { .. }));
+        assert!(!alt(false));
+        assert_eq!(
+            z.posledni().1.ui,
+            Some(UiEvent::BindingSaved {
+                key: KeyId::LEFT_ALT,
+                target: cil,
+                moved_from: None
+            })
+        );
+        assert_eq!(mapovani_enginu().target(KeyId::LEFT_ALT), Some(cil));
+    }
+
+    /// Bez hlídaného popředí (WinEvent se nepodařilo zaregistrovat) se
+    /// klik na čepičku nepřijme, i když okno v popředí je — nic by
+    /// přiřazování při ztrátě popředí nezrušilo a spolklo by klávesu
+    /// napsanou v jiném programu.
+    #[test]
+    fn prirad_bez_hlidaneho_popredi_se_neprijme() {
+        let z = Arc::new(Zaznam::default());
+        priprav(&z);
+        let prirad = || {
+            proved(HookPrikaz::Prirad {
+                cil: PadAction::first(Action::Button(PadButton::Y)),
+                druh: BindKind::Replace,
+            })
+        };
+        nastav_popredi(true);
+        okno(Some(7), false);
+        prirad();
+        assert_eq!(rezim(), Mode::Gamepad, "klik se nepřijal");
+        assert!(!s_stavem(|s| s.okno_aktivni));
+        // S hlídáním ano.
+        okno(Some(7), true);
+        prirad();
+        assert!(matches!(rezim(), Mode::Binding { .. }));
+        // Okno ukázané znovu bez hlídání běžící přiřazování zruší.
+        okno(Some(7), false);
+        assert_eq!(rezim(), Mode::Gamepad);
+        assert_eq!(
+            z.posledni().1.ui,
+            Some(UiEvent::BindingCancelled {
+                reason: BindingCancel::Gui
+            })
+        );
+    }
+
+    /// Zpráva o aktivaci okna dojde až po přijetí kliku (okno bylo vidět
+    /// na pozadí, klik ho aktivoval): přijetí samo zapíše „aktivní",
+    /// takže následná ztráta popředí přiřazování zruší. A ruší ho každá
+    /// událost bez popředí, i když nevypadá jako přechod.
+    #[test]
+    fn ztrata_popredi_zrusi_prirazovani_i_bez_zpravy_o_aktivaci() {
+        let z = Arc::new(Zaznam::default());
+        priprav(&z);
+        let cil = PadAction::first(Action::Button(PadButton::X));
+        nastav_popredi(false);
+        okno(Some(7), true);
+        assert!(!s_stavem(|s| s.okno_aktivni));
+        nastav_popredi(true);
+        proved(HookPrikaz::Prirad {
+            cil,
+            druh: BindKind::Replace,
+        });
+        assert!(matches!(rezim(), Mode::Binding { .. }));
+        assert!(s_stavem(|s| s.okno_aktivni), "přijatý klik = aktivní");
+        nastav_popredi(false);
+        zmena_popredi();
+        assert_eq!(rezim(), Mode::Gamepad, "ztráta popředí zrušila");
+        // Přiřazování, o jehož popředí smyčka neví (jen pojistka).
+        let _ = s_stavem(|s| s.engine.start_binding(cil, BindKind::Replace, ted_ms()));
+        assert!(!s_stavem(|s| s.okno_aktivni));
+        zmena_popredi();
+        assert_eq!(rezim(), Mode::Gamepad, "zrušeno i bez přechodu");
+        assert_eq!(
+            z.posledni().1.ui,
+            Some(UiEvent::BindingCancelled {
+                reason: BindingCancel::Gui
+            })
+        );
+    }
+
+    /// Kdy má být hook v systému (spec 2.4): se zapnutým ovladačem
+    /// a při přiřazování vždy, bez ovladače jen s oknem v popředí,
+    /// s rozbitým enginem nikdy.
+    #[test]
+    fn potreba_hooku_tabulkou() {
+        let binding = Mode::Binding {
+            target: PadAction::first(Action::Button(PadButton::A)),
+            started_at_ms: 0,
+        };
+        for (rezim, bez_okna, s_oknem) in [
+            (None, false, false),
+            (
+                Some(Mode::Disabled {
+                    reason: DisabledReason::PadNotConnected,
+                }),
+                false,
+                true,
+            ),
+            (
+                Some(Mode::Disabled {
+                    reason: DisabledReason::ViGEmMissing,
+                }),
+                false,
+                true,
+            ),
+            (
+                Some(Mode::Disabled {
+                    reason: DisabledReason::PadError,
+                }),
+                false,
+                true,
+            ),
+            (Some(Mode::Keyboard), true, true),
+            (Some(Mode::Gamepad), true, true),
+            (Some(binding), true, true),
+        ] {
+            assert_eq!(potreba_hooku(rezim, false), bez_okna, "{rezim:?} bez okna");
+            assert_eq!(potreba_hooku(rezim, true), s_oknem, "{rezim:?} s oknem");
+        }
+    }
+
+    /// Klik na čepičku se přijme, jen když je okno V TU CHVÍLI
+    /// v popředí — ne podle poslední události ani jen proto, že je vidět.
+    #[test]
+    fn prirad_jen_s_oknem_v_popredi() {
+        let z = Arc::new(Zaznam::default());
+        priprav(&z);
+        let cil = PadAction::new(PadId::new(1).unwrap(), Action::Button(PadButton::B));
+        let prirad = || {
+            proved(HookPrikaz::Prirad {
+                cil,
+                druh: BindKind::Add,
+            })
+        };
+        // Okno není vidět.
+        nastav_popredi(true);
+        prirad();
+        assert_eq!(rezim(), Mode::Gamepad);
+        // Okno je vidět a poslední událost tvrdí „v popředí", teď už ale
+        // v popředí není.
+        okno(Some(7), true);
+        assert!(s_stavem(|s| s.okno_aktivni));
+        nastav_popredi(false);
+        prirad();
+        assert_eq!(rezim(), Mode::Gamepad, "okno na pozadí klik nepřijme");
+        nastav_popredi(true);
+        prirad();
+        assert!(
+            matches!(rezim(), Mode::Binding { target, .. } if target == cil),
+            "{:?}",
+            rezim()
+        );
+        assert_eq!(s_stavem(|s| s.engine.binding_kind()), Some(BindKind::Add));
+        // Zrušení z okna: zpět do hry.
+        proved(HookPrikaz::ZrusPrirazeni);
+        assert_eq!(rezim(), Mode::Gamepad);
+        assert_eq!(
+            z.posledni().1.ui,
+            Some(UiEvent::BindingCancelled {
+                reason: BindingCancel::Gui
+            })
+        );
+    }
+
+    /// Okno ztratí popředí během přiřazování (Alt+Tab do chatu): zrušeno
+    /// jako z okna, smyčka dostane `WM_POPREDI` a živý stav se přepočítá
+    /// bez kláves Windows. Návrat popředí přiřazování neobnoví.
+    #[test]
+    fn ztrata_popredi_zrusi_prirazovani() {
+        let z = Arc::new(Zaznam::default());
+        priprav(&z);
+        nastav_popredi(true);
+        okno(Some(7), true);
+        proved(HookPrikaz::Prirad {
+            cil: PadAction::first(Action::Button(PadButton::X)),
+            druh: BindKind::Replace,
+        });
+        assert!(matches!(rezim(), Mode::Binding { .. }));
+        let zive_pred = z.zive.lock().unwrap().len();
+        nastav_popredi(false);
+        zmena_popredi();
+        let (_, d, m) = z.posledni();
+        assert_eq!(
+            d.ui,
+            Some(UiEvent::BindingCancelled {
+                reason: BindingCancel::Gui
+            })
+        );
+        assert_eq!(m, Mode::Gamepad, "zpět do hry");
+        assert!(!s_stavem(|s| s.okno_aktivni));
+        assert!(
+            z.zive.lock().unwrap().len() > zive_pred,
+            "živý stav přepočítán"
+        );
+        // Bez změny popředí se nic neděje.
+        let n = z.rozhodnuti.lock().unwrap().len();
+        zmena_popredi();
+        assert_eq!(z.rozhodnuti.lock().unwrap().len(), n);
+        // Návrat popředí: jen živý stav, přiřazování ne.
+        nastav_popredi(true);
+        zmena_popredi();
+        assert!(s_stavem(|s| s.okno_aktivni));
+        assert_eq!(rezim(), Mode::Gamepad);
+        // Schované okno popředí neřeší.
+        okno(None, true);
+        nastav_popredi(false);
+        let n = z.rozhodnuti.lock().unwrap().len();
+        zmena_popredi();
+        assert_eq!(z.rozhodnuti.lock().unwrap().len(), n);
+    }
+
+    /// Klávesy Windows (vlastník `Os`) jsou vidět jen s oknem v popředí;
+    /// s oknem na pozadí jen klávesy hry. Bez okna se živý stav vůbec
+    /// nepočítá.
+    #[test]
+    fn zive_klavesy_windows_jen_v_popredi() {
+        let z = Arc::new(Zaznam::default());
+        priprav_s(&z, Mapping::default());
+        // Pozastaveno: W patří Windows.
+        let _ = s_stavem(|s| s.engine.toggle(0));
+        assert_eq!(rezim(), Mode::Keyboard);
+        let w = |d: bool| {
+            zavolej(
+                0,
+                if d { WM_KEYDOWN } else { WM_KEYUP },
+                &kb(0x11, if d { 0 } else { LLKHF_UP.0 }),
+            )
+        };
+        assert!(!w(true));
+        assert_eq!(z.posledni_zive(), None, "bez okna se nepočítá");
+        assert!(!w(false));
+        nastav_popredi(false);
+        okno(Some(9), true);
+        assert!(!w(true));
+        assert_eq!(
+            z.posledni_zive().unwrap()[0],
+            LiveInputs::EMPTY,
+            "okno na pozadí"
+        );
+        assert!(!w(false));
+        nastav_popredi(true);
+        okno(Some(9), true);
+        assert!(!w(true));
+        let l = z.posledni_zive().unwrap()[0];
+        assert!(l.held().contains(Action::LeftStick(StickDir::Up)));
+        assert_eq!(l.left_stick(), (0, 1));
+        assert!(!w(false));
+    }
+
+    /// Schované okno: přiřazování zrušené, živý stav vynulovaný a další
+    /// klávesy ho už nepočítají.
+    #[test]
+    fn schovane_okno_nuluje_zivy_stav_a_rusi_prirazovani() {
+        let z = Arc::new(Zaznam::default());
+        priprav(&z);
+        nastav_popredi(true);
+        okno(Some(7), true);
+        assert!(zavolej(0, WM_KEYDOWN, &kb(0x76, 0)));
+        let a = z.posledni_zive().unwrap()[0];
+        assert!(a.held().contains(Action::Button(PadButton::A)));
+        proved(HookPrikaz::Prirad {
+            cil: PadAction::first(Action::Button(PadButton::Y)),
+            druh: BindKind::Replace,
+        });
+        assert!(matches!(rezim(), Mode::Binding { .. }));
+        okno(None, true);
+        assert_eq!(z.posledni_zive(), Some([LiveInputs::EMPTY; MAX_PADS]));
+        assert_eq!(
+            z.posledni().1.ui,
+            Some(UiEvent::BindingCancelled {
+                reason: BindingCancel::Gui
+            })
+        );
+        assert_eq!(rezim(), Mode::Gamepad);
+        assert_eq!(s_stavem(|s| (s.okno, s.okno_aktivni)), (None, false));
+        let n = z.zive.lock().unwrap().len();
+        zavolej(0, WM_KEYUP, &kb(0x76, LLKHF_UP.0));
+        assert_eq!(
+            z.zive.lock().unwrap().len(),
+            n,
+            "bez okna se živý stav nepočítá"
+        );
+        // Bez hlídaného popředí se okno nikdy nebere jako aktivní.
+        okno(Some(7), false);
+        assert!(!s_stavem(|s| s.okno_aktivni));
+    }
+
+    fn uprav_s(zmena: Zmena) -> Result<(), ChybaUpravy> {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        proved(HookPrikaz::Uprav { zmena, odpoved: tx });
+        rx.try_recv().expect("odpověď hned")
+    }
+
+    fn mapovani_enginu() -> Mapping {
+        s_stavem(|s| s.engine.mapping().clone())
+    }
+
+    fn revize_enginu() -> u64 {
+        s_stavem(|s| s.engine.mapping_rev())
+    }
+
+    /// Úpravy z editoru: každá změna, prázdné nic nemění, „Zpět" jen
+    /// z aktuální revize, poslední klávesu nejde odebrat — a režim hry
+    /// zůstává (bez pozastavení, OQ 43).
+    #[test]
+    fn uprav_vsechny_zmeny() {
+        let z = Arc::new(Zaznam::default());
+        priprav_s(&z, Mapping::default());
+        let x = PadAction::first(Action::Button(PadButton::X));
+        let p2 = PadId::new(1).unwrap();
+        let num8 = PadAction::new(p2, Action::LeftStick(StickDir::Up));
+
+        assert_eq!(uprav_s(Zmena::VyprazdniVstup(x)), Ok(()));
+        assert_eq!(mapovani_enginu().target(KeyId::F), None);
+        assert_eq!((revize_enginu(), rezim()), (1, Mode::Gamepad));
+        assert_eq!(z.revize.load(Ordering::Acquire), 1, "revize jde oknu");
+        // Prázdný vstup znovu: v pořádku, revize stojí.
+        assert_eq!(uprav_s(Zmena::VyprazdniVstup(x)), Ok(()));
+        assert_eq!(revize_enginu(), 1);
+
+        assert_eq!(uprav_s(Zmena::VychoziPrvni), Ok(()));
+        assert_eq!(mapovani_enginu().target(KeyId::F), Some(x));
+        assert_eq!(revize_enginu(), 2);
+
+        let mut s_druhym = mapovani_enginu();
+        s_druhym.bind(KeyId::NUMPAD_8, num8).unwrap();
+        assert_eq!(
+            uprav_s(Zmena::Obnov {
+                mapovani: Box::new(s_druhym.clone()),
+                kdyz_revize: 2
+            }),
+            Ok(())
+        );
+        assert_eq!(mapovani_enginu(), s_druhym);
+        assert_eq!(revize_enginu(), 3);
+
+        assert_eq!(uprav_s(Zmena::VymazOvladac(p2)), Ok(()));
+        assert_eq!(mapovani_enginu().target(KeyId::NUMPAD_8), None);
+        assert_eq!(revize_enginu(), 4);
+
+        // „Zpět" ze staré revize: nic se nemění.
+        assert_eq!(
+            uprav_s(Zmena::Obnov {
+                mapovani: Box::new(s_druhym),
+                kdyz_revize: 3
+            }),
+            Err(ChybaUpravy::Zastarale)
+        );
+        assert_eq!(revize_enginu(), 4);
+        assert_eq!(mapovani_enginu().target(KeyId::NUMPAD_8), None);
+
+        // Poslední klávesa.
+        let jedina = Mapping::new(KeyId::SCROLL_LOCK, [(KeyId::F, x)]).unwrap();
+        assert_eq!(
+            uprav_s(Zmena::Obnov {
+                mapovani: Box::new(jedina.clone()),
+                kdyz_revize: 4
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            uprav_s(Zmena::VyprazdniVstup(x)),
+            Err(ChybaUpravy::Mapovani(MappingError::WouldBeEmpty))
+        );
+        assert_eq!(
+            uprav_s(Zmena::VymazOvladac(PadId::FIRST)),
+            Err(ChybaUpravy::Mapovani(MappingError::WouldBeEmpty))
+        );
+        assert_eq!(mapovani_enginu(), jedina);
+        assert_eq!(rezim(), Mode::Gamepad, "úpravy hru nepozastavují");
+
+        // Úprava během přiřazování ho zruší (cíl mohl zmizet).
+        nastav_popredi(true);
+        okno(Some(3), true);
+        proved(HookPrikaz::Prirad {
+            cil: x,
+            druh: BindKind::Replace,
+        });
+        assert!(matches!(rezim(), Mode::Binding { .. }));
+        assert_eq!(uprav_s(Zmena::VychoziPrvni), Ok(()));
+        assert_eq!(rezim(), Mode::Gamepad);
+        assert!(z.rozhodnuti.lock().unwrap().iter().any(|r| r.1.ui
+            == Some(UiEvent::BindingCancelled {
+                reason: BindingCancel::Gui
+            })));
+
+        // Rozbitý engine neodpoví — příkaz okna skončí chybou kanálu.
+        s_stavem(|s| s.rozbity = true);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        proved(HookPrikaz::Uprav {
+            zmena: Zmena::VychoziPrvni,
+            odpoved: tx,
+        });
+        assert_eq!(
+            rx.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Disconnected)
+        );
+    }
+
+    /// Snímek mapování pro okno pošle jen povel `Zverejni` (smyčka, klon),
+    /// nikdy callback.
+    #[test]
+    fn zverejni_posle_snimek_mapovani() {
+        let z = Arc::new(Zaznam::default());
+        priprav_s(&z, Mapping::default());
+        proved(HookPrikaz::Zverejni);
+        assert_eq!(*z.mapovani.lock().unwrap(), vec![(0, Mapping::default())]);
+        let x = PadAction::first(Action::Button(PadButton::X));
+        assert_eq!(uprav_s(Zmena::VyprazdniVstup(x)), Ok(()));
+        assert_eq!(z.mapovani.lock().unwrap().len(), 1, "úprava snímek nepošle");
+        proved(HookPrikaz::Zverejni);
+        let (rev, m) = z.mapovani.lock().unwrap().last().cloned().unwrap();
+        assert_eq!((rev, m.target(KeyId::F)), (1, None));
+        // Přiřazení klávesy v callbacku: jen revize, snímek ne.
+        nastav_popredi(true);
+        okno(Some(3), true);
+        proved(HookPrikaz::Prirad {
+            cil: x,
+            druh: BindKind::Replace,
+        });
+        assert!(zavolej(0, WM_KEYDOWN, &kb(0x21, 0)));
+        assert!(zavolej(0, WM_KEYUP, &kb(0x21, LLKHF_UP.0)));
+        assert_eq!(z.revize.load(Ordering::Acquire), 2);
+        assert_eq!(z.mapovani.lock().unwrap().len(), 2);
+    }
+
+    /// Syntetická klávesa testů jde touž cestou jako callback: stejná
+    /// rozhodnutí, stejné režimy, stejné potlačení.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_klavesa_jako_callback() {
+        // F24 dolů/nahoru, W (nenamapovaná), šipka nahoru (E0), Win,
+        // zkratka F23 dvakrát (pauza a zpět), F24 při pauze.
+        let udalosti: [(u16, bool, bool); 10] = [
+            (0x76, false, true),
+            (0x76, false, true),
+            (0x76, false, false),
+            (0x11, false, true),
+            (0x48, true, true),
+            (0x5B, true, true),
+            (0x6E, false, true),
+            (0x6E, false, false),
+            (0x76, false, true),
+            (0x76, false, false),
+        ];
+        let callbackem = {
+            let z = Arc::new(Zaznam::default());
+            priprav(&z);
+            udalosti.map(|(scan, e0, dolu)| {
+                let flags =
+                    if e0 { LLKHF_EXTENDED.0 } else { 0 } | if dolu { 0 } else { LLKHF_UP.0 };
+                let zprava = if dolu { WM_KEYDOWN } else { WM_KEYUP };
+                let p = zavolej(0, zprava, &kb(u32::from(scan), flags));
+                let (u, d, m) = z.posledni();
+                let u = u.unwrap();
+                (p, u.klavesa, u.dolu, d, m)
+            })
+        };
+        let testem = {
+            let z = Arc::new(Zaznam::default());
+            priprav(&z);
+            udalosti.map(|(scan, e0, dolu)| {
+                let klavesa = KeyId { scan, extended: e0 };
+                proved(HookPrikaz::TestKlavesa {
+                    klavesa,
+                    vk: 0,
+                    dolu,
+                });
+                let (u, d, m) = z.posledni();
+                let u = u.unwrap();
+                (d.suppress, u.klavesa, u.dolu, d, m)
+            })
+        };
+        assert_eq!(callbackem, testem);
     }
 
     /// Skutečný hook na skryté ploše: bez zapnutého ovladače v systému
@@ -1252,7 +2627,13 @@ mod tests {
     fn hook_jen_se_zapnutym_ovladacem() {
         let z = Arc::new(Zaznam::default());
         let vystup: Arc<dyn Vystup> = z.clone();
-        let mut hook = spust_s(mapovani(), vystup, testy_plocha::na_skryte_plose).unwrap();
+        let mut hook = spust_s(
+            mapovani(),
+            vystup,
+            testy_plocha::na_skryte_plose,
+            je_v_popredi,
+        )
+        .unwrap();
         let st = Arc::clone(hook.status());
         assert!(!st.nainstalovan(), "bez ovladače hook v systému není");
         assert_eq!(st.instalaci(), 0);
@@ -1263,13 +2644,6 @@ mod tests {
                 if z.rozhodnuti.lock().unwrap().iter().any(podminka) {
                     return;
                 }
-                assert!(std::time::Instant::now() < konec, "vlákno neodpovědělo");
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        };
-        let pockej_na = |co: &dyn Fn() -> bool| {
-            let konec = std::time::Instant::now() + LIMIT;
-            while !co() {
                 assert!(std::time::Instant::now() < konec, "vlákno neodpovědělo");
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -1327,13 +2701,118 @@ mod tests {
         assert!(hook.zastav(), "druhé zastavení nic nedělá");
     }
 
+    fn pockej_na(co: &dyn Fn() -> bool) {
+        let konec = std::time::Instant::now() + LIMIT;
+        while !co() {
+            assert!(std::time::Instant::now() < konec, "vlákno neodpovědělo");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Popředí okna pro hook vlákno testu na skryté ploše (fn ukazatel
+    /// nic nezachytí — proto statika, každý test vlastní).
+    static POPREDI_BEZ_OVLADACE: AtomicBool = AtomicBool::new(false);
+    static POPREDI_S_OVLADACEM: AtomicBool = AtomicBool::new(false);
+
+    fn popredi_bez_ovladace(_hwnd: isize) -> bool {
+        POPREDI_BEZ_OVLADACE.load(Ordering::Acquire)
+    }
+
+    fn popredi_s_ovladacem(_hwnd: isize) -> bool {
+        POPREDI_S_OVLADACEM.load(Ordering::Acquire)
+    }
+
+    /// Skutečný hook na skryté ploše bez zapnutého ovladače: okno
+    /// v popředí ho nainstaluje (živé klávesy), okno na pozadí nebo
+    /// schované ho zase odebere.
+    #[test]
+    fn hook_s_oknem_v_popredi_bez_ovladace() {
+        let z = Arc::new(Zaznam::default());
+        let vystup: Arc<dyn Vystup> = z.clone();
+        let mut hook = spust_s(
+            mapovani(),
+            vystup,
+            testy_plocha::na_skryte_plose,
+            popredi_bez_ovladace,
+        )
+        .unwrap();
+        let st = Arc::clone(hook.status());
+        POPREDI_BEZ_OVLADACE.store(true, Ordering::Release);
+        assert!(hook.posli(HookPrikaz::Okno(Some(42))));
+        pockej_na(&|| st.nainstalovan());
+        assert_eq!(st.instalaci(), 1);
+        // Okno na pozadí.
+        POPREDI_BEZ_OVLADACE.store(false, Ordering::Release);
+        assert!(hook.posli(HookPrikaz::Okno(Some(42))));
+        pockej_na(&|| !st.nainstalovan());
+        // Zase v popředí, pak schované.
+        POPREDI_BEZ_OVLADACE.store(true, Ordering::Release);
+        assert!(hook.posli(HookPrikaz::Okno(Some(42))));
+        pockej_na(&|| st.instalaci() == 2 && st.nainstalovan());
+        assert!(hook.posli(HookPrikaz::Okno(None)));
+        pockej_na(&|| !st.nainstalovan());
+        assert_eq!(z.posledni_zive(), Some([LiveInputs::EMPTY; MAX_PADS]));
+        assert!(hook.zastav());
+    }
+
+    /// Se zapnutým ovladačem popředí okna na hook nesahá — klávesy hráče
+    /// se nesmí ztratit přeinstalací při každém Alt+Tab.
+    #[test]
+    fn se_zapnutym_ovladacem_popredi_hook_nemeni() {
+        let z = Arc::new(Zaznam::default());
+        let vystup: Arc<dyn Vystup> = z.clone();
+        let mut hook = spust_s(
+            mapovani(),
+            vystup,
+            testy_plocha::na_skryte_plose,
+            popredi_s_ovladacem,
+        )
+        .unwrap();
+        let st = Arc::clone(hook.status());
+        assert!(hook.posli(HookPrikaz::Povol(PadId::FIRST)));
+        assert!(hook.posli(HookPrikaz::Zachytavej));
+        pockej_na(&|| {
+            z.rozhodnuti
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.2 == Mode::Gamepad)
+        });
+        pockej_na(&|| st.nainstalovan());
+        let n = st.instalaci();
+        for i in 0..4 {
+            POPREDI_S_OVLADACEM.store(i % 2 == 0, Ordering::Release);
+            assert!(hook.posli(HookPrikaz::Okno(Some(5))));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(hook.posli(HookPrikaz::Okno(None)));
+        std::thread::sleep(Duration::from_millis(20));
+        // Zpráva za vším předchozím: až dorazí, smyčka prošla hlídáním.
+        assert!(hook.posli(HookPrikaz::Zverejni));
+        pockej_na(&|| !z.mapovani.lock().unwrap().is_empty());
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(st.instalaci(), n);
+        assert!(st.nainstalovan());
+        assert_eq!(
+            z.rozhodnuti.lock().unwrap().last().map(|r| r.2),
+            Some(Mode::Gamepad)
+        );
+        assert!(hook.zastav());
+    }
+
     /// Konec při zachytávání: neutrál všem ovladačům ještě před
     /// odebráním hooku (pořadí neutrál → odhooknout).
     #[test]
     fn konec_pri_zachytavani_posle_neutral() {
         let z = Arc::new(Zaznam::default());
         let vystup: Arc<dyn Vystup> = z.clone();
-        let mut hook = spust_s(mapovani(), vystup, testy_plocha::na_skryte_plose).unwrap();
+        let mut hook = spust_s(
+            mapovani(),
+            vystup,
+            testy_plocha::na_skryte_plose,
+            je_v_popredi,
+        )
+        .unwrap();
         assert!(hook.posli(HookPrikaz::Povol(PadId::FIRST)));
         assert!(hook.posli(HookPrikaz::Zachytavej));
         let konec = std::time::Instant::now() + LIMIT;
@@ -1407,7 +2886,13 @@ mod tests {
         }
         let v = Arc::new(Padajici::default());
         let vystup: Arc<dyn Vystup> = v.clone();
-        let mut hook = spust_s(mapovani(), vystup, testy_plocha::na_skryte_plose).unwrap();
+        let mut hook = spust_s(
+            mapovani(),
+            vystup,
+            testy_plocha::na_skryte_plose,
+            je_v_popredi,
+        )
+        .unwrap();
         let st = Arc::clone(hook.status());
         assert!(hook.posli(HookPrikaz::Povol(PadId::FIRST)));
         assert!(hook.posli(HookPrikaz::Zachytavej));
@@ -1506,7 +2991,11 @@ mod tests {
             let mut s = s.borrow_mut();
             let e = &mut s.as_mut().unwrap().engine;
             let _ = e.force_keyboard(ForceReason::Shutdown);
-            let _ = e.start_binding(PadAction::first(Action::Button(PadButton::B)), ted_ms());
+            let _ = e.start_binding(
+                PadAction::first(Action::Button(PadButton::B)),
+                BindKind::Replace,
+                ted_ms(),
+            );
         });
         let id = hlidej_casovac(0);
         assert_ne!(id, 0);
@@ -1520,6 +3009,29 @@ mod tests {
                 .cancel_binding(ted_ms());
         });
         assert_eq!(hlidej_casovac(id), 0);
+    }
+
+    /// Měření pro `hook_selftest`: vrátí čas každé události, předchozí
+    /// stav vlákna obnoví a nic nenechá v systému.
+    #[test]
+    fn mereni_vrati_casy_a_obnovi_stav() {
+        let z = Arc::new(Zaznam::default());
+        priprav(&z);
+        let jiny: Arc<dyn Vystup> = Arc::new(Zaznam::default());
+        for zive in [false, true] {
+            let casy = zmer_zpracovani(
+                100,
+                Mapping::default(),
+                Arc::clone(&jiny),
+                zive,
+                true,
+                |_| 0,
+            );
+            assert_eq!(casy.len(), 100);
+        }
+        // Stav testu zůstal (zaznamenává dál do `z`).
+        assert!(zavolej(0, WM_KEYDOWN, &kb(0x76, 0)));
+        assert_eq!(z.posledni().0.unwrap().klavesa, F24);
     }
 }
 

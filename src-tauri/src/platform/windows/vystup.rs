@@ -1,17 +1,24 @@
 //! Kam hook předává rozhodnutí enginu (Fáze 4): stavy ovladačů do
-//! slotů jejich pad vláken, režim a příčinu jeho změny (Fáze 4b: ikona
-//! a zvuk) pro okno.
+//! slotů jejich pad vláken; režim a příčinu jeho změny (Fáze 4b: ikona
+//! a zvuk); cíl přiřazování, poslední oznámení, revizi mapování a živý
+//! stav vstupů (Fáze 6) pro okno.
 //!
 //! Volá se z callbacku hooku — proto jen atomiky a události Windows,
 //! žádný zámek, alokace ani logování (princip 3). Okno se o změně
-//! režimu dozví přes [`Budik`]: probudí vlákno, které teprve vydá
-//! Tauri událost (z callbacku `emit` nikdy).
+//! dozví přes [`Budik`]: probudí vlákno, které teprve vydá Tauri
+//! událost (z callbacku `emit` nikdy).
+//!
+//! Jediný zámek je schránka snímku mapování ([`HookVystup::vezmi_mapovani`]):
+//! plní ji jen smyčka hook vlákna na povel `Zverejni`, nikdy callback
+//! (snímek je klon celé tabulky). Callback publikuje jen revizi —
+//! číslo, podle kterého si vlákno okna o snímek řekne.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use keypad_core::{
-    BindingCancel, Decision, DisabledReason, ForceReason, Mode, ModeCause, PadId, UiEvent, MAX_PADS,
+    Action, ActionSet, BindingCancel, Decision, DisabledReason, ForceReason, LiveInputs, Mapping,
+    Mode, ModeCause, PadId, UiEvent, MAX_PADS,
 };
 use serde::Serialize;
 
@@ -36,12 +43,35 @@ pub enum Rezim {
     NoHook,
 }
 
+/// Vstup konkrétního ovladače pro okno (cíl přiřazování, odkud se
+/// klávesa přesunula). Ovladače od 0 jako všude ve smlouvě s oknem.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct CilInfo {
+    pub pad: u8,
+    /// Stabilní kód vstupu ([`Action::code`]).
+    pub vstup: &'static str,
+}
+
+impl CilInfo {
+    pub fn z(t: keypad_core::PadAction) -> CilInfo {
+        CilInfo {
+            pad: t.pad.index() as u8,
+            vstup: t.action.code(),
+        }
+    }
+}
+
 /// Režim pro okno s pořadovým číslem změny: odpověď příkazu `rezim`
 /// a událost se můžou předběhnout — okno si nechá novější.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct RezimInfo {
     pub rezim: Rezim,
     pub seq: u64,
+    /// Co se právě přiřazuje (jen v `binding`).
+    pub cil: Option<CilInfo>,
+    /// Windows nedovolily hook klávesnice. I bez zapnutého ovladače:
+    /// okno v popředí pak neukáže živé klávesy a musí říct proč.
+    pub hook_chyba: bool,
 }
 
 impl Rezim {
@@ -151,80 +181,110 @@ impl Pricina {
             Pricina::Ovladac => 3,
             Pricina::Prirazovani => 4,
             Pricina::OvladacChyba => 5,
-            Pricina::Vynuceno(r) => {
-                8 + match r {
-                    ForceReason::Watchdog => 0,
-                    ForceReason::PadError => 1,
-                    ForceReason::SessionLock => 2,
-                    ForceReason::DesktopSwitch => 3,
-                    ForceReason::Suspend => 4,
-                    ForceReason::HookPanic => 5,
-                    ForceReason::HookReinstalled => 6,
-                    ForceReason::MappingChanged => 7,
-                    ForceReason::Shutdown => 8,
-                }
-            }
+            Pricina::Vynuceno(r) => 8 + r.index() as u64,
         }
     }
 
     /// Opak [`Pricina::kod`]; neznámý kód = `Nic`.
     fn z_kodu(k: u64) -> Pricina {
-        let r = match k {
-            1 => return Pricina::Zkratka,
-            2 => return Pricina::Okno,
-            3 => return Pricina::Ovladac,
-            4 => return Pricina::Prirazovani,
-            5 => return Pricina::OvladacChyba,
-            8 => ForceReason::Watchdog,
-            9 => ForceReason::PadError,
-            10 => ForceReason::SessionLock,
-            11 => ForceReason::DesktopSwitch,
-            12 => ForceReason::Suspend,
-            13 => ForceReason::HookPanic,
-            14 => ForceReason::HookReinstalled,
-            15 => ForceReason::MappingChanged,
-            16 => ForceReason::Shutdown,
-            _ => return Pricina::Nic,
-        };
-        Pricina::Vynuceno(r)
+        match k {
+            1 => Pricina::Zkratka,
+            2 => Pricina::Okno,
+            3 => Pricina::Ovladac,
+            4 => Pricina::Prirazovani,
+            5 => Pricina::OvladacChyba,
+            _ => k
+                .checked_sub(8)
+                .and_then(|i| ForceReason::ALL.get(i as usize))
+                .map_or(Pricina::Nic, |&r| Pricina::Vynuceno(r)),
+        }
     }
 }
 
 // Bity atomiku `stav`:
 //   0–2 režim enginu | 3 hook nejde | 4–11 příčina poslední změny |
-//   12–19 cíl přiřazování (Fáze 6, zatím 0) | 20–63 číslo změny.
+//   12–19 cíl přiřazování (12 platný | 13–14 ovladač | 15–19
+//   Action::index) | 20–63 číslo změny.
 // Číslo změny má 44 bitů — přeteklo by po 17 bilionech změn.
 const REZIM: u64 = 0b111;
 const CHYBA: u64 = 1 << 3;
 const PRICINA_POSUN: u32 = 4;
 const PRICINA: u64 = 0xFF << PRICINA_POSUN;
+const CIL_POSUN: u32 = 12;
+const CIL: u64 = 0xFF << CIL_POSUN;
 const SEQ_POSUN: u32 = 20;
-/// Část, jejíž změna zvyšuje číslo změny (příčina ji jen provází).
-const OBSAH: u64 = REZIM | CHYBA;
+/// Část, jejíž změna zvyšuje číslo změny (příčina ji jen provází). Cíl
+/// patří k ní: nové přiřazování jiné čepičky je změna, kterou okno musí
+/// vidět, i když režim zůstal „přiřazuji".
+const OBSAH: u64 = REZIM | CHYBA | CIL;
+
+/// Cíl přiřazování do bitů 12–19 atomiku `stav`; mimo přiřazování 0.
+fn kod_cile(m: Mode) -> u64 {
+    match m {
+        Mode::Binding { target, .. } => {
+            (1 | (target.pad.index() as u64) << 1 | (target.action.index() as u64) << 3)
+                << CIL_POSUN
+        }
+        _ => 0,
+    }
+}
+
+fn cil_z_kodu(s: u64) -> Option<CilInfo> {
+    let c = (s & CIL) >> CIL_POSUN;
+    if c & 1 == 0 {
+        return None;
+    }
+    let pad = PadId::new((c >> 1 & 0b11) as usize)?;
+    let action = Action::from_index((c >> 3) as usize)?;
+    Some(CilInfo::z(keypad_core::PadAction::new(pad, action)))
+}
+
+// Schránka oznámení: 0–47 `UiEvent::pack` | 48–63 pořadí (přetéká).
+// Platí jen poslední oznámení — přepsané okno pozná podle mezery
+// v pořadí a načte si stav znovu (režim a mapování jsou zdroj pravdy,
+// oznámení je jen „co se stalo a proč").
+const OZNAMENI_SEQ_POSUN: u32 = 48;
+/// Obsah schránky oznámení bez pořadí.
+pub const OZNAMENI_OBSAH: u64 = (1 << OZNAMENI_SEQ_POSUN) - 1;
 
 pub struct HookVystup {
     sloty: [Arc<StavSlot>; MAX_PADS],
-    /// Režim, chyba hooku, příčina a číslo změny v JEDNOM atomiku — okno
-    /// tak nikdy nedostane nový režim se starým číslem nebo cizí
+    /// Režim, chyba hooku, příčina, cíl a číslo změny v JEDNOM atomiku —
+    /// okno tak nikdy nedostane nový režim se starým číslem nebo cizí
     /// příčinou. Zapisuje jen hook vlákno (callback i smyčka), proto
     /// stačí načíst a uložit.
     stav: AtomicU64,
+    /// Poslední oznámení (viz `OZNAMENI_SEQ_POSUN`).
+    oznameni: AtomicU64,
+    /// Živý stav vstupů ovladačů (`LiveInputs::bits`) — jen s viditelným
+    /// oknem, jinak ho hook nepočítá.
+    zive: [AtomicU32; MAX_PADS],
+    /// Revize mapování enginu.
+    revize: AtomicU64,
+    /// Snímek mapování s revizí. Plní JEN smyčka hook vlákna (povel
+    /// `Zverejni`), bere JEN vlákno okna — callback na zámek nesahá.
+    mapovani: Mutex<Option<(u64, Arc<Mapping>)>>,
     budik: Arc<Budik>,
 }
 
 impl HookVystup {
-    /// `budik` probudí vlákno, které změnu režimu ohlásí oknu.
+    /// `budik` probudí vlákno, které změny ohlásí oknu.
     pub fn new(sloty: [Arc<StavSlot>; MAX_PADS], budik: Arc<Budik>) -> HookVystup {
         HookVystup {
             sloty,
             stav: AtomicU64::new(Rezim::Disabled.kod()),
+            oznameni: AtomicU64::new(0),
+            zive: std::array::from_fn(|_| AtomicU32::new(0)),
+            revize: AtomicU64::new(0),
+            mapovani: Mutex::new(None),
             budik,
         }
     }
 
     /// Režim s číslem změny pro okno. Chyba hooku přebíjí zapnuté stavy
     /// (bez hooku se nic nezachytává); bez ovladače je to prostě
-    /// `Disabled`.
+    /// `Disabled` a přiřazování zůstává přiřazováním (smyčka ho bez hooku
+    /// hned zruší) — chybu pak nese jen `hook_chyba`.
     pub fn info(&self) -> RezimInfo {
         self.info_s_pricinou().0
     }
@@ -233,18 +293,55 @@ impl HookVystup {
     /// takže k sobě vždy patří.
     pub fn info_s_pricinou(&self) -> (RezimInfo, Pricina) {
         let s = self.stav.load(Ordering::Acquire);
+        let chyba = s & CHYBA != 0;
         let rezim = match Rezim::z_kodu(s & REZIM) {
-            Rezim::Disabled => Rezim::Disabled,
-            _ if s & CHYBA != 0 => Rezim::NoHook,
+            r @ (Rezim::Disabled | Rezim::Binding) => r,
+            _ if chyba => Rezim::NoHook,
             r => r,
         };
         (
             RezimInfo {
                 rezim,
                 seq: s >> SEQ_POSUN,
+                cil: cil_z_kodu(s),
+                hook_chyba: chyba,
             },
             Pricina::z_kodu((s & PRICINA) >> PRICINA_POSUN),
         )
+    }
+
+    /// Schránka oznámení: pořadí v bitech 48–63, obsah
+    /// ([`OZNAMENI_OBSAH`]) je `UiEvent::pack`.
+    pub fn oznameni(&self) -> u64 {
+        self.oznameni.load(Ordering::Acquire)
+    }
+
+    /// Fyzicky držené vstupy ovladačů (jak je naposledy poslal hook).
+    pub fn zive_vstupy(&self) -> [LiveInputs; MAX_PADS] {
+        std::array::from_fn(|i| LiveInputs::from_bits(self.zive[i].load(Ordering::Acquire)))
+    }
+
+    /// Vstupy, které hra opravdu dostává: stav ve slotu padu (ten pad
+    /// vlákno posílá do ViGEm).
+    pub fn hra(&self) -> [ActionSet; MAX_PADS] {
+        std::array::from_fn(|i| {
+            self.sloty[i]
+                .cti()
+                .map_or(ActionSet::EMPTY, |p| p.stav.active_inputs())
+        })
+    }
+
+    /// Revize mapování enginu.
+    pub fn revize_mapovani(&self) -> u64 {
+        self.revize.load(Ordering::Acquire)
+    }
+
+    /// Vezme snímek mapování (každý jen jednou).
+    pub fn vezmi_mapovani(&self) -> Option<(u64, Arc<Mapping>)> {
+        self.mapovani
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
     }
 
     /// Nový obsah atomiku; při změně zapíše příčinu, zvýší číslo
@@ -262,6 +359,17 @@ impl HookVystup {
             self.budik.probud();
         }
     }
+
+    /// Zapíše oznámení s dalším pořadím a probudí okno.
+    fn oznam(&self, obsah: u64) {
+        let stary = self.oznameni.load(Ordering::Acquire);
+        let seq = ((stary >> OZNAMENI_SEQ_POSUN) as u16).wrapping_add(1);
+        self.oznameni.store(
+            u64::from(seq) << OZNAMENI_SEQ_POSUN | obsah & OZNAMENI_OBSAH,
+            Ordering::Release,
+        );
+        self.budik.probud();
+    }
 }
 
 impl Vystup for HookVystup {
@@ -271,8 +379,14 @@ impl Vystup for HookVystup {
                 slot.zapis(stav);
             }
         }
-        let kod = Rezim::z(rezim).kod();
+        let kod = Rezim::z(rezim).kod() | kod_cile(rezim);
         self.zmen(Pricina::z_udalosti(d.ui), |s| s & CHYBA | kod);
+        // Až po režimu: vlákno okna čte oznámení dřív než režim, takže
+        // kdo vidí nové oznámení, vidí i režim, který k němu patří, a
+        // okno dostane `rezim` vždy před `oznameni` (spec B4).
+        if let Some(obsah) = d.ui.and_then(|u| u.pack()) {
+            self.oznam(obsah);
+        }
     }
 
     fn hook_chyba(&self, chyba: bool) {
@@ -282,13 +396,41 @@ impl Vystup for HookVystup {
     fn tep_ms(&self, pad: PadId) -> Option<u64> {
         self.sloty.get(pad.index()).map(|s| s.tep())
     }
+
+    fn zive(&self, z: &[LiveInputs; MAX_PADS]) {
+        let mut zmena = false;
+        for (a, l) in self.zive.iter().zip(z) {
+            if a.load(Ordering::Relaxed) != l.bits() {
+                a.store(l.bits(), Ordering::Release);
+                zmena = true;
+            }
+        }
+        // Budí se jen změnou — autorepeat držené klávesy okno nebudí.
+        if zmena {
+            self.budik.probud();
+        }
+    }
+
+    fn revize(&self, rev: u64) {
+        if self.revize.load(Ordering::Relaxed) != rev {
+            self.revize.store(rev, Ordering::Release);
+            self.budik.probud();
+        }
+    }
+
+    fn mapovani(&self, rev: u64, m: &Mapping) {
+        let snimek = Some((rev, Arc::new(m.clone())));
+        *self.mapovani.lock().unwrap_or_else(PoisonError::into_inner) = snimek;
+        self.budik.probud();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use keypad_core::{
-        Action, Engine, KeyId, Mapping, PadAction, PadButton, PadState, PadUpdates, AXIS_MAX,
+        BindKind, BindingReject, Engine, KeyId, PadAction, PadButton, PadState, PadUpdates,
+        StickDir, ToggleReject, AXIS_MAX,
     };
 
     fn vystup() -> (HookVystup, [Arc<StavSlot>; MAX_PADS], Arc<Budik>) {
@@ -345,13 +487,15 @@ mod tests {
     }
 
     /// Hook nejde: zapnutý ovladač se v okně nesmí tvářit, že klávesy
-    /// ovládají ho. Bez ovladače je to jen „vypnuto". Každá změna zvýší
-    /// číslo (okno zahodí starší odpověď).
+    /// ovládají ho. Bez ovladače je to jen „vypnuto" a chybu nese
+    /// `hook_chyba` (okno v popředí neukáže živé klávesy). Každá změna
+    /// zvýší číslo (okno zahodí starší odpověď).
     #[test]
     fn chyba_hooku_je_videt_a_cisluje_se() {
         let (v, _sloty, budik) = vystup();
         v.hook_chyba(true);
         assert_eq!(v.info().rezim, Rezim::Disabled, "bez ovladače nic nechybí");
+        assert!(v.info().hook_chyba);
         assert!(budik.cekej(Some(0)));
         v.rozhodnuti(None, &Decision::NONE, Mode::Keyboard);
         assert_eq!(v.info().rezim, Rezim::NoHook);
@@ -365,12 +509,218 @@ mod tests {
             v.info(),
             RezimInfo {
                 rezim: Rezim::Capturing,
-                seq: pred + 1
+                seq: pred + 1,
+                cil: None,
+                hook_chyba: false,
             }
         );
     }
 
-    /// Výstup běží v callbacku hooku — nesmí alokovat.
+    /// Cíl přiřazování jde oknu v atomiku `stav` spolu s režimem; nový
+    /// cíl za běžícího přiřazování je změna (nové číslo), konec
+    /// přiřazování cíl smaže.
+    #[test]
+    fn cil_prirazovani_v_atomiku_stav() {
+        let (v, _sloty, budik) = vystup();
+        let binding = |pad: usize, a: Action| Mode::Binding {
+            target: PadAction::new(PadId::new(pad).unwrap(), a),
+            started_at_ms: 5,
+        };
+        v.rozhodnuti(
+            None,
+            &Decision::NONE,
+            binding(1, Action::Button(PadButton::A)),
+        );
+        let i = v.info();
+        assert_eq!(i.rezim, Rezim::Binding);
+        assert_eq!(i.cil, Some(CilInfo { pad: 1, vstup: "a" }));
+        assert!(budik.cekej(Some(0)));
+        // Jiný cíl = nové číslo, i když režim zůstává.
+        v.rozhodnuti(None, &Decision::NONE, binding(3, Action::RightTrigger));
+        assert_eq!(v.info().seq, i.seq + 1);
+        assert_eq!(
+            v.info().cil,
+            Some(CilInfo {
+                pad: 3,
+                vstup: "rt"
+            })
+        );
+        // Všechny cíle tam a zpět.
+        for pad in PadId::ALL {
+            for a in Action::ALL {
+                v.rozhodnuti(None, &Decision::NONE, binding(pad.index(), a));
+                assert_eq!(
+                    v.info().cil,
+                    Some(CilInfo::z(PadAction::new(pad, a))),
+                    "{pad:?} {a:?}"
+                );
+            }
+        }
+        v.rozhodnuti(None, &Decision::NONE, Mode::Keyboard);
+        assert_eq!(v.info().cil, None);
+        // Přiřazování s nefunkčním hookem zůstává přiřazováním (smyčka ho
+        // hned zruší) a chybu nese `hook_chyba`.
+        v.hook_chyba(true);
+        v.rozhodnuti(
+            None,
+            &Decision::NONE,
+            binding(0, Action::Button(PadButton::B)),
+        );
+        let i = v.info();
+        assert_eq!((i.rezim, i.hook_chyba), (Rezim::Binding, true));
+    }
+
+    /// Každé oznámení (kromě změny režimu, tu nese `stav`) jde do
+    /// schránky s dalším pořadím a vrátí se celé; pořadí přetéká.
+    #[test]
+    fn oznameni_tam_a_zpet() {
+        let (v, _sloty, budik) = vystup();
+        let a = PadAction::new(PadId::new(1).unwrap(), Action::LeftStick(StickDir::Up));
+        let mut udalosti = vec![
+            UiEvent::BindingSaved {
+                key: KeyId::W,
+                target: a,
+                moved_from: None,
+            },
+            UiEvent::BindingSaved {
+                key: KeyId::ext(0x48),
+                target: a,
+                moved_from: Some(PadAction::first(Action::Button(PadButton::Y))),
+            },
+            UiEvent::ToggleRejected {
+                reason: ToggleReject::Binding,
+            },
+        ];
+        for reason in [
+            BindingReject::ToggleKey,
+            BindingReject::Unmappable,
+            BindingReject::Reserved,
+        ] {
+            udalosti.push(UiEvent::BindingRejected {
+                key: KeyId {
+                    scan: 0xFFFF,
+                    extended: true,
+                },
+                reason,
+            });
+        }
+        for reason in [
+            BindingCancel::Escape,
+            BindingCancel::Timeout,
+            BindingCancel::Gui,
+            BindingCancel::PadStatus,
+        ]
+        .into_iter()
+        .chain(ForceReason::ALL.map(BindingCancel::Forced))
+        {
+            udalosti.push(UiEvent::BindingCancelled { reason });
+        }
+        for r in [
+            DisabledReason::ViGEmMissing,
+            DisabledReason::PadNotConnected,
+            DisabledReason::PadError,
+        ] {
+            udalosti.push(UiEvent::ToggleRejected {
+                reason: ToggleReject::Disabled(r),
+            });
+        }
+        assert_eq!(v.oznameni(), 0);
+        for (i, u) in udalosti.iter().enumerate() {
+            let d = Decision {
+                ui: Some(*u),
+                ..Decision::NONE
+            };
+            v.rozhodnuti(None, &d, Mode::Keyboard);
+            let b = v.oznameni();
+            assert_eq!(b >> 48, i as u64 + 1, "{u:?}");
+            assert_eq!(UiEvent::unpack(b & OZNAMENI_OBSAH), Some(*u));
+            assert!(budik.cekej(Some(0)));
+        }
+        // Změna režimu oznámení nepřepíše (nese ji `stav`).
+        let pred = v.oznameni();
+        let d = Decision {
+            ui: Some(UiEvent::ModeChanged {
+                mode: Mode::Gamepad,
+                cause: ModeCause::Hotkey,
+            }),
+            ..Decision::NONE
+        };
+        v.rozhodnuti(None, &d, Mode::Gamepad);
+        assert_eq!(v.oznameni(), pred);
+        // Pořadí je 16 bitů a přeteče na 0.
+        v.oznameni.store(0xFFFF << 48, Ordering::Release);
+        let d = Decision {
+            ui: Some(udalosti[0]),
+            ..Decision::NONE
+        };
+        v.rozhodnuti(None, &d, Mode::Keyboard);
+        assert_eq!(v.oznameni() >> 48, 0);
+        assert_eq!(
+            UiEvent::unpack(v.oznameni() & OZNAMENI_OBSAH),
+            Some(udalosti[0])
+        );
+    }
+
+    /// Živý stav se zapíše a okno probudí jen při změně (autorepeat ani
+    /// klávesa jiného vstupu téhož stavu okno nebudí).
+    #[test]
+    fn zive_zapise_a_probudi_jen_pri_zmene() {
+        let (v, _sloty, budik) = vystup();
+        let mut set = ActionSet::EMPTY;
+        set.insert(Action::LeftStick(StickDir::Up));
+        let mut z = [LiveInputs::EMPTY; MAX_PADS];
+        v.zive(&z);
+        assert!(
+            !budik.cekej(Some(0)),
+            "prázdný stav na začátku = beze změny"
+        );
+        z[2] = LiveInputs::new(set, (0, 1), (0, 0));
+        v.zive(&z);
+        assert!(budik.cekej(Some(0)));
+        assert_eq!(v.zive_vstupy(), z);
+        v.zive(&z);
+        assert!(!budik.cekej(Some(0)), "stejný stav okno nebudí");
+        v.zive(&[LiveInputs::EMPTY; MAX_PADS]);
+        assert!(budik.cekej(Some(0)));
+        assert_eq!(v.zive_vstupy(), [LiveInputs::EMPTY; MAX_PADS]);
+    }
+
+    /// Revize budí jen změnou; snímek mapování jde do schránky a vlákno
+    /// okna si ho vezme právě jednou (novější přepíše starší).
+    #[test]
+    fn revize_a_schranka_mapovani() {
+        let (v, _sloty, budik) = vystup();
+        v.revize(0);
+        assert!(!budik.cekej(Some(0)));
+        v.revize(3);
+        assert!(budik.cekej(Some(0)));
+        assert_eq!(v.revize_mapovani(), 3);
+        assert!(v.vezmi_mapovani().is_none());
+        let m = Mapping::default();
+        let mut m2 = m.clone();
+        m2.unbind(KeyId::W).unwrap();
+        v.mapovani(3, &m);
+        assert!(budik.cekej(Some(0)));
+        v.mapovani(4, &m2);
+        let (rev, snimek) = v.vezmi_mapovani().unwrap();
+        assert_eq!((rev, &*snimek), (4, &m2));
+        assert!(v.vezmi_mapovani().is_none(), "snímek se bere jen jednou");
+    }
+
+    /// Hra = stav ve slotu padu (to, co pad vlákno posílá do ViGEm).
+    #[test]
+    fn hra_ze_slotu_padu() {
+        let (v, sloty, _budik) = vystup();
+        assert_eq!(v.hra(), [ActionSet::EMPTY; MAX_PADS]);
+        sloty[1].zapis(stav());
+        let mut ocekavano = ActionSet::EMPTY;
+        ocekavano.insert(Action::LeftStick(StickDir::Up));
+        assert_eq!(v.hra()[1], ocekavano);
+        assert_eq!(v.hra()[0], ActionSet::EMPTY);
+    }
+
+    /// Výstup běží v callbacku hooku — nesmí alokovat ani uvolňovat,
+    /// ani se živým stavem, oznámením a revizí.
     #[test]
     fn vystup_nealokuje() {
         let (v, _sloty, _budik) = vystup();
@@ -383,24 +733,33 @@ mod tests {
             pads,
             ui: None,
         };
+        let ulozeno = Decision {
+            ui: Some(UiEvent::BindingSaved {
+                key: KeyId::W,
+                target: PadAction::first(Action::Button(PadButton::A)),
+                moved_from: Some(PadAction::first(Action::Button(PadButton::B))),
+            }),
+            ..d
+        };
+        let mut set = ActionSet::EMPTY;
+        set.insert(Action::Button(PadButton::A));
+        let zive = [LiveInputs::new(set, (1, -1), (0, 1)); MAX_PADS];
+        let binding = Mode::Binding {
+            target: PadAction::first(Action::Button(PadButton::X)),
+            started_at_ms: 0,
+        };
         let pred = crate::testy_alokace::pocet();
-        for m in [Mode::Gamepad, Mode::Keyboard, Mode::Gamepad] {
+        for m in [Mode::Gamepad, Mode::Keyboard, binding, Mode::Gamepad] {
             v.rozhodnuti(None, &d, m);
+            v.rozhodnuti(None, &ulozeno, m);
+            v.revize(7);
+            v.zive(&zive);
+            v.zive(&[LiveInputs::EMPTY; MAX_PADS]);
+            v.hook_chyba(true);
+            v.hook_chyba(false);
         }
         assert_eq!(crate::testy_alokace::pocet(), pred);
     }
-
-    const VYNUCENI: [ForceReason; 9] = [
-        ForceReason::Watchdog,
-        ForceReason::PadError,
-        ForceReason::SessionLock,
-        ForceReason::DesktopSwitch,
-        ForceReason::Suspend,
-        ForceReason::HookPanic,
-        ForceReason::HookReinstalled,
-        ForceReason::MappingChanged,
-        ForceReason::Shutdown,
-    ];
 
     fn vsechny_priciny() -> Vec<Pricina> {
         let mut v = vec![
@@ -411,7 +770,7 @@ mod tests {
             Pricina::OvladacChyba,
             Pricina::Prirazovani,
         ];
-        v.extend(VYNUCENI.map(Pricina::Vynuceno));
+        v.extend(ForceReason::ALL.map(Pricina::Vynuceno));
         v
     }
 
@@ -446,7 +805,7 @@ mod tests {
         ]
         .into_iter()
         .chain(
-            VYNUCENI
+            ForceReason::ALL
                 .iter()
                 .map(|&r| (ModeCause::Forced(r), Pricina::Vynuceno(r))),
         ) {
@@ -466,7 +825,7 @@ mod tests {
         ]
         .into_iter()
         .chain(
-            VYNUCENI
+            ForceReason::ALL
                 .iter()
                 .map(|&r| (BindingCancel::Forced(r), Pricina::Vynuceno(r))),
         ) {
@@ -518,7 +877,7 @@ mod tests {
         assert_eq!((r.rezim, p), (Rezim::Capturing, Pricina::Zkratka));
         let odmitnuti = Decision {
             ui: Some(UiEvent::ToggleRejected {
-                reason: keypad_core::ToggleReject::Binding,
+                reason: ToggleReject::Binding,
             }),
             ..Decision::NONE
         };
@@ -568,6 +927,33 @@ mod tests {
         krok(&mut e, &|e| e.capture(0));
         let (r, p) = krok(&mut e, &|e| e.disable(p1, DisabledReason::PadError));
         assert_eq!((r.rezim, p), (Rezim::Disabled, Pricina::OvladacChyba));
+    }
+
+    /// Přiřazování z enginu: cíl i oznámení přijdou oknu přes atomiky,
+    /// uložení nese příčinu „přiřazování“.
+    #[test]
+    fn prirazovani_z_enginu_pres_atomiky() {
+        let (v, _sloty, _budik) = vystup();
+        let mut e = Engine::new(Mapping::default());
+        let cil = PadAction::first(Action::Button(PadButton::Y));
+        let d = e.start_binding(cil, BindKind::Replace, 0);
+        v.rozhodnuti(None, &d, e.mode());
+        assert_eq!(v.info().cil, Some(CilInfo { pad: 0, vstup: "y" }));
+        let d = e.on_key(KeyId::F, true, 1);
+        v.rozhodnuti(None, &d, e.mode());
+        let (r, p) = v.info_s_pricinou();
+        assert_eq!(
+            (r.rezim, r.cil, p),
+            (Rezim::Disabled, None, Pricina::Prirazovani)
+        );
+        assert_eq!(
+            UiEvent::unpack(v.oznameni() & OZNAMENI_OBSAH),
+            Some(UiEvent::BindingSaved {
+                key: KeyId::F,
+                target: cil,
+                moved_from: Some(PadAction::first(Action::Button(PadButton::X))),
+            })
+        );
     }
 
     /// Příčina se v callbacku počítá bez alokace i s oznámením.

@@ -1,0 +1,28 @@
+[
+	{
+		"seq": 101,
+		"mezera": false,
+		"typ": "ulozeno",
+		"pad": 0,
+		"vstup": "x",
+		"klavesa": { "scan": 33, "e0": false },
+		"odkud": null
+	},
+	{
+		"seq": 102,
+		"mezera": false,
+		"typ": "ulozeno",
+		"pad": 1,
+		"vstup": "ls_up",
+		"klavesa": { "scan": 17, "e0": false },
+		"odkud": { "pad": 0, "vstup": "ls_up" }
+	},
+	{ "seq": 103, "mezera": true, "typ": "odmitnuto", "duvod": "win", "klavesa": { "scan": 91, "e0": true } },
+	{ "seq": 104, "mezera": false, "typ": "odmitnuto", "duvod": "zkratka", "klavesa": { "scan": 70, "e0": false } },
+	{ "seq": 105, "mezera": false, "typ": "odmitnuto", "duvod": "nejde", "klavesa": { "scan": 56, "e0": true } },
+	{ "seq": 106, "mezera": false, "typ": "zruseno", "duvod": "esc" },
+	{ "seq": 107, "mezera": false, "typ": "zruseno", "duvod": "cas" },
+	{ "seq": 108, "mezera": false, "typ": "zruseno", "duvod": "okno" },
+	{ "seq": 109, "mezera": false, "typ": "zruseno", "duvod": "vynuceno" },
+	{ "seq": 65535, "mezera": false, "typ": "zapni_ovladac" }
+]

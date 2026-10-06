@@ -25,13 +25,18 @@
 //! nebo ne. Režim je ale jeden pro všechny — zkratka pozastaví
 //! zachytávání celé klávesnice najednou, jinak by se do chatu psát
 //! nedalo.
+//!
+//! Editor (Fáze 6) mění mapování i za hry ([`Engine::replace_mapping`])
+//! bez pozastavení — jde to jen díky pravidlu vlastnictví: výměna mění
+//! mapování, ne vlastníky, takže držená klávesa dohraje se starou akcí
+//! a nový stisk se řídí novým mapováním.
 
 use serde::{Deserialize, Serialize};
 
-use crate::action::{PadAction, PadId, MAX_PADS};
+use crate::action::{Action, PadAction, PadId, MAX_PADS};
 use crate::key::{KeyId, KEY_TABLE_SIZE};
-use crate::mapping::{Mapping, MappingError};
-use crate::pad_state::{compute_pad_state, PadState, PadUpdates};
+use crate::mapping::{Mapping, MappingError, Rebind};
+use crate::pad_state::{compute_pad_state, live_from, LiveInputs, PadState, PadUpdates};
 
 /// Po jaké době se přiřazování klávesy samo zruší.
 pub const BINDING_TIMEOUT_MS: u64 = 10_000;
@@ -161,6 +166,53 @@ pub enum ForceReason {
     Shutdown,
 }
 
+impl ForceReason {
+    /// Všechny důvody v pořadí [`ForceReason::index`].
+    pub const ALL: [ForceReason; 9] = [
+        ForceReason::Watchdog,
+        ForceReason::PadError,
+        ForceReason::SessionLock,
+        ForceReason::DesktopSwitch,
+        ForceReason::Suspend,
+        ForceReason::HookPanic,
+        ForceReason::HookReinstalled,
+        ForceReason::MappingChanged,
+        ForceReason::Shutdown,
+    ];
+
+    /// Pozice v [`ForceReason::ALL`] — malé číslo do atomiků hook vlákna
+    /// ([`UiEvent::pack`]). Výčtem, ne `as usize`, ať přeskládání variant
+    /// potichu nepřečísluje; shodu s `ALL` hlídá test.
+    pub const fn index(self) -> usize {
+        match self {
+            ForceReason::Watchdog => 0,
+            ForceReason::PadError => 1,
+            ForceReason::SessionLock => 2,
+            ForceReason::DesktopSwitch => 3,
+            ForceReason::Suspend => 4,
+            ForceReason::HookPanic => 5,
+            ForceReason::HookReinstalled => 6,
+            ForceReason::MappingChanged => 7,
+            ForceReason::Shutdown => 8,
+        }
+    }
+}
+
+/// Co udělá klávesa stisknutá při přiřazování s ostatními klávesami
+/// vstupu.
+///
+/// Pole enginu, ne součást [`Mode::Binding`]: `Mode` se serializuje do
+/// okna a celý zbytek aplikace ho rozebírá — druh přiřazování zajímá jen
+/// uložení klávesy ([`Engine::binding_kind`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BindKind {
+    /// Klávesa vstup převezme a jeho ostatní klávesy se odeberou (klik
+    /// na čepičku — jako v nastavení her, OQ 40).
+    Replace,
+    /// Klávesa se přidá k ostatním klávesám vstupu (`+` u čepičky).
+    Add,
+}
+
 /// Proč se přiřazování klávesy zrušilo.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BindingCancel {
@@ -233,6 +285,164 @@ pub enum UiEvent {
     },
 }
 
+// Rozložení `UiEvent::pack` (bity od nejnižšího). Šířky: druh 3, scan 16,
+// E0 1, cíl 7 (ovladač·32 + akce, nejvýš 3·32 + 23 = 119), příznak 1,
+// odkud 7, důvod 5 — celkem 40 bitů, do schránky `seq16 | obsah48` hook
+// vlákna se vejde i s rezervou.
+const PACK_KIND: (u32, u32) = (0, 3);
+const PACK_SCAN: (u32, u32) = (3, 16);
+const PACK_E0: (u32, u32) = (19, 1);
+const PACK_TARGET: (u32, u32) = (20, 7);
+const PACK_MOVED: (u32, u32) = (27, 1);
+const PACK_MOVED_FROM: (u32, u32) = (28, 7);
+const PACK_REASON: (u32, u32) = (35, 5);
+
+const KIND_SAVED: u64 = 1;
+const KIND_REJECTED: u64 = 2;
+const KIND_CANCELLED: u64 = 3;
+const KIND_TOGGLE_REJECTED: u64 = 4;
+
+/// Hodnota do pole rozložení (šířka hodnoty je zaručená volajícím).
+const fn put(field: (u32, u32), v: u64) -> u64 {
+    debug_assert!(v < 1 << field.1);
+    v << field.0
+}
+
+const fn get(bits: u64, field: (u32, u32)) -> u64 {
+    (bits >> field.0) & ((1 << field.1) - 1)
+}
+
+const fn pack_key(k: KeyId) -> u64 {
+    put(PACK_SCAN, k.scan as u64) | put(PACK_E0, k.extended as u64)
+}
+
+const fn pack_target(t: PadAction) -> u64 {
+    (t.pad.index() * 32 + t.action.index()) as u64
+}
+
+fn unpack_target(v: u64) -> Option<PadAction> {
+    let v = usize::try_from(v).ok()?;
+    Some(PadAction::new(
+        PadId::new(v / 32)?,
+        Action::from_index(v % 32)?,
+    ))
+}
+
+impl UiEvent {
+    /// Oznámení jako nejvýš 48 bitů — hook callback ho předá oknu jedním
+    /// atomikem (žádný kanál, žádný zámek, princip 3).
+    ///
+    /// `ModeChanged` → `None`: režim (i jeho příčinu) nese zvláštní atomik
+    /// stavu, oznámení by ho jen zdvojilo. Klávesa jde jako syrový scan
+    /// kód (16 bitů) + E0, ne jako index tabulky enginu — i nemapovatelná
+    /// klávesa („tuhle nejde použít") musí přijít celá.
+    ///
+    /// Rozložení: 0–2 druh (1 uloženo, 2 odmítnuto, 3 zrušeno, 4 přepnutí
+    /// odmítnuto) | 3–18 scan | 19 E0 | 20–26 cíl (ovladač·32 +
+    /// [`Action::index`]) | 27 je odkud? | 28–34 odkud | 35–39 důvod.
+    pub fn pack(&self) -> Option<u64> {
+        Some(match *self {
+            UiEvent::ModeChanged { .. } => return None,
+            UiEvent::BindingSaved {
+                key,
+                target,
+                moved_from,
+            } => {
+                put(PACK_KIND, KIND_SAVED)
+                    | pack_key(key)
+                    | put(PACK_TARGET, pack_target(target))
+                    | match moved_from {
+                        Some(m) => put(PACK_MOVED, 1) | put(PACK_MOVED_FROM, pack_target(m)),
+                        None => 0,
+                    }
+            }
+            UiEvent::BindingRejected { key, reason } => {
+                let r = match reason {
+                    BindingReject::ToggleKey => 0,
+                    BindingReject::Unmappable => 1,
+                    BindingReject::Reserved => 2,
+                };
+                put(PACK_KIND, KIND_REJECTED) | pack_key(key) | put(PACK_REASON, r)
+            }
+            UiEvent::BindingCancelled { reason } => {
+                let r = match reason {
+                    BindingCancel::Escape => 0,
+                    BindingCancel::Timeout => 1,
+                    BindingCancel::Gui => 2,
+                    BindingCancel::PadStatus => 3,
+                    BindingCancel::Forced(f) => 4 + f.index() as u64,
+                };
+                put(PACK_KIND, KIND_CANCELLED) | put(PACK_REASON, r)
+            }
+            UiEvent::ToggleRejected { reason } => {
+                let r = match reason {
+                    ToggleReject::Disabled(DisabledReason::ViGEmMissing) => 0,
+                    ToggleReject::Disabled(DisabledReason::PadNotConnected) => 1,
+                    ToggleReject::Disabled(DisabledReason::PadError) => 2,
+                    ToggleReject::Binding => 3,
+                };
+                put(PACK_KIND, KIND_TOGGLE_REJECTED) | put(PACK_REASON, r)
+            }
+        })
+    }
+
+    /// Opak [`UiEvent::pack`]. Cokoli, co `pack` nevydá (neznámý druh nebo
+    /// důvod, ovladač či akce mimo rozsah, bity v nepoužitých polích),
+    /// je `None` — okno pak raději načte stav znovu, než aby ukázalo
+    /// smyšlené oznámení.
+    pub fn unpack(bits: u64) -> Option<UiEvent> {
+        let key = KeyId {
+            scan: get(bits, PACK_SCAN) as u16,
+            extended: get(bits, PACK_E0) == 1,
+        };
+        let reason = get(bits, PACK_REASON);
+        let e = match get(bits, PACK_KIND) {
+            KIND_SAVED => UiEvent::BindingSaved {
+                key,
+                target: unpack_target(get(bits, PACK_TARGET))?,
+                moved_from: match get(bits, PACK_MOVED) {
+                    1 => Some(unpack_target(get(bits, PACK_MOVED_FROM))?),
+                    _ => None,
+                },
+            },
+            KIND_REJECTED => UiEvent::BindingRejected {
+                key,
+                reason: match reason {
+                    0 => BindingReject::ToggleKey,
+                    1 => BindingReject::Unmappable,
+                    2 => BindingReject::Reserved,
+                    _ => return None,
+                },
+            },
+            KIND_CANCELLED => UiEvent::BindingCancelled {
+                reason: match reason {
+                    0 => BindingCancel::Escape,
+                    1 => BindingCancel::Timeout,
+                    2 => BindingCancel::Gui,
+                    3 => BindingCancel::PadStatus,
+                    r => BindingCancel::Forced(
+                        *ForceReason::ALL.get(usize::try_from(r).ok()?.checked_sub(4)?)?,
+                    ),
+                },
+            },
+            KIND_TOGGLE_REJECTED => UiEvent::ToggleRejected {
+                reason: match reason {
+                    0 => ToggleReject::Disabled(DisabledReason::ViGEmMissing),
+                    1 => ToggleReject::Disabled(DisabledReason::PadNotConnected),
+                    2 => ToggleReject::Disabled(DisabledReason::PadError),
+                    3 => ToggleReject::Binding,
+                    _ => return None,
+                },
+            },
+            _ => return None,
+        };
+        // Jen kanonická podoba: bity, které druh nepoužívá (klávesa u
+        // zrušení, cíl u odmítnutí…), musí být nulové. Tím je `unpack`
+        // přesný opak `pack` a dvě různé hodnoty nikdy nedají totéž.
+        (e.pack() == Some(bits)).then_some(e)
+    }
+}
+
 /// Výsledek zpracování události.
 ///
 /// - `suppress`: hook má událost spolknout (nepředat OS). U příkazů,
@@ -297,7 +507,33 @@ pub struct Engine {
     /// Po konci přiřazování zase zachytávat. Mimo přiřazování vždy
     /// `false`.
     resume_capture: bool,
+    /// Druh běžícího přiřazování; mimo přiřazování bez významu.
+    bind_kind: BindKind,
+    /// Modifikátor stisknutý při přiřazování, který se přiřadí při svém
+    /// key-upu — jen když mezitím nepřišel jiný stisk (pak to byla
+    /// zkratka Windows, třeba Alt+Tab). Mimo přiřazování vždy `None`.
+    bind_tap: Option<KeyId>,
+    /// Poslední stisk při přiřazování byl falešný levý Ctrl z AltGr
+    /// ([`KeyId::ALTGR_FAKE_CTRL`]). Pravý Alt hned po něm je AltGr na
+    /// českém rozložení, ne ťuknutí — okno by jinak po „Tuhle klávesu
+    /// nejde použít" vzápětí uložilo „P Alt" a hra by s ním dostávala
+    /// i falešný Ctrl, který jde vždy Windows. Mimo přiřazování vždy
+    /// `false`.
+    bind_altgr: bool,
+    /// Revize mapování ([`Engine::mapping_rev`]).
+    mapping_rev: u64,
 }
+
+/// Modifikátory ([`KeyId::is_modifier`]) — pevný výčet, ať se při stisku
+/// neprochází celá tabulka držených kláves.
+const MODIFIERS: [KeyId; 6] = [
+    KeyId::LEFT_CTRL,
+    KeyId::RIGHT_CTRL,
+    KeyId::LEFT_SHIFT,
+    KeyId::RIGHT_SHIFT,
+    KeyId::LEFT_ALT,
+    KeyId::RIGHT_ALT,
+];
 
 impl std::fmt::Debug for Engine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -315,6 +551,10 @@ impl std::fmt::Debug for Engine {
             .field("last_pads", &self.last_pads)
             .field("disabled_reason", &self.disabled_reason)
             .field("resume_capture", &self.resume_capture)
+            .field("bind_kind", &self.bind_kind)
+            .field("bind_tap", &self.bind_tap)
+            .field("bind_altgr", &self.bind_altgr)
+            .field("mapping_rev", &self.mapping_rev)
             .field("mapping", &self.mapping)
             .finish()
     }
@@ -341,6 +581,10 @@ impl Engine {
             last_pads: [PadState::NEUTRAL; MAX_PADS],
             disabled_reason: DisabledReason::PadNotConnected,
             resume_capture: false,
+            bind_kind: BindKind::Replace,
+            bind_tap: None,
+            bind_altgr: false,
+            mapping_rev: 0,
         }
     }
 
@@ -350,6 +594,47 @@ impl Engine {
 
     pub fn mapping(&self) -> &Mapping {
         &self.mapping
+    }
+
+    /// Revize mapování: roste při každé SKUTEČNÉ změně (uložená vazba,
+    /// která něco změnila, [`Engine::replace_mapping`] i
+    /// [`Engine::set_mapping`] s jiným obsahem), jinak stojí.
+    ///
+    /// Okno podle ní pozná, že má načíst klávesy znovu, a „Zpět" podle
+    /// ní, že mapování mezitím nezměnil nikdo jiný. Hook ji publikuje
+    /// atomikem — stav, ne událost, takže se nedá ztratit.
+    pub fn mapping_rev(&self) -> u64 {
+        self.mapping_rev
+    }
+
+    /// Druh běžícího přiřazování; mimo přiřazování `None`.
+    pub fn binding_kind(&self) -> Option<BindKind> {
+        matches!(self.mode, Mode::Binding { .. }).then_some(self.bind_kind)
+    }
+
+    /// Živý stav vstupů všech ovladačů pro okno: které vstupy jsou
+    /// fyzicky držené a kam po SOCD míří páčky.
+    ///
+    /// - `Pad(t)` → `t` (cíl určený při stisku, ten dostává hra),
+    /// - `Swallow` → cíl klávesy v aktuálním mapování (pauza, klávesa
+    ///   právě přiřazená: svítí na novém místě),
+    /// - `Os` → cíl v aktuálním mapování, jen s `include_os`. Klávesy
+    ///   patřící Windows ukazuje okno jen v popředí (soukromí — psaní do
+    ///   jiného programu okno vidět nemá).
+    ///
+    /// Nenamapovaná klávesa nerozsvítí nic. Nealokuje — počítá se
+    /// v hook callbacku.
+    pub fn live_inputs(&self, include_os: bool) -> [LiveInputs; MAX_PADS] {
+        live_from(self.held.iter().enumerate().filter_map(|(i, h)| {
+            let h = (*h)?;
+            let t = match h.owner {
+                Owner::Pad(t) => t,
+                Owner::Swallow => self.mapping.target(KeyId::from_index(i))?,
+                Owner::Os if include_os => self.mapping.target(KeyId::from_index(i))?,
+                Owner::Os => return None,
+            };
+            Some((t, h.seq))
+        }))
     }
 
     /// Je ovladač připojený a smí dostávat klávesy?
@@ -372,6 +657,28 @@ impl Engine {
         key.index()
             .and_then(|i| self.held.get(i).copied())
             .flatten()
+    }
+
+    /// Rozhodne engine o NOVÉM stisku `key` jinak, než že ho jen pustí do
+    /// OS? Tedy: zkratka přepnutí, přiřazování, nebo klávesa připraveného
+    /// ovladače při zachytávání.
+    ///
+    /// Jen u takového stisku má hook smysl ptát se Windows, jestli klávesu
+    /// (nebo Win) už drží OS ([`Engine::adopt_os_key`]). U ostatních by
+    /// převzetí dopadlo stejně jako nový stisk — klávesa OS bez efektu —
+    /// a dotaz je volání jádra Windows, které měření ukázalo jako ocas
+    /// zpracování klávesy (p99). Rovnost obou cest hlídá property test.
+    pub fn claims_new_press(&self, key: KeyId) -> bool {
+        key.index().is_some()
+            && (key == self.mapping.toggle_key()
+                || match self.mode {
+                    Mode::Binding { .. } => true,
+                    Mode::Gamepad => self
+                        .mapping
+                        .target(key)
+                        .is_some_and(|t| self.is_ready(t.pad)),
+                    Mode::Keyboard | Mode::Disabled { .. } => false,
+                })
     }
 
     // ── Klávesnice ───────────────────────────────────────────────────
@@ -425,6 +732,12 @@ impl Engine {
         let Some(i) = key.index() else {
             // Nemapovatelná klávesa (i Win) jde vždy do OS a nesleduje
             // se. Při přiřazování se okno aspoň dozví, proč se nic nestalo.
+            // Je to ale jiný stisk: držený modifikátor už nebyl ťuknutí.
+            // Falešný Ctrl z AltGr si přiřazování zapamatuje kvůli pravému
+            // Altu, který Windows posílají hned po něm (`bind_altgr`).
+            self.bind_tap = None;
+            self.bind_altgr =
+                matches!(self.mode, Mode::Binding { .. }) && key == KeyId::ALTGR_FAKE_CTRL;
             return Decision {
                 ui: matches!(self.mode, Mode::Binding { .. }).then_some(UiEvent::BindingRejected {
                     key,
@@ -455,6 +768,19 @@ impl Engine {
         // Nový stisk: vlastník podle tabulky „Pravidla engine".
         self.seq += 1;
         let owner = self.owner_for_new_press(key);
+        if let Mode::Binding { .. } = self.mode {
+            // Ťuknutí modifikátorem se přiřadí až při key-upu; každý jiný
+            // stisk mezitím (Tab z Alt+Tab, i druhý modifikátor) z něj
+            // dělá zkratku Windows a nepřiřadí se nic. Počítá se před
+            // zápisem nového stisku — ten sám zkratku netvoří. AltGr (pravý
+            // Alt hned po falešném Ctrl) okno už odmítlo jako nepoužitelnou
+            // klávesu — ťuknutím se nepřiřadí; pravý Alt bez falešného Ctrl
+            // (anglické rozložení) ano.
+            let altgr = std::mem::take(&mut self.bind_altgr) && key == KeyId::RIGHT_ALT;
+            self.bind_tap =
+                (owner == Owner::Os && key.is_modifier() && !self.os_modifier_held() && !altgr)
+                    .then_some(key);
+        }
         self.remember(
             i,
             HeldKey {
@@ -467,7 +793,12 @@ impl Engine {
         let effects = if key == self.mapping.toggle_key() {
             self.toggle_with(ModeCause::Hotkey)
         } else if let Mode::Binding { target, .. } = self.mode {
-            self.binding_key(key, target)
+            match owner {
+                // Modifikátor nebo stisk s drženým modifikátorem patří
+                // Windows a přiřazování čeká dál.
+                Owner::Os => Decision::NONE,
+                Owner::Pad(_) | Owner::Swallow => self.binding_key(key, target),
+            }
         } else {
             // Klávesa ovladače nebo klávesa, která zahodila zastaralý
             // záznam ovladače — obojí může změnit stav.
@@ -488,6 +819,13 @@ impl Engine {
             return Owner::Swallow;
         }
         match self.mode {
+            // Modifikátor jde při přiřazování do Windows (přiřadí se až
+            // ťuknutím, `bind_tap`) a s drženým modifikátorem i každá další
+            // klávesa — Alt+Tab, Alt+F4 a Ctrl+Shift+Esc tak z okna vedou
+            // tam, kam mají, a přiřazování zruší ztráta popředí (OQ 55).
+            // Modifikátor spolknutý (klávesa ovladače ze hry) zkratku
+            // netvoří: Windows ho neviděly.
+            Mode::Binding { .. } if key.is_modifier() || self.os_modifier_held() => Owner::Os,
             Mode::Binding { .. } => Owner::Swallow,
             // Klávesa nepřipraveného ovladače jde do OS: ovladač, který
             // neexistuje, by ji jen spolkl a uživateli by zmizela.
@@ -499,6 +837,14 @@ impl Engine {
         }
     }
 
+    /// Drží Windows některý modifikátor (vlastník `Os`)? Pak je nový stisk
+    /// zkratka Windows, ne klávesa k přiřazení.
+    fn os_modifier_held(&self) -> bool {
+        MODIFIERS
+            .iter()
+            .any(|&k| self.held(k).is_some_and(|h| h.owner == Owner::Os))
+    }
+
     fn key_up(&mut self, key: KeyId) -> Decision {
         let Some(h) = key.index().and_then(|i| self.forget(i)) else {
             // Key-up bez záznamu: klávesa držená už před spuštěním,
@@ -506,8 +852,22 @@ impl Engine {
             // key-down viděl, takže key-up patří jemu.
             return Decision::NONE;
         };
+        let suppress = h.owner.suppresses();
+        // Ťuknutí modifikátorem při přiřazování: teď se přiřadí. Key-up
+        // jde Windows jako jeho key-down (princip 2) — spolknout ho by
+        // nechalo modifikátor v OS viset. `bind_tap` je mimo přiřazování
+        // vždy prázdné (maže ho každá změna režimu).
+        if self.bind_tap == Some(key) {
+            self.bind_tap = None;
+            if let Mode::Binding { target, .. } = self.mode {
+                return Decision {
+                    suppress,
+                    ..self.binding_key(key, target)
+                };
+            }
+        }
         Decision {
-            suppress: h.owner.suppresses(),
+            suppress,
             pads: match h.owner {
                 Owner::Pad(_) => self.pads_if_changed(),
                 Owner::Os | Owner::Swallow => PadUpdates::NONE,
@@ -521,11 +881,29 @@ impl Engine {
         if key == KeyId::ESC {
             return self.leave_binding(BindingCancel::Escape);
         }
-        match self.mapping.bind(key, target) {
-            Ok(moved_from) => {
+        let before = self.mapping.target(key);
+        let saved = match self.bind_kind {
+            BindKind::Add => self.mapping.bind(key, target).map(|moved_from| Rebind {
+                moved_from,
+                removed: 0,
+            }),
+            BindKind::Replace => self.mapping.bind_replacing(key, target),
+        };
+        match saved {
+            Ok(Rebind {
+                moved_from,
+                removed,
+            }) => {
+                // Revize jen se skutečnou změnou: stejná klávesa na
+                // tentýž cíl (jediná, nebo přidaná podruhé) nic nemění
+                // a okno nemá co načítat znovu.
+                if before != Some(target) || removed > 0 {
+                    self.mapping_rev += 1;
+                }
                 // Klávesa má vlastníka Swallow (stisknutá při
                 // přiřazování) — i když se teď vrací zachytávání, její
-                // key-up se spolkne a ovladač ji neuvidí.
+                // key-up se spolkne a ovladač ji neuvidí. Ťuknutý
+                // modifikátor se ukládá až při key-upu, nic už nedrží.
                 let to = self.mode_after_binding(true);
                 Decision {
                     suppress: false,
@@ -660,12 +1038,17 @@ impl Engine {
     /// Začne přiřazování klávesy akci ovladače — z kteréhokoli režimu
     /// (Fáze 6: klávesy jde upravovat i za hry, ovladač nemusí být
     /// připojený). Zachytávání se na dobu přiřazování pozastaví a po
-    /// konci vrátí; běžící přiřazování začne znovu s novým cílem.
-    pub fn start_binding(&mut self, target: PadAction, now_ms: u64) -> Decision {
+    /// konci vrátí; běžící přiřazování začne znovu s novým cílem
+    /// a druhem.
+    ///
+    /// `kind` určuje, co se stane s ostatními klávesami vstupu
+    /// ([`BindKind`]).
+    pub fn start_binding(&mut self, target: PadAction, kind: BindKind, now_ms: u64) -> Decision {
         // Propadlé přiřazování (časovač nestihl tiknout) se nejdřív
         // ukončí — o návratu zachytávání pak rozhoduje režim, do kterého
         // se vrátilo, ne zapomenutý příznak.
         let expired = self.expire_binding(now_ms);
+        self.bind_kind = kind;
         self.resume_capture = match self.mode {
             Mode::Gamepad => true,
             Mode::Binding { .. } => self.resume_capture,
@@ -766,6 +1149,9 @@ impl Engine {
     /// Nahradí mapování. V režimu Gamepad se nejdřív vynutí Klávesnice
     /// (ovladač nesmí zůstat s vazbami, které už neplatí); běžící
     /// přiřazování se zruší.
+    ///
+    /// Pro úpravy z editoru je [`Engine::replace_mapping`] — tohle je
+    /// fail-safe výměna celého rozvržení.
     pub fn set_mapping(&mut self, mapping: Mapping) -> Decision {
         let d = match self.mode {
             Mode::Gamepad | Mode::Binding { .. } => {
@@ -773,8 +1159,40 @@ impl Engine {
             }
             Mode::Keyboard | Mode::Disabled { .. } => Decision::NONE,
         };
-        self.mapping = mapping;
+        self.store_mapping(mapping);
         d
+    }
+
+    /// Živá výměna mapování z editoru (vyprázdnit vstup, odebrat
+    /// ovladač, výchozí klávesy, „Zpět") — i za hry, bez pozastavení
+    /// (OQ 43).
+    ///
+    /// Propadlé přiřazování nejdřív ukončí, běžící zruší s
+    /// [`BindingCancel::Gui`] a vrátí se, kam patří (i na Gamepad) —
+    /// cíl přiřazování mohl s novým mapováním zmizet (odebraný ovladač).
+    ///
+    /// Jinak NEMĚNÍ režim ani vlastníky držených kláves (princip 2):
+    /// klávesa držená jako `Pad(t)` dohraje s `t` a její key-up se
+    /// spolkne, nový stisk jde podle nového mapování. Stav ovladačů se
+    /// počítá z vlastníků, ne z mapování, takže výměna sama nic
+    /// neposílá. [`Engine::set_mapping`] (s vynucením Klávesnice) zůstává
+    /// pro fail-safe.
+    pub fn replace_mapping(&mut self, mapping: Mapping, now_ms: u64) -> Decision {
+        let expired = self.expire_binding(now_ms);
+        let d = match self.mode {
+            Mode::Binding { .. } => self.leave_binding(BindingCancel::Gui),
+            Mode::Keyboard | Mode::Gamepad | Mode::Disabled { .. } => Decision::NONE,
+        };
+        self.store_mapping(mapping);
+        d.or(expired)
+    }
+
+    /// Uloží mapování; revize roste jen s jiným obsahem.
+    fn store_mapping(&mut self, mapping: Mapping) {
+        if mapping != self.mapping {
+            self.mapping_rev += 1;
+        }
+        self.mapping = mapping;
     }
 
     // ── Vnitřní přechody ─────────────────────────────────────────────
@@ -835,6 +1253,10 @@ impl Engine {
                 }
             }
         }
+        // Ťuknutí patří jen tomu přiřazování, při kterém začalo — i nové
+        // přiřazování (jiný cíl) začíná bez něj. Stejně AltGr.
+        self.bind_tap = None;
+        self.bind_altgr = false;
         self.mode = new;
         self.emit_all()
     }
@@ -1114,7 +1536,7 @@ mod tests {
     fn binding_esc_rusi() {
         let mut e = engine();
         let before = e.mapping().clone();
-        let _ = e.start_binding(t0(Action::Button(PadButton::A)), T0);
+        let _ = e.start_binding(t0(Action::Button(PadButton::A)), BindKind::Replace, T0);
         let d = down(&mut e, KeyId::ESC);
         assert!(d.suppress, "Esc během přiřazování nejde do OS");
         assert_eq!(
@@ -1132,7 +1554,7 @@ mod tests {
     #[test]
     fn binding_timeout_rusi() {
         let mut e = engine();
-        let _ = e.start_binding(t0(Action::LeftTrigger), T0);
+        let _ = e.start_binding(t0(Action::LeftTrigger), BindKind::Replace, T0);
         assert_eq!(e.tick(T0 + BINDING_TIMEOUT_MS - 1), Decision::NONE);
         assert!(matches!(e.mode(), Mode::Binding { .. }));
         let d = e.tick(T0 + BINDING_TIMEOUT_MS);
@@ -1151,7 +1573,7 @@ mod tests {
         // klávesu, která už patří OS.
         let mut e = engine();
         let before = e.mapping().clone();
-        let _ = e.start_binding(t0(Action::LeftTrigger), T0);
+        let _ = e.start_binding(t0(Action::LeftTrigger), BindKind::Replace, T0);
         let d = e.on_key(KeyId::X, true, T0 + BINDING_TIMEOUT_MS + 5);
         assert!(!d.suppress, "klávesa po timeoutu jde do OS");
         assert_eq!(
@@ -1171,7 +1593,7 @@ mod tests {
     fn binding_zkratku_nelze_priradit() {
         let mut e = engine();
         let before = e.mapping().clone();
-        let _ = e.start_binding(t0(Action::Button(PadButton::Y)), T0);
+        let _ = e.start_binding(t0(Action::Button(PadButton::Y)), BindKind::Replace, T0);
         let d = down(&mut e, TOGGLE);
         assert!(d.suppress);
         assert_eq!(
@@ -1231,7 +1653,7 @@ mod tests {
     #[test]
     fn binding_ulozi_klavesu_a_spolkne_ji() {
         let mut e = engine();
-        let d = e.start_binding(t0(Action::RightTrigger), T0);
+        let d = e.start_binding(t0(Action::RightTrigger), BindKind::Replace, T0);
         assert!(matches!(
             d.ui,
             Some(UiEvent::ModeChanged {
@@ -1261,7 +1683,7 @@ mod tests {
     fn nemapovatelne_klavesy_jdou_do_os_i_pri_prirazovani() {
         let mut e = engine();
         let before = e.mapping().clone();
-        let _ = e.start_binding(t0(Action::LeftTrigger), T0);
+        let _ = e.start_binding(t0(Action::LeftTrigger), BindKind::Replace, T0);
         for k in [KeyId::ALTGR_FAKE_CTRL, KeyId::new(0), KeyId::new(0x80)] {
             let d = down(&mut e, k);
             assert!(!d.suppress, "{k} jde do OS");
@@ -1285,7 +1707,7 @@ mod tests {
         // Start — a okno se dozví, že patří Windows.
         let mut e = gamepad();
         let before = e.mapping().clone();
-        let _ = e.start_binding(t0(Action::LeftTrigger), T0);
+        let _ = e.start_binding(t0(Action::LeftTrigger), BindKind::Replace, T0);
         for k in [KeyId::LEFT_WIN, KeyId::RIGHT_WIN] {
             let d = down(&mut e, k);
             assert!(!d.suppress, "{k} jde do OS");
@@ -1324,6 +1746,276 @@ mod tests {
         assert_eq!(stick(e.pad_state(P0)), (0, AXIS_MAX));
     }
 
+    /// Alt+Tab z okna KeyPadu při přiřazování (kontrolní seznam
+    /// vlastníka, bod 10; OQ 55): Alt i Tab jdou do Windows a nic se
+    /// nepřiřadí — přiřazování pak zruší ztráta popředí (hook). Totéž
+    /// Alt+F4, z Klávesnice i ze hry.
+    #[test]
+    fn alt_tab_pri_prirazovani_patri_windows() {
+        let tab = KeyId::new(0x0F);
+        let f4 = KeyId::new(0x3E);
+        for mut e in [engine(), gamepad()] {
+            let pred = e.mapping().clone();
+            let rev = e.mapping_rev();
+            let _ = e.start_binding(t0(Action::Button(PadButton::A)), BindKind::Replace, T0);
+            for k in [tab, f4] {
+                assert_eq!(down(&mut e, KeyId::LEFT_ALT), Decision::NONE, "Alt Windows");
+                assert_eq!(down(&mut e, KeyId::LEFT_ALT), Decision::NONE, "autorepeat");
+                assert_eq!(down(&mut e, k), Decision::NONE, "{k} Windows");
+                assert_eq!(up(&mut e, k), Decision::NONE);
+                assert_eq!(
+                    up(&mut e, KeyId::LEFT_ALT),
+                    Decision::NONE,
+                    "Alt+{k} se nepřiřadí"
+                );
+                assert!(matches!(e.mode(), Mode::Binding { .. }), "čeká se dál");
+            }
+            assert_eq!(e.mapping(), &pred);
+            assert_eq!(e.mapping_rev(), rev);
+            assert_eq!(e.held_len(), 0);
+        }
+    }
+
+    /// Samotné ťuknutí modifikátorem se přiřadí při uvolnění. Stisk
+    /// i key-up jdou Windows (princip 2). Ze hry se pak hraje dál.
+    #[test]
+    fn tuknuti_modifikatorem_se_priradi_pri_uvolneni() {
+        let cil = t0(Action::Button(PadButton::Lb));
+        for k in MODIFIERS {
+            let mut e = gamepad();
+            let odkud = e.mapping().target(k).filter(|&t| t != cil);
+            let _ = e.start_binding(cil, BindKind::Replace, T0);
+            assert_eq!(down(&mut e, k), Decision::NONE, "{k}: stisk Windows");
+            assert_eq!(down(&mut e, k), Decision::NONE, "{k}: autorepeat nic");
+            assert!(matches!(e.mode(), Mode::Binding { .. }), "{k}");
+            let d = up(&mut e, k);
+            assert!(!d.suppress, "{k}: key-up Windows jako key-down");
+            assert_eq!(
+                d.ui,
+                Some(UiEvent::BindingSaved {
+                    key: k,
+                    target: cil,
+                    moved_from: odkud
+                }),
+                "{k}"
+            );
+            assert_eq!(e.mode(), Mode::Gamepad, "{k}: zpět do hry");
+            assert_eq!(e.mapping().target(k), Some(cil));
+            assert_eq!(e.held_len(), 0);
+        }
+    }
+
+    /// Ctrl+Shift+Esc: Esc s drženým modifikátorem je zkratka Windows
+    /// (Správce úloh), ne zrušení přiřazování. Po puštění modifikátorů
+    /// se klávesa zase přiřazuje.
+    #[test]
+    fn ctrl_shift_esc_pri_prirazovani_patri_windows() {
+        let mut e = engine();
+        let _ = e.start_binding(t0(Action::Button(PadButton::A)), BindKind::Add, T0);
+        for k in [KeyId::LEFT_CTRL, KeyId::LEFT_SHIFT, KeyId::ESC] {
+            assert_eq!(down(&mut e, k), Decision::NONE, "{k} Windows");
+        }
+        assert!(matches!(e.mode(), Mode::Binding { .. }), "Esc nezrušil");
+        for k in [KeyId::ESC, KeyId::LEFT_CTRL, KeyId::LEFT_SHIFT] {
+            assert_eq!(up(&mut e, k), Decision::NONE, "{k}: nic se nepřiřadí");
+        }
+        let d = down(&mut e, KeyId::X);
+        assert!(d.suppress);
+        assert!(matches!(
+            d.ui,
+            Some(UiEvent::BindingSaved { key: KeyId::X, .. })
+        ));
+    }
+
+    /// Modifikátor, který Windows drží už z doby před kliknutím (Ctrl
+    /// v Klávesnici), dělá zkratku i při přiřazování — Ctrl+C není vazba
+    /// C. Modifikátor spolknutý ze hry (levý Shift = L3) Windows neviděly,
+    /// takže zkratku netvoří.
+    #[test]
+    fn zkratku_dela_jen_modifikator_drzeny_windows() {
+        let cil = t0(Action::Button(PadButton::A));
+        let mut e = engine();
+        assert!(!down(&mut e, KeyId::LEFT_CTRL).suppress);
+        let _ = e.start_binding(cil, BindKind::Replace, T0);
+        assert_eq!(down(&mut e, KeyId::C), Decision::NONE, "Ctrl+C Windows");
+        assert_eq!(up(&mut e, KeyId::C), Decision::NONE);
+        assert_eq!(
+            up(&mut e, KeyId::LEFT_CTRL),
+            Decision::NONE,
+            "Ctrl se neťukl při přiřazování"
+        );
+        assert!(matches!(e.mode(), Mode::Binding { .. }));
+
+        let mut e = gamepad();
+        assert!(down(&mut e, KeyId::LEFT_SHIFT).suppress, "L3");
+        let _ = e.start_binding(cil, BindKind::Replace, T0);
+        let d = down(&mut e, KeyId::C);
+        assert!(d.suppress);
+        assert!(matches!(
+            d.ui,
+            Some(UiEvent::BindingSaved { key: KeyId::C, .. })
+        ));
+        assert!(up(&mut e, KeyId::LEFT_SHIFT).suppress, "key-up L3 spolknut");
+    }
+
+    /// Ťuknutí ruší každý jiný stisk (zkratka, Win, AltGr, druhý Alt)
+    /// i konec přiřazování — key-up po novém začátku nic nepřiřadí.
+    #[test]
+    fn jiny_stisk_nebo_konec_zrusi_tuknuti() {
+        let cil = t0(Action::Button(PadButton::A));
+        for jiny in [
+            TOGGLE,
+            KeyId::LEFT_WIN,
+            KeyId::ALTGR_FAKE_CTRL,
+            KeyId::RIGHT_ALT,
+        ] {
+            let mut e = engine();
+            let _ = e.start_binding(cil, BindKind::Replace, T0);
+            let _ = down(&mut e, KeyId::LEFT_ALT);
+            let _ = down(&mut e, jiny);
+            let _ = up(&mut e, jiny);
+            assert_eq!(up(&mut e, KeyId::LEFT_ALT).ui, None, "Alt s {jiny}");
+            assert!(matches!(e.mode(), Mode::Binding { .. }), "{jiny}");
+        }
+        let mut e = engine();
+        let _ = e.start_binding(cil, BindKind::Replace, T0);
+        let _ = down(&mut e, KeyId::LEFT_ALT);
+        let _ = e.start_binding(t0(Action::Button(PadButton::B)), BindKind::Replace, T0);
+        assert_eq!(
+            up(&mut e, KeyId::LEFT_ALT),
+            Decision::NONE,
+            "nové přiřazování"
+        );
+        let _ = down(&mut e, KeyId::LEFT_ALT);
+        let _ = e.cancel_binding(T0);
+        assert_eq!(up(&mut e, KeyId::LEFT_ALT), Decision::NONE, "zrušené");
+        assert_eq!(e.mapping(), &Mapping::default());
+    }
+
+    /// AltGr na českém rozložení: falešný levý Ctrl (0x21D), pak pravý
+    /// Alt; puštění v tomtéž pořadí. Okno dostane jediné odmítnutí
+    /// („Tuhle klávesu nejde použít") a nic se nepřiřadí — ani pravý Alt
+    /// ťuknutím. Obojí jde Windows. Přiřazování čeká dál a další klávesa
+    /// se přiřadí. Pravý Alt bez falešného Ctrl (anglické rozložení) se
+    /// ťuknutím přiřadí dál (`tuknuti_modifikatorem_se_priradi_pri_uvolneni`).
+    #[test]
+    fn altgr_pri_prirazovani_se_neprirazuje() {
+        let cil = t0(Action::Button(PadButton::A));
+        for zacatek in [Mode::Keyboard, Mode::Gamepad] {
+            let mut e = if zacatek == Mode::Gamepad {
+                gamepad()
+            } else {
+                engine()
+            };
+            let rev = e.mapping_rev();
+            let _ = e.start_binding(cil, BindKind::Replace, T0);
+            // Držený AltGr opakuje obě události (autorepeat).
+            for opakovani in 0..2 {
+                let d = down(&mut e, KeyId::ALTGR_FAKE_CTRL);
+                assert_eq!(
+                    d,
+                    Decision {
+                        ui: Some(UiEvent::BindingRejected {
+                            key: KeyId::ALTGR_FAKE_CTRL,
+                            reason: BindingReject::Unmappable
+                        }),
+                        ..Decision::NONE
+                    },
+                    "{zacatek:?} {opakovani}: falešný Ctrl"
+                );
+                assert_eq!(
+                    down(&mut e, KeyId::RIGHT_ALT),
+                    Decision::NONE,
+                    "{zacatek:?} {opakovani}: pravý Alt Windows, nic"
+                );
+            }
+            assert_eq!(up(&mut e, KeyId::ALTGR_FAKE_CTRL), Decision::NONE);
+            assert_eq!(
+                up(&mut e, KeyId::RIGHT_ALT),
+                Decision::NONE,
+                "{zacatek:?}: puštění AltGr nic nepřiřadí a jde Windows"
+            );
+            assert!(matches!(e.mode(), Mode::Binding { .. }), "{zacatek:?}");
+            assert_eq!(e.mapping_rev(), rev, "{zacatek:?}");
+            assert_eq!(e.mapping().target(KeyId::RIGHT_ALT), None);
+            assert_eq!(e.held_len(), 0);
+
+            // Přiřazování běží dál: příští klávesa se přiřadí, AltGr
+            // z ní nic nedělá.
+            let d = down(&mut e, KeyId::X);
+            assert!(d.suppress);
+            assert!(matches!(
+                d.ui,
+                Some(UiEvent::BindingSaved { key: KeyId::X, .. })
+            ));
+            assert!(up(&mut e, KeyId::X).suppress);
+        }
+
+        // Falešný Ctrl následovaný jinou klávesou (tady Win): pravý Alt až
+        // potom je zase obyčejné ťuknutí.
+        let mut e = engine();
+        let _ = e.start_binding(cil, BindKind::Replace, T0);
+        let _ = down(&mut e, KeyId::ALTGR_FAKE_CTRL);
+        let _ = up(&mut e, KeyId::ALTGR_FAKE_CTRL);
+        let _ = down(&mut e, KeyId::LEFT_WIN);
+        let _ = up(&mut e, KeyId::LEFT_WIN);
+        let _ = down(&mut e, KeyId::RIGHT_ALT);
+        assert!(matches!(
+            up(&mut e, KeyId::RIGHT_ALT).ui,
+            Some(UiEvent::BindingSaved {
+                key: KeyId::RIGHT_ALT,
+                ..
+            })
+        ));
+
+        // Falešný Ctrl mimo přiřazování nic nepamatuje: přiřazování
+        // začaté až potom pravý Alt ťuknutím přiřadí.
+        let mut e = engine();
+        let _ = down(&mut e, KeyId::ALTGR_FAKE_CTRL);
+        let _ = up(&mut e, KeyId::ALTGR_FAKE_CTRL);
+        let _ = e.start_binding(cil, BindKind::Replace, T0);
+        let _ = down(&mut e, KeyId::RIGHT_ALT);
+        assert!(matches!(
+            up(&mut e, KeyId::RIGHT_ALT).ui,
+            Some(UiEvent::BindingSaved {
+                key: KeyId::RIGHT_ALT,
+                ..
+            })
+        ));
+    }
+
+    /// Kdy se hook u nového stisku ptá Windows na stav klávesnice: jen
+    /// u zkratky, při přiřazování a u klávesy připraveného ovladače při
+    /// zachytávání. Že ostatní stisky dopadnou s převzetím i bez něj
+    /// stejně, hlídá property test.
+    #[test]
+    fn o_novem_stisku_rozhoduje_jen_kde_ma_co() {
+        let tab = KeyId::new(0x0F);
+        let mut m = Mapping::default();
+        m.bind(KeyId::C, PadAction::new(P1, Action::Button(PadButton::A)))
+            .unwrap();
+        let mut e = Engine::new(m);
+        // Disabled a Klávesnice: jen zkratka.
+        for _ in 0..2 {
+            assert!(e.claims_new_press(TOGGLE));
+            assert!(!e.claims_new_press(KeyId::W));
+            let _ = e.enable(P0);
+        }
+        let _ = e.toggle(T0);
+        assert_eq!(e.mode(), Mode::Gamepad);
+        assert!(
+            e.claims_new_press(KeyId::W),
+            "klávesa připraveného ovladače"
+        );
+        assert!(!e.claims_new_press(KeyId::C), "nepřipravený ovladač");
+        assert!(!e.claims_new_press(tab), "nenamapovaná");
+        let _ = e.start_binding(t0(Action::Button(PadButton::A)), BindKind::Replace, T0);
+        assert!(e.claims_new_press(tab), "přiřazování: každá mapovatelná");
+        for k in [KeyId::LEFT_WIN, KeyId::new(0), KeyId::ALTGR_FAKE_CTRL] {
+            assert!(!e.claims_new_press(k), "{k} engine nesleduje");
+        }
+    }
+
     #[test]
     fn klavesy_bez_scan_kodu_si_nesdileji_zaznam() {
         // Dvě mediální klávesy (obě scan 0) se v enginu nesmí plést:
@@ -1331,7 +2023,7 @@ mod tests {
         let mut e = engine();
         let media = KeyId::new(0);
         assert!(!down(&mut e, media).suppress);
-        let _ = e.start_binding(t0(Action::LeftTrigger), T0);
+        let _ = e.start_binding(t0(Action::LeftTrigger), BindKind::Replace, T0);
         assert!(!down(&mut e, media).suppress);
         assert!(!up(&mut e, media).suppress);
         assert!(!down(&mut e, media).suppress);
@@ -1346,8 +2038,8 @@ mod tests {
         let late = T0 + BINDING_TIMEOUT_MS + 1;
 
         let mut e = engine();
-        let _ = e.start_binding(t0(Action::LeftTrigger), T0);
-        let d = e.start_binding(t0(Action::RightTrigger), late);
+        let _ = e.start_binding(t0(Action::LeftTrigger), BindKind::Replace, T0);
+        let d = e.start_binding(t0(Action::RightTrigger), BindKind::Replace, late);
         assert_eq!(
             e.mode(),
             Mode::Binding {
@@ -1358,12 +2050,12 @@ mod tests {
         assert!(matches!(d.ui, Some(UiEvent::ModeChanged { .. })));
 
         let mut e = engine();
-        let _ = e.start_binding(t0(Action::LeftTrigger), T0);
+        let _ = e.start_binding(t0(Action::LeftTrigger), BindKind::Replace, T0);
         let _ = e.toggle(late);
         assert_eq!(e.mode(), Mode::Gamepad);
 
         let mut e = engine();
-        let _ = e.start_binding(t0(Action::LeftTrigger), T0);
+        let _ = e.start_binding(t0(Action::LeftTrigger), BindKind::Replace, T0);
         assert_eq!(
             e.cancel_binding(late).ui,
             Some(UiEvent::BindingCancelled {
@@ -1373,7 +2065,7 @@ mod tests {
 
         // capture po propadlém přiřazování zapne zachytávání hned.
         let mut e = engine();
-        let _ = e.start_binding(t0(Action::LeftTrigger), T0);
+        let _ = e.start_binding(t0(Action::LeftTrigger), BindKind::Replace, T0);
         let d = e.capture(late);
         assert_eq!(e.mode(), Mode::Gamepad);
         assert_eq!(
@@ -1393,7 +2085,7 @@ mod tests {
         let mut e = engine();
         assert!(!down(&mut e, KeyId::W).suppress);
         let before = e.mapping().clone();
-        let _ = e.start_binding(t0(Action::LeftTrigger), T0);
+        let _ = e.start_binding(t0(Action::LeftTrigger), BindKind::Replace, T0);
         let r = down(&mut e, KeyId::W);
         assert!(!r.suppress);
         assert_eq!(r.ui, None);
@@ -1895,7 +2587,7 @@ mod tests {
     fn prirazovani_ze_hry_vrati_zachytavani() {
         let mut e = gamepad();
         let _ = down(&mut e, KeyId::W);
-        let d = e.start_binding(t0(Action::Button(PadButton::Y)), T0);
+        let d = e.start_binding(t0(Action::Button(PadButton::Y)), BindKind::Replace, T0);
         assert!(matches!(e.mode(), Mode::Binding { .. }));
         assert!(vse_neutralni(&d), "přiřazování pozastaví zachytávání");
         assert_eq!(e.held(KeyId::W).unwrap().owner, Owner::Swallow);
@@ -1921,18 +2613,18 @@ mod tests {
     fn kazdy_bezny_konec_prirazovani_ze_hry_vrati_zachytavani() {
         let akce = t0(Action::LeftTrigger);
         let mut e = gamepad();
-        let _ = e.start_binding(akce, T0);
+        let _ = e.start_binding(akce, BindKind::Replace, T0);
         let _ = down(&mut e, KeyId::ESC);
         assert_eq!(e.mode(), Mode::Gamepad, "Esc");
         assert!(up(&mut e, KeyId::ESC).suppress);
 
         let mut e = gamepad();
-        let _ = e.start_binding(akce, T0);
+        let _ = e.start_binding(akce, BindKind::Replace, T0);
         let _ = e.tick(T0 + BINDING_TIMEOUT_MS);
         assert_eq!(e.mode(), Mode::Gamepad, "timeout");
 
         let mut e = gamepad();
-        let _ = e.start_binding(akce, T0);
+        let _ = e.start_binding(akce, BindKind::Replace, T0);
         let d = e.cancel_binding(T0);
         assert_eq!(e.mode(), Mode::Gamepad, "zrušení z okna");
         assert_eq!(
@@ -1947,7 +2639,7 @@ mod tests {
     fn vynuceny_konec_prirazovani_nevraci_zachytavani() {
         let akce = t0(Action::LeftTrigger);
         let mut e = gamepad();
-        let _ = e.start_binding(akce, T0);
+        let _ = e.start_binding(akce, BindKind::Replace, T0);
         let d = e.force_keyboard(ForceReason::Watchdog);
         assert_eq!(e.mode(), Mode::Keyboard);
         assert_eq!(
@@ -1959,17 +2651,17 @@ mod tests {
         assert!(vse_neutralni(&d));
 
         let mut e = gamepad();
-        let _ = e.start_binding(akce, T0);
+        let _ = e.start_binding(akce, BindKind::Replace, T0);
         let _ = e.set_mapping(Mapping::default());
         assert_eq!(e.mode(), Mode::Keyboard, "změna mapování");
 
         let mut e = gamepad();
-        let _ = e.start_binding(akce, T0);
+        let _ = e.start_binding(akce, BindKind::Replace, T0);
         let _ = e.reset_held(ForceReason::SessionLock);
         assert_eq!(e.mode(), Mode::Keyboard, "zamčení relace");
         // Příznak návratu se zapomněl: další přiřazování z Klávesnice se
         // vrací na Klávesnici.
-        let _ = e.start_binding(akce, T0);
+        let _ = e.start_binding(akce, BindKind::Replace, T0);
         let _ = e.cancel_binding(T0);
         assert_eq!(e.mode(), Mode::Keyboard);
     }
@@ -1979,7 +2671,7 @@ mod tests {
         let mut e = Engine::new(Mapping::default());
         let _ = e.disable(P0, DisabledReason::ViGEmMissing);
         let cil = PadAction::new(P2, Action::RightTrigger);
-        let d = e.start_binding(cil, T0);
+        let d = e.start_binding(cil, BindKind::Replace, T0);
         assert!(matches!(e.mode(), Mode::Binding { .. }));
         assert!(matches!(d.ui, Some(UiEvent::ModeChanged { .. })));
         let d = down(&mut e, KeyId::W);
@@ -2006,7 +2698,7 @@ mod tests {
         // Ze hry: během přiřazování vypadne jediný ovladač → konec do
         // Disabled s jeho důvodem.
         let mut e = gamepad();
-        let _ = e.start_binding(t0(Action::LeftTrigger), T0);
+        let _ = e.start_binding(t0(Action::LeftTrigger), BindKind::Replace, T0);
         let d = e.disable(P0, DisabledReason::PadError);
         assert!(matches!(e.mode(), Mode::Binding { .. }), "běží dál");
         assert_eq!(d.ui, None);
@@ -2027,7 +2719,7 @@ mod tests {
 
         // Z Disabled: během přiřazování se ovladač připojí → Klávesnice.
         let mut e = Engine::new(Mapping::default());
-        let _ = e.start_binding(t0(Action::LeftTrigger), T0);
+        let _ = e.start_binding(t0(Action::LeftTrigger), BindKind::Replace, T0);
         assert_eq!(e.enable(P0), Decision::NONE);
         assert!(matches!(e.mode(), Mode::Binding { .. }));
         let _ = e.cancel_binding(T0);
@@ -2061,7 +2753,7 @@ mod tests {
         assert!(matches!(e.mode(), Mode::Disabled { .. }));
         // Přiřazování z Klávesnice: zapne se až po jeho konci.
         let mut e = engine();
-        let _ = e.start_binding(t0(Action::LeftTrigger), T0);
+        let _ = e.start_binding(t0(Action::LeftTrigger), BindKind::Replace, T0);
         assert_eq!(e.capture(T0), Decision::NONE);
         assert!(matches!(e.mode(), Mode::Binding { .. }));
         let d = down(&mut e, KeyId::X);
@@ -2075,9 +2767,9 @@ mod tests {
         let mut e = gamepad();
         let prvni = t0(Action::LeftTrigger);
         let druhe = PadAction::new(P1, Action::Button(PadButton::B));
-        let _ = e.start_binding(prvni, T0);
+        let _ = e.start_binding(prvni, BindKind::Replace, T0);
         let pozde = T0 + 5_000;
-        let d = e.start_binding(druhe, pozde);
+        let d = e.start_binding(druhe, BindKind::Replace, pozde);
         assert_eq!(
             d.ui,
             Some(UiEvent::ModeChanged {
@@ -2104,11 +2796,494 @@ mod tests {
         assert_eq!(e.mode(), Mode::Gamepad, "příznak návratu přežil restart");
     }
 
+    // ── Editor (Fáze 6) ──────────────────────────────────────────────
+
+    const A_BTN: Action = Action::Button(PadButton::A);
+    const UP: Action = Action::LeftStick(StickDir::Up);
+
+    /// Výchozí mapování + X jako druhá klávesa tlačítka A.
+    fn a_se_dvema() -> Mapping {
+        let mut m = Mapping::default();
+        m.bind(KeyId::X, t0(A_BTN)).unwrap();
+        m
+    }
+
+    #[test]
+    fn duvody_vynuceni_cisluje_all() {
+        for (i, r) in ForceReason::ALL.into_iter().enumerate() {
+            assert_eq!(r.index(), i, "{r:?}");
+        }
+        let mut s = ForceReason::ALL.to_vec();
+        s.dedup();
+        assert_eq!(s.len(), 9);
+    }
+
+    #[test]
+    fn prirazeni_nahradi_ostatni_klavesy() {
+        let mut e = engine_with(a_se_dvema());
+        assert_eq!(e.binding_kind(), None);
+        let _ = e.start_binding(t0(A_BTN), BindKind::Replace, T0);
+        assert_eq!(e.binding_kind(), Some(BindKind::Replace));
+        let d = down(&mut e, KeyId::NUMPAD_8);
+        assert_eq!(
+            d.ui,
+            Some(UiEvent::BindingSaved {
+                key: KeyId::NUMPAD_8,
+                target: t0(A_BTN),
+                moved_from: None
+            })
+        );
+        assert_eq!(
+            e.mapping().keys_for(t0(A_BTN)).collect::<Vec<_>>(),
+            vec![KeyId::NUMPAD_8],
+            "mezerník a X pryč"
+        );
+        assert_eq!(e.binding_kind(), None, "přiřazování skončilo");
+    }
+
+    #[test]
+    fn pridani_necha_ostatni_klavesy() {
+        let mut e = engine_with(a_se_dvema());
+        let _ = e.start_binding(t0(A_BTN), BindKind::Add, T0);
+        assert_eq!(e.binding_kind(), Some(BindKind::Add));
+        let d = down(&mut e, KeyId::NUMPAD_8);
+        assert!(matches!(d.ui, Some(UiEvent::BindingSaved { .. })));
+        assert_eq!(
+            e.mapping().keys_for(t0(A_BTN)).collect::<Vec<_>>(),
+            vec![KeyId::X, KeyId::SPACE, KeyId::NUMPAD_8]
+        );
+    }
+
+    #[test]
+    fn druh_plati_pro_posledni_start() {
+        // Restart přiřazování s jiným druhem: platí nový.
+        let mut e = engine_with(a_se_dvema());
+        let _ = e.start_binding(t0(A_BTN), BindKind::Add, T0);
+        let _ = e.start_binding(t0(A_BTN), BindKind::Replace, T0);
+        let _ = down(&mut e, KeyId::NUMPAD_8);
+        assert_eq!(e.mapping().keys_for(t0(A_BTN)).count(), 1);
+    }
+
+    #[test]
+    fn nahrazeni_presune_klavesu_z_jineho_ovladace() {
+        let mut e = engine_with(dva_ovladace());
+        let _ = e.enable(P1);
+        let cil = t0(A_BTN);
+        let _ = e.start_binding(cil, BindKind::Replace, T0);
+        let d = down(&mut e, KeyId::X);
+        assert_eq!(
+            d.ui,
+            Some(UiEvent::BindingSaved {
+                key: KeyId::X,
+                target: cil,
+                moved_from: Some(PadAction::new(P1, A_BTN))
+            })
+        );
+        assert_eq!(
+            e.mapping().keys_for(cil).collect::<Vec<_>>(),
+            vec![KeyId::X]
+        );
+        assert_eq!(e.mapping().keys_for(PadAction::new(P1, A_BTN)).count(), 0);
+    }
+
+    #[test]
+    fn nahrazeni_se_zkratkou_ani_win_nic_nezmeni() {
+        for kind in [BindKind::Replace, BindKind::Add] {
+            let mut e = engine_with(a_se_dvema());
+            let pred = e.mapping().clone();
+            let _ = e.start_binding(t0(A_BTN), kind, T0);
+            let d = down(&mut e, TOGGLE);
+            assert_eq!(
+                d.ui,
+                Some(UiEvent::BindingRejected {
+                    key: TOGGLE,
+                    reason: BindingReject::ToggleKey
+                })
+            );
+            let d = down(&mut e, KeyId::LEFT_WIN);
+            assert_eq!(
+                d.ui,
+                Some(UiEvent::BindingRejected {
+                    key: KeyId::LEFT_WIN,
+                    reason: BindingReject::Reserved
+                })
+            );
+            assert_eq!(e.mapping(), &pred, "{kind:?}");
+            assert_eq!(e.mapping_rev(), 0);
+            assert_eq!(e.binding_kind(), Some(kind), "čeká se dál");
+        }
+    }
+
+    #[test]
+    fn vymena_mapovani_nemeni_rezim_ani_vlastniky() {
+        let mut e = gamepad();
+        let d = down(&mut e, KeyId::W);
+        let stav = pad0(&d).unwrap();
+        let mut m = e.mapping().clone();
+        m.unbind(KeyId::W).unwrap();
+        let d = e.replace_mapping(m, T0);
+        assert_eq!(d, Decision::NONE, "nic se nevynucuje ani neposílá");
+        assert_eq!(e.mode(), Mode::Gamepad);
+        assert_eq!(e.pad_state(P0), stav, "W dohrává se starou akcí");
+        assert_eq!(e.held(KeyId::W).unwrap().owner, Owner::Pad(t0(UP)));
+        assert_eq!(e.mapping().target(KeyId::W), None);
+        // Autorepeat dál k ovladači, nic nespouští.
+        let r = down(&mut e, KeyId::W);
+        assert!(r.suppress && r.pads.is_empty() && r.ui.is_none());
+        // Key-up se spolkne (OS key-down neviděl) a pad je neutrální.
+        let u = up(&mut e, KeyId::W);
+        assert!(u.suppress);
+        assert_eq!(pad0(&u), Some(PadState::NEUTRAL));
+        // Další W už jde podle nového mapování do OS.
+        let n = down(&mut e, KeyId::W);
+        assert!(!n.suppress && n.pads.is_empty());
+        assert!(!up(&mut e, KeyId::W).suppress);
+    }
+
+    #[test]
+    fn vymena_mapovani_v_ostatnich_rezimech_nic_nevynucuje() {
+        let m = a_se_dvema();
+        let mut e = engine();
+        assert_eq!(e.replace_mapping(m.clone(), T0), Decision::NONE);
+        assert_eq!(e.mode(), Mode::Keyboard);
+        let mut e = Engine::new(Mapping::default());
+        assert_eq!(e.replace_mapping(m.clone(), T0), Decision::NONE);
+        assert!(matches!(e.mode(), Mode::Disabled { .. }));
+        assert_eq!(e.mapping(), &m);
+    }
+
+    #[test]
+    fn vymena_mapovani_zrusi_prirazovani_a_vrati_hru() {
+        let mut e = gamepad();
+        let _ = e.start_binding(t0(A_BTN), BindKind::Replace, T0);
+        let d = e.replace_mapping(a_se_dvema(), T0);
+        assert_eq!(
+            d.ui,
+            Some(UiEvent::BindingCancelled {
+                reason: BindingCancel::Gui
+            })
+        );
+        assert_eq!(
+            e.mode(),
+            Mode::Gamepad,
+            "zpět do hry, ne vynucená Klávesnice"
+        );
+        assert!(vse_neutralni(&d));
+        assert_eq!(e.mapping(), &a_se_dvema());
+        // Propadlé přiřazování skončí časem, ne zrušením z okna.
+        let mut e = engine();
+        let _ = e.start_binding(t0(A_BTN), BindKind::Replace, T0);
+        let d = e.replace_mapping(a_se_dvema(), T0 + BINDING_TIMEOUT_MS);
+        assert_eq!(
+            d.ui,
+            Some(UiEvent::BindingCancelled {
+                reason: BindingCancel::Timeout
+            })
+        );
+        assert_eq!(e.mode(), Mode::Keyboard);
+    }
+
+    #[test]
+    fn vymena_mapovani_zmeni_i_zkratku() {
+        // Nová zkratka platí od dalšího stisku; stará je obyčejná klávesa.
+        let mut e = engine();
+        let mut m = Mapping::default();
+        m.set_toggle_key(KeyId::NUMPAD_8).unwrap();
+        let _ = e.replace_mapping(m, T0);
+        assert!(!down(&mut e, TOGGLE).suppress);
+        assert!(!up(&mut e, TOGGLE).suppress);
+        let d = down(&mut e, KeyId::NUMPAD_8);
+        assert!(d.suppress);
+        assert_eq!(e.mode(), Mode::Gamepad);
+    }
+
+    #[test]
+    fn revize_roste_jen_se_skutecnou_zmenou() {
+        let mut e = engine();
+        assert_eq!(e.mapping_rev(), 0);
+        // Klávesy mimo přiřazování revizi nemění, ani přepnutí.
+        for k in [KeyId::W, TOGGLE, KeyId::X] {
+            let _ = down(&mut e, k);
+            let _ = up(&mut e, k);
+        }
+        let _ = e.toggle(T0);
+        assert_eq!(e.mapping_rev(), 0);
+
+        // Vazba na tentýž cíl: jediná klávesa (nahradit) i znovu přidaná.
+        let _ = e.start_binding(t0(UP), BindKind::Replace, T0);
+        let d = down(&mut e, KeyId::W);
+        assert!(matches!(d.ui, Some(UiEvent::BindingSaved { .. })));
+        let _ = up(&mut e, KeyId::W);
+        let _ = e.start_binding(t0(UP), BindKind::Add, T0);
+        let _ = down(&mut e, KeyId::W);
+        let _ = up(&mut e, KeyId::W);
+        assert_eq!(e.mapping_rev(), 0);
+
+        // Neúspěch ani zrušení nic nemění.
+        let _ = e.start_binding(t0(UP), BindKind::Replace, T0);
+        let _ = down(&mut e, TOGGLE);
+        let _ = down(&mut e, KeyId::new(0));
+        let _ = down(&mut e, KeyId::ESC);
+        let _ = e.start_binding(t0(UP), BindKind::Replace, T0);
+        let _ = e.cancel_binding(T0);
+        let _ = e.start_binding(t0(UP), BindKind::Replace, T0);
+        let _ = e.tick(T0 + BINDING_TIMEOUT_MS);
+        assert_eq!(e.mapping_rev(), 0);
+
+        // Skutečná změna: přidaná klávesa, pak nahrazení jen odebírá.
+        let _ = e.start_binding(t0(UP), BindKind::Add, T0);
+        let _ = e.on_key(KeyId::NUMPAD_8, true, T0 + 1);
+        assert_eq!(e.mapping_rev(), 1);
+        let _ = e.on_key(KeyId::NUMPAD_8, false, T0 + 1);
+        let _ = e.start_binding(t0(UP), BindKind::Replace, T0 + 2);
+        let _ = e.on_key(KeyId::W, true, T0 + 3);
+        assert_eq!(e.mapping_rev(), 2, "W zůstalo, ubylo NUMPAD_8");
+
+        // Výměna mapování: stejný obsah nic, clear_pad bez vazeb nic.
+        let _ = e.replace_mapping(e.mapping().clone(), T0);
+        let mut m = e.mapping().clone();
+        assert_eq!(m.clear_pad(P2), Ok(0));
+        let _ = e.replace_mapping(m, T0);
+        assert_eq!(e.mapping_rev(), 2);
+        let _ = e.set_mapping(e.mapping().clone());
+        assert_eq!(e.mapping_rev(), 2);
+
+        // clear_pad s vazbami, set_mapping s jiným obsahem: roste.
+        let mut m = dva_ovladace();
+        let _ = e.replace_mapping(m.clone(), T0);
+        assert_eq!(e.mapping_rev(), 3);
+        assert_eq!(m.clear_pad(P1), Ok(5));
+        let _ = e.replace_mapping(m, T0);
+        assert_eq!(e.mapping_rev(), 4);
+        let _ = e.set_mapping(Mapping::default());
+        assert_eq!(e.mapping_rev(), 5);
+    }
+
+    /// Živý stav ovladače `p` jako (držené akce, levá páčka).
+    fn zive(e: &Engine, include_os: bool, p: PadId) -> (Vec<Action>, (i8, i8)) {
+        let z = e.live_inputs(include_os)[p.index()];
+        (z.held().iter().collect(), z.left_stick())
+    }
+
+    #[test]
+    fn zivy_stav_bez_ovladace_jen_s_klavesami_os() {
+        let mut e = Engine::new(Mapping::default());
+        let _ = down(&mut e, KeyId::W);
+        assert_eq!(zive(&e, true, P0), (vec![UP], (0, 1)));
+        assert_eq!(e.live_inputs(false), [LiveInputs::EMPTY; MAX_PADS]);
+        // Nenamapovaná klávesa nerozsvítí nic.
+        let _ = up(&mut e, KeyId::W);
+        let _ = down(&mut e, KeyId::NUMPAD_8);
+        assert_eq!(e.live_inputs(true), [LiveInputs::EMPTY; MAX_PADS]);
+    }
+
+    #[test]
+    fn zivy_stav_ve_hre_a_po_zkratce() {
+        let mut e = gamepad();
+        let _ = down(&mut e, KeyId::W);
+        assert_eq!(e.held(KeyId::W).unwrap().owner, Owner::Pad(t0(UP)));
+        assert_eq!(zive(&e, false, P0), (vec![UP], (0, 1)), "Pad svítí vždy");
+        // Pauza: W je Swallow a pořád svítí (klávesa je dole).
+        let _ = down(&mut e, TOGGLE);
+        assert_eq!(e.held(KeyId::W).unwrap().owner, Owner::Swallow);
+        assert_eq!(zive(&e, false, P0), (vec![UP], (0, 1)));
+        // reset_held zapomene všechno.
+        let _ = e.reset_held(ForceReason::SessionLock);
+        assert_eq!(e.live_inputs(true), [LiveInputs::EMPTY; MAX_PADS]);
+    }
+
+    #[test]
+    fn zivy_stav_a_pak_d_sviti_obe() {
+        let mut e = gamepad();
+        let _ = down(&mut e, KeyId::A);
+        let _ = down(&mut e, KeyId::D);
+        let left = Action::LeftStick(StickDir::Left);
+        let right = Action::LeftStick(StickDir::Right);
+        assert_eq!(zive(&e, false, P0), (vec![left, right], (1, 0)));
+        // Hra dostává jen vítěze SOCD.
+        assert_eq!(
+            e.pad_state(P0).active_inputs().iter().collect::<Vec<_>>(),
+            vec![right]
+        );
+        let _ = up(&mut e, KeyId::D);
+        assert_eq!(zive(&e, false, P0), (vec![left], (-1, 0)));
+    }
+
+    #[test]
+    fn zivy_stav_klavesy_druheho_ovladace() {
+        let mut e = engine_with(dva_ovladace());
+        // Bez zachytávání: klávesa OS svítí u svého ovladače (s popředím).
+        let _ = down(&mut e, KeyId::I);
+        assert_eq!(zive(&e, true, P1), (vec![UP], (0, 1)));
+        assert_eq!(e.live_inputs(true)[P0.index()], LiveInputs::EMPTY);
+        let _ = up(&mut e, KeyId::I);
+        // Ve hře s připraveným druhým ovladačem i bez popředí.
+        let _ = e.enable(P1);
+        let _ = e.capture(T0);
+        let _ = down(&mut e, KeyId::X);
+        let z = e.live_inputs(false);
+        assert_eq!(z[P1.index()].held().iter().collect::<Vec<_>>(), vec![A_BTN]);
+        for p in [P0, P2, PadId::ALL[3]] {
+            assert_eq!(z[p.index()], LiveInputs::EMPTY, "{p:?}");
+        }
+    }
+
+    #[test]
+    fn zivy_stav_prirazene_klavesy_sviti_na_novem_miste() {
+        let mut e = engine();
+        let cil = t0(Action::RightTrigger);
+        let _ = e.start_binding(cil, BindKind::Replace, T0);
+        let _ = down(&mut e, KeyId::W);
+        assert_eq!(e.held(KeyId::W).unwrap().owner, Owner::Swallow);
+        let z = e.live_inputs(false)[0];
+        assert_eq!(
+            z.held().iter().collect::<Vec<_>>(),
+            vec![Action::RightTrigger]
+        );
+        assert_eq!(z.left_stick(), (0, 0));
+    }
+
+    /// Klávesy pro kódování: mapovatelné, nemapovatelné, Win, krajní scan.
+    const KODOVANE_KLAVESY: [KeyId; 8] = [
+        KeyId::W,
+        KeyId::ARROW_UP,
+        KeyId::LEFT_WIN,
+        KeyId::ALTGR_FAKE_CTRL,
+        KeyId::new(0),
+        KeyId::ext(0),
+        KeyId::new(0xFFFF),
+        KeyId::ext(0xFFFF),
+    ];
+
+    /// Všechny události kromě `ModeChanged` (cíle a klávesy výběrem).
+    fn vsechny_udalosti() -> Vec<UiEvent> {
+        let cile: Vec<PadAction> = PadId::ALL
+            .into_iter()
+            .flat_map(|p| Action::ALL.map(|a| PadAction::new(p, a)))
+            .collect();
+        let mut v = Vec::new();
+        for key in KODOVANE_KLAVESY {
+            for &target in &cile {
+                v.push(UiEvent::BindingSaved {
+                    key,
+                    target,
+                    moved_from: None,
+                });
+            }
+            for &moved in &cile {
+                v.push(UiEvent::BindingSaved {
+                    key,
+                    target: cile[(moved.action.index() * 7) % cile.len()],
+                    moved_from: Some(moved),
+                });
+            }
+            for reason in [
+                BindingReject::ToggleKey,
+                BindingReject::Unmappable,
+                BindingReject::Reserved,
+            ] {
+                v.push(UiEvent::BindingRejected { key, reason });
+            }
+        }
+        for reason in [
+            BindingCancel::Escape,
+            BindingCancel::Timeout,
+            BindingCancel::Gui,
+            BindingCancel::PadStatus,
+        ]
+        .into_iter()
+        .chain(ForceReason::ALL.map(BindingCancel::Forced))
+        {
+            v.push(UiEvent::BindingCancelled { reason });
+        }
+        for reason in [
+            ToggleReject::Disabled(DisabledReason::ViGEmMissing),
+            ToggleReject::Disabled(DisabledReason::PadNotConnected),
+            ToggleReject::Disabled(DisabledReason::PadError),
+            ToggleReject::Binding,
+        ] {
+            v.push(UiEvent::ToggleRejected { reason });
+        }
+        v
+    }
+
+    #[test]
+    fn oznameni_tam_a_zpet() {
+        let v = vsechny_udalosti();
+        let mut bity = std::collections::HashSet::new();
+        for e in &v {
+            let b = e.pack().unwrap_or_else(|| panic!("{e:?} nejde zabalit"));
+            assert!(b < 1 << 48, "{e:?}: {b:#x} přes 48 bitů");
+            assert_ne!(b, 0, "{e:?}: nula je „nic\"");
+            assert_eq!(UiEvent::unpack(b), Some(*e), "{b:#x}");
+            assert!(bity.insert(b), "{e:?} sdílí bity s jinou událostí");
+        }
+        // Všechny moved_from i cíle (4 × 24) a všechny důvody jsou vidět.
+        assert_eq!(v.len(), 8 * (96 + 96 + 3) + 13 + 4);
+    }
+
+    #[test]
+    fn zmena_rezimu_se_nebali() {
+        for (mode, cause) in [
+            (Mode::Gamepad, ModeCause::Hotkey),
+            (
+                Mode::Binding {
+                    target: t0(A_BTN),
+                    started_at_ms: u64::MAX,
+                },
+                ModeCause::Gui,
+            ),
+            (
+                Mode::Disabled {
+                    reason: DisabledReason::PadError,
+                },
+                ModeCause::Forced(ForceReason::Shutdown),
+            ),
+        ] {
+            assert_eq!(UiEvent::ModeChanged { mode, cause }.pack(), None);
+        }
+    }
+
+    #[test]
+    fn rozbalit_odmitne_cokoli_mimo_pack() {
+        let zrus = UiEvent::BindingCancelled {
+            reason: BindingCancel::Gui,
+        }
+        .pack()
+        .unwrap();
+        let ulozeno = UiEvent::BindingSaved {
+            key: KeyId::W,
+            target: t0(A_BTN),
+            moved_from: None,
+        }
+        .pack()
+        .unwrap();
+        for b in [
+            0,                            // druh 0
+            5,                            // neznámý druh
+            7,                            // neznámý druh
+            zrus | 1 << 3,                // klávesa u zrušení
+            zrus | 1 << 20,               // cíl u zrušení
+            zrus | 1 << 47,               // bit nad rozložením
+            zrus | 1 << 63,               // horní bity (seq hook vlákna)
+            3 | 13 << 35,                 // důvod zrušení mimo rozsah
+            2 | 3 << 35,                  // důvod odmítnutí mimo rozsah
+            4 | 4 << 35,                  // důvod přepnutí mimo rozsah
+            ulozeno | 1 << 28,            // odkud bez příznaku
+            1 | 24 << 20,                 // akce 24 neexistuje
+            1 | 127 << 20,                // ovladač 3, akce 31
+            ulozeno | 1 << 27 | 30 << 28, // odkud: akce 30
+            ulozeno | 2 << 35,            // důvod u uložení
+        ] {
+            assert_eq!(UiEvent::unpack(b), None, "{b:#x}");
+        }
+    }
+
     #[test]
     fn prirazeni_presune_klavesu_na_jiny_ovladac() {
         let mut e = hraji_dva();
         let cil = PadAction::new(P1, Action::Button(PadButton::Y));
-        let _ = e.start_binding(cil, T0);
+        let _ = e.start_binding(cil, BindKind::Replace, T0);
         let d = down(&mut e, KeyId::SPACE);
         assert_eq!(
             d.ui,

@@ -77,6 +77,23 @@ impl KeyId {
         self.scan >= 0x01 && self.scan <= 0x7F && !self.is_reserved()
     }
 
+    /// Modifikátor — levý i pravý Ctrl, Shift a Alt (pravý Alt je na
+    /// českém rozložení AltGr)?
+    ///
+    /// Při přiřazování jde jeho stisk do Windows a přiřadí se až ťuknutím
+    /// (key-up bez jiné klávesy mezitím): kdyby se přiřadil hned při
+    /// key-downu, Alt+Tab, Alt+F4 ani Ctrl+Shift+Esc by z okna KeyPadu
+    /// nevedly nikam a vstup by potichu dostal Alt (otevřená otázka 55).
+    ///
+    /// Shift jen bez E0 — E0 0x2A a E0 0x36 jsou „falešné" Shifty, které
+    /// klávesnice posílá s jinými klávesami (Print Screen…), ne modifikátor.
+    pub const fn is_modifier(self) -> bool {
+        matches!(
+            (self.scan, self.extended),
+            (0x1D | 0x38, _) | (0x2A | 0x36, false)
+        )
+    }
+
     /// Index do tabulek o [`KEY_TABLE_SIZE`] položkách: nízkých 7 bitů je
     /// scan kód, horní bit prefix E0. `None` pro nemapovatelné klávesy.
     ///
@@ -115,6 +132,7 @@ impl KeyId {
     pub const I: KeyId = KeyId::new(0x17);
     pub const ENTER: KeyId = KeyId::new(0x1C);
     pub const LEFT_CTRL: KeyId = KeyId::new(0x1D);
+    pub const RIGHT_CTRL: KeyId = KeyId::ext(0x1D);
     pub const A: KeyId = KeyId::new(0x1E);
     pub const S: KeyId = KeyId::new(0x1F);
     pub const D: KeyId = KeyId::new(0x20);
@@ -126,6 +144,7 @@ impl KeyId {
     pub const X: KeyId = KeyId::new(0x2D);
     pub const C: KeyId = KeyId::new(0x2E);
     pub const V: KeyId = KeyId::new(0x2F);
+    pub const RIGHT_SHIFT: KeyId = KeyId::new(0x36);
     /// Levý Alt. Mapovat jde; okno u něj jen varuje, že při hraní
     /// nepůjde Alt+Tab (Fáze 6).
     pub const LEFT_ALT: KeyId = KeyId::new(0x38);
@@ -224,6 +243,35 @@ mod tests {
             assert!(k.is_mappable() && !k.is_reserved(), "{k}");
         }
         assert_ne!(KeyId::LEFT_ALT, KeyId::RIGHT_ALT);
+    }
+
+    #[test]
+    fn modifikatory_jsou_prave_ctrl_shift_alt() {
+        let mut modifikatory = Vec::new();
+        for scan in 0..=0x300u16 {
+            for extended in [false, true] {
+                let k = KeyId { scan, extended };
+                if k.is_modifier() {
+                    modifikatory.push(k);
+                }
+            }
+        }
+        modifikatory.sort();
+        let mut cekane = vec![
+            KeyId::LEFT_CTRL,
+            KeyId::RIGHT_CTRL,
+            KeyId::LEFT_SHIFT,
+            KeyId::RIGHT_SHIFT,
+            KeyId::LEFT_ALT,
+            KeyId::RIGHT_ALT,
+        ];
+        cekane.sort();
+        assert_eq!(modifikatory, cekane);
+        // Všechny jdou mapovat (přiřazují se ťuknutím); falešný Ctrl
+        // z AltGr modifikátor není — engine ho vůbec nesleduje.
+        assert!(cekane.iter().all(|k| k.is_mappable()));
+        assert!(!KeyId::ALTGR_FAKE_CTRL.is_modifier());
+        assert!(!KeyId::LEFT_WIN.is_modifier());
     }
 
     #[test]

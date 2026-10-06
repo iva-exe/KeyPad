@@ -5,7 +5,7 @@
 	import { fly } from 'svelte/transition';
 	import { aplikace } from './aplikace.svelte';
 	import { trvani, zpomaleni } from './motion';
-	import { otevri } from './pad.svelte';
+	import { otevri } from './pady.svelte';
 	import { textChyby, zavolej } from './tauri';
 
 	// „O aplikaci": verze, credit ViGEmBus (bez něj by KeyPad nebyl)

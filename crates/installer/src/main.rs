@@ -105,11 +105,11 @@ const UNINSTALL_STEPS: &[&str] = &[
     "Odebírám zástupce a záznam v systému",
 ];
 
-/// Soubory, které vedle KeyPad.exe zakládá instalace nebo aplikace
-/// a které odinstalace maže. `config.toml` mezi nimi schválně NENÍ —
-/// je to uživatelovo mapování kláves a to se bez ptaní nemaže.
+/// Soubory, které vedle KeyPad.exe (nebo v `%APPDATA%\KeyPad`) zakládá
+/// instalace nebo aplikace a které odinstalace maže. Konfigurace
+/// (`updater::config_path`) mezi nimi schválně NENÍ — je to uživatelovo
+/// mapování kláves a to se bez ptaní nemaže.
 const SIDE_FILES: &[&str] = &[VERSION_FILE, "keypad.log", "keypad.old.log"];
-const CONFIG_FILE: &str = "config.toml";
 
 /// Hlášení průběhu. Okno i konzole dostávají totéž — jen to jinak
 /// ukazují, takže se logika instalace nemusí ptát, kde zrovna běží.
@@ -1503,13 +1503,8 @@ fn do_uninstall(rep: &mut dyn Report) -> Result<Done, String> {
             }
         }
     }
-    // Náhradní umístění logu (když instalační složka nebyla zapisovatelná).
-    if let Some(roaming) = updater::roaming_dir() {
-        for name in SIDE_FILES {
-            let _ = std::fs::remove_file(roaming.join(name));
-        }
-        let _ = std::fs::remove_dir(&roaming);
-    }
+    // `%APPDATA%\KeyPad`: náhradní umístění logu a uživatelova konfigurace.
+    let config_dir = updater::roaming_dir().and_then(|r| clean_roaming(&r));
     remove_update_downloads(&updater::update_temp_dir());
     // Zbytky přerušené instalace ovladače v %TEMP% (jen naše soubory)
     // a log instalátoru.
@@ -1530,7 +1525,6 @@ fn do_uninstall(rep: &mut dyn Report) -> Result<Done, String> {
     if !running_from_it {
         let _ = std::fs::remove_file(&setup);
     }
-    let config_left = dir.join(CONFIG_FILE).is_file();
     // Jen prázdnou složku — cokoliv, co v ní zůstalo, není naše.
     let _ = std::fs::remove_dir(&dir);
 
@@ -1542,17 +1536,31 @@ fn do_uninstall(rep: &mut dyn Report) -> Result<Done, String> {
         BusLeft::Elsewhere
     };
     Ok(Done {
-        message: uninstall_message(
-            found,
-            config_left.then_some(dir.as_path()),
-            webview_left.as_deref(),
-            bus,
-        ),
+        message: uninstall_message(found, config_dir.as_deref(), webview_left.as_deref(), bus),
         // Nesmazaná data okna chtějí ruční zásah — v tichém režimu
         // (`/uninstall /quiet`) by jinak okno zmizelo i s pokynem.
         attention: webview_left.is_some(),
         next: None,
     })
+}
+
+/// Uklidí po KeyPadu `roaming` (`updater::roaming_dir()`) a vrátí ji,
+/// když zůstala, aby ji hláška ukázala; `None` = složka zmizela nebo
+/// nebyla.
+///
+/// Smaže jen [`SIDE_FILES`] (náhradní umístění logu) a složku jen
+/// prázdnou. Cokoli dalšího v ní patří uživateli a odinstalace to NEMAŽE:
+/// konfigurace (`updater::CONFIG_FILE`), záloha nevalidní konfigurace
+/// (`updater::CONFIG_BACKUP_FILE`), `.tmp` přerušeného zápisu nebo jeho
+/// vlastní soubor. Proto se ptá na složku, ne na jméno konfigurace: po
+/// obnově nevalidního souboru, kdy uživatel ještě nic nezměnil, v ní je
+/// jen záloha — a hláška by o ní mlčela (princip 8).
+fn clean_roaming(roaming: &Path) -> Option<PathBuf> {
+    for name in SIDE_FILES {
+        let _ = std::fs::remove_file(roaming.join(name));
+    }
+    let _ = std::fs::remove_dir(roaming);
+    roaming.is_dir().then(|| roaming.to_path_buf())
 }
 
 /// Zůstal po odinstalaci KeyPadu v systému ViGEmBus, a jde odebrat
@@ -1993,6 +2001,63 @@ mod tests {
         assert!(uninstall_message(true, Some(d), None, BusLeft::No).contains(r"C:\x\KeyPad"));
         let wv = Path::new(r"C:\x\cz.hexel.keypad");
         assert!(uninstall_message(true, None, Some(wv), BusLeft::No).contains("smaž tu složku"));
+    }
+
+    /// Konfigurace se hledá tam, kde ji aplikace píše (`%APPDATA%\KeyPad`,
+    /// jedna cesta v updateru), ne vedle programu, a hláška ukáže její
+    /// složku. Úklid se zkouší jen v dočasné složce, skutečný `%APPDATA%`
+    /// test nečte.
+    #[test]
+    fn odinstalace_ukaze_slozku_konfigurace() {
+        let roaming = updater::roaming_dir().expect("APPDATA je ve Windows vždy nastavená");
+        assert!(roaming.ends_with("KeyPad"));
+        assert_eq!(
+            updater::config_path(),
+            Some(roaming.join(updater::CONFIG_FILE))
+        );
+        let m = uninstall_message(true, Some(&roaming), None, BusLeft::No);
+        assert!(
+            m.contains(&format!("zůstalo v {}.", roaming.display())),
+            "{m}"
+        );
+
+        let zaklad = std::env::temp_dir().join(format!("keypad-setup-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&zaklad);
+        // Složka s uživatelovým souborem `jmeno` a se vším, co maže
+        // odinstalace: zůstane jen s tím souborem a hláška ji ukáže.
+        let zustane = |jmeno: &str| {
+            let dir = zaklad.join(jmeno);
+            std::fs::create_dir_all(&dir).unwrap();
+            for name in SIDE_FILES {
+                std::fs::write(dir.join(name), "x").unwrap();
+            }
+            std::fs::write(dir.join(jmeno), "{\"verze\": 1, \"zvuk\": }").unwrap();
+            assert_eq!(clean_roaming(&dir), Some(dir.clone()), "{jmeno}");
+            let mut zbylo: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            zbylo.sort();
+            assert_eq!(zbylo, [jmeno], "maže se jen log a version.txt");
+        };
+        zustane(updater::CONFIG_FILE);
+        // Po obnově nevalidní konfigurace, kdy uživatel nic nezměnil,
+        // `config.json` není — jen záloha s jeho klávesami.
+        zustane(updater::CONFIG_BACKUP_FILE);
+        // Přerušený zápis a vlastní soubor uživatele.
+        zustane("config.json.tmp");
+        zustane("moje-poznamky.txt");
+
+        // Bez uživatelových souborů složka zmizí a hláška o ní mlčí.
+        let prazdna = zaklad.join("jen-log");
+        std::fs::create_dir_all(&prazdna).unwrap();
+        for name in SIDE_FILES {
+            std::fs::write(prazdna.join(name), "x").unwrap();
+        }
+        assert_eq!(clean_roaming(&prazdna), None);
+        assert!(!prazdna.exists());
+        assert_eq!(clean_roaming(&zaklad.join("nebyla")), None);
+        let _ = std::fs::remove_dir_all(&zaklad);
     }
 
     /// Úvodní obrazovka: krok ovladače (instalace / aktualizace) a credit

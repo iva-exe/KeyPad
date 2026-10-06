@@ -149,6 +149,41 @@ fn mica_je(hwnd: windows::Win32::Foundation::HWND) -> Option<(bool, String)> {
     cti(DWMWINDOWATTRIBUTE(1029)).map(|v| (v != 0, format!("mica {v}")))
 }
 
+/// Vypne zkratky prohlížeče ve WebView2 (spec 1.8): F5 a Ctrl+R by
+/// obnovily stránku, Ctrl+P otevřel tisk, Ctrl+F hledání… KeyPad je
+/// aplikace, ne prohlížeč — a bez zapnutého ovladače jdou do okna
+/// i herní klávesy. wry je nechává zapnuté (`browser_accelerator_keys`)
+/// a Tauri 2.11 to nastavit neumí, proto přímo přes
+/// `ICoreWebView2Settings3`.
+///
+/// Starší WebView2 Runtime bez `ICoreWebView2Settings3` → tiše nic
+/// (zkratky zůstanou, nic se nerozbije).
+pub fn vypni_zkratky_prohlizece(w: &tauri::WebviewWindow) {
+    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings3;
+    use windows::core::Interface;
+
+    // `with_webview` běží na hlavním vlákně, kde COM objekty WebView2
+    // žijí.
+    let r = w.with_webview(|pw| {
+        // SAFETY: volání COM na vlákně, které webview vlastní; controller
+        // drží Tauri po celou dobu života okna.
+        let r = unsafe {
+            pw.controller()
+                .CoreWebView2()
+                .and_then(|wv| wv.Settings())
+                .and_then(|s| s.cast::<ICoreWebView2Settings3>())
+                .and_then(|s| s.SetAreBrowserAcceleratorKeysEnabled(false))
+        };
+        match r {
+            Ok(()) => log::debug!("WebView2: zkratky prohlížeče vypnuté"),
+            Err(e) => log::debug!("WebView2: zkratky prohlížeče nejde vypnout ({e}) — nevadí"),
+        }
+    });
+    if let Err(e) = r {
+        log::debug!("WebView2: zkratky prohlížeče nejde vypnout ({e}) — nevadí");
+    }
+}
+
 /// Dá hlavní okno do popředí — bez syntetického vstupu.
 ///
 /// Schválně NE `set_focus()` z Tauri: tao v něm, když Windows

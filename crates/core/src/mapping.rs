@@ -100,6 +100,16 @@ fn not_mappable(key: KeyId, action: Option<PadAction>) -> MappingError {
     }
 }
 
+/// Co udělalo [`Mapping::bind_replacing`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Rebind {
+    /// Cíl, kterému klávesa patřila dosud (přesunula se, i z jiného
+    /// ovladače); `None` = byla volná nebo už patřila tomuhle cíli.
+    pub moved_from: Option<PadAction>,
+    /// Kolik jiných kláves cíl ztratil.
+    pub removed: usize,
+}
+
 /// Kompletní rozvržení kláves: vazby klávesa → akce na ovladači
 /// a zkratka přepnutí.
 ///
@@ -254,6 +264,88 @@ impl Mapping {
         };
         let previous = slot.replace(t);
         Ok(previous.filter(|&p| p != t))
+    }
+
+    /// Nahradí klávesy cíle: ostatní klávesy `t` odebere a `key` mu
+    /// přiřadí (patřila-li jinam, přesune se) — klik na čepičku a stisk
+    /// klávesy jako v nastavení her (Fáze 6, OQ 40).
+    ///
+    /// Všechno, nebo nic: chyby (zkratka, Win, nemapovatelná klávesa) se
+    /// hlásí před jakoukoli změnou. Prázdné mapování vzniknout nemůže —
+    /// `key` po úspěchu vazbu má.
+    ///
+    /// Nealokuje — volá se z hook callbacku.
+    pub fn bind_replacing(&mut self, key: KeyId, t: PadAction) -> Result<Rebind, MappingError> {
+        if key == self.toggle {
+            return Err(MappingError::ToggleKeyMapped { key, action: t });
+        }
+        let Some(ki) = key.index().filter(|&i| i < self.keys.len()) else {
+            return Err(not_mappable(key, Some(t)));
+        };
+        let mut removed = 0;
+        for (i, slot) in self.keys.iter_mut().enumerate() {
+            if i != ki && *slot == Some(t) {
+                *slot = None;
+                removed += 1;
+            }
+        }
+        let previous = self.keys[ki].replace(t);
+        Ok(Rebind {
+            moved_from: previous.filter(|&p| p != t),
+            removed,
+        })
+    }
+
+    /// Vyprázdní vstup — odebere všechny jeho klávesy a vrátí, kolik
+    /// jich bylo (`Ok(0)` = vstup už byl prázdný). Všechno, nebo nic:
+    /// jsou-li to poslední vazby celého mapování,
+    /// [`MappingError::WouldBeEmpty`] a nic se neodebere.
+    ///
+    /// Celý vstup, ne „naposledy přidaná klávesa": tabulka pořadí přidání
+    /// nezná.
+    pub fn unbind_target(&mut self, t: PadAction) -> Result<usize, MappingError> {
+        let n = self.keys_for(t).count();
+        if n > 0 && n == self.len() {
+            return Err(MappingError::WouldBeEmpty);
+        }
+        for slot in &mut self.keys {
+            if *slot == Some(t) {
+                *slot = None;
+            }
+        }
+        Ok(n)
+    }
+
+    /// Mapování, ve kterém má první ovladač výchozí rozvržení (tlačítko
+    /// „Výchozí klávesy").
+    ///
+    /// Výchozí klávesu, která teď patří jinému ovladači nebo je zkratkou
+    /// přepnutí, PŘESKOČÍ — vstup prvního ovladače zůstane prázdný (OQ 49).
+    /// Brát klávesy jiným hráčům by bylo překvapení, o které nikdo nežádal.
+    /// Ostatní ovladače i zkratka zůstávají beze změny.
+    ///
+    /// Prázdné být nemůže: buď mají klávesy jiné ovladače, nebo první
+    /// dostane všechny výchozí kromě nejvýš zkratky.
+    pub fn defaults_for_first_pad(&self) -> Mapping {
+        let mut out = self.clone();
+        for slot in &mut out.keys {
+            if slot.is_some_and(|t| t.pad == PadId::FIRST) {
+                *slot = None;
+            }
+        }
+        for (key, t) in Mapping::default().bindings() {
+            if key == out.toggle {
+                continue;
+            }
+            // Obsazený slot teď patří jen jinému ovladači.
+            if let Some(slot) = key.index().and_then(|i| out.keys.get_mut(i)) {
+                if slot.is_none() {
+                    *slot = Some(t);
+                }
+            }
+        }
+        debug_assert!(!out.is_empty(), "výchozí klávesy daly prázdné mapování");
+        out
     }
 
     /// Odebere vazbu klávesy. Poslední vazbu (celého mapování) odebrat
@@ -593,6 +685,231 @@ mod tests {
             Err(MappingError::Unmappable { .. })
         ));
         assert_eq!(m, pred, "neúspěch nic nezměnil");
+    }
+
+    #[test]
+    fn nahrazeni_necha_jen_novou_klavesu() {
+        // A má mezerník a X; nahrazení F nechá jen F.
+        let mut m = Mapping::default();
+        m.bind(KeyId::X, A_BTN).unwrap();
+        assert_eq!(m.keys_for(A_BTN).count(), 2);
+        let f = PadAction::first(Action::Button(PadButton::X));
+        assert_eq!(
+            m.bind_replacing(KeyId::F, A_BTN),
+            Ok(Rebind {
+                moved_from: Some(f),
+                removed: 2
+            })
+        );
+        assert_eq!(m.keys_for(A_BTN).collect::<Vec<_>>(), vec![KeyId::F]);
+        assert_eq!(m.keys_for(f).count(), 0, "F z tlačítka X odešlo");
+        assert_eq!(m.target(KeyId::SPACE), None);
+        assert_eq!(m.target(KeyId::X), None);
+        assert_eq!(m.len(), 23, "24 + X − mezerník − X");
+        let platne = Mapping::new(m.toggle_key(), m.bindings()).expect("platné");
+        assert_eq!(platne, m);
+    }
+
+    #[test]
+    fn pridani_necha_vsechny_klavesy() {
+        let mut m = Mapping::default();
+        m.bind(KeyId::X, A_BTN).unwrap();
+        assert_eq!(m.bind(KeyId::NUMPAD_8, A_BTN), Ok(None));
+        assert_eq!(
+            m.keys_for(A_BTN).collect::<Vec<_>>(),
+            vec![KeyId::X, KeyId::SPACE, KeyId::NUMPAD_8]
+        );
+    }
+
+    #[test]
+    fn nahrazeni_touz_klavesou() {
+        // Klávesa už cíli patří: odeberou se jen ostatní, nic se nepřesouvá.
+        let mut m = Mapping::default();
+        m.bind(KeyId::X, A_BTN).unwrap();
+        assert_eq!(
+            m.bind_replacing(KeyId::SPACE, A_BTN),
+            Ok(Rebind {
+                moved_from: None,
+                removed: 1
+            })
+        );
+        assert_eq!(m.keys_for(A_BTN).collect::<Vec<_>>(), vec![KeyId::SPACE]);
+        // Jediná klávesa cíle: nic se nemění.
+        let pred = m.clone();
+        assert_eq!(
+            m.bind_replacing(KeyId::SPACE, A_BTN),
+            Ok(Rebind {
+                moved_from: None,
+                removed: 0
+            })
+        );
+        assert_eq!(m, pred);
+        // Prázdný cíl: nic se neodebírá.
+        let lt2 = PadAction::new(P1, Action::LeftTrigger);
+        assert_eq!(
+            m.bind_replacing(KeyId::NUMPAD_8, lt2),
+            Ok(Rebind {
+                moved_from: None,
+                removed: 0
+            })
+        );
+        assert_eq!(m.target(KeyId::NUMPAD_8), Some(lt2));
+    }
+
+    #[test]
+    fn nahrazeni_presune_klavesu_mezi_ovladaci() {
+        let mut m = Mapping::default();
+        m.bind(KeyId::X, na(P1, UP)).unwrap();
+        // W z prvního ovladače nahradí X u druhého.
+        assert_eq!(
+            m.bind_replacing(KeyId::W, na(P1, UP)),
+            Ok(Rebind {
+                moved_from: Some(UP),
+                removed: 1
+            })
+        );
+        assert_eq!(
+            m.pad_bindings(P1).collect::<Vec<_>>(),
+            vec![(KeyId::W, UP.action)]
+        );
+        assert_eq!(m.keys_for(UP).count(), 0, "první ovladač o W přišel");
+        assert_eq!(m.target(KeyId::X), None);
+    }
+
+    #[test]
+    fn nahrazeni_s_chybou_nic_nezmeni() {
+        let mut m = Mapping::default();
+        m.bind(KeyId::X, A_BTN).unwrap();
+        let pred = m.clone();
+        assert_eq!(
+            m.bind_replacing(KeyId::SCROLL_LOCK, A_BTN),
+            Err(MappingError::ToggleKeyMapped {
+                key: KeyId::SCROLL_LOCK,
+                action: A_BTN
+            })
+        );
+        for win in [KeyId::LEFT_WIN, KeyId::RIGHT_WIN] {
+            assert_eq!(
+                m.bind_replacing(win, A_BTN),
+                Err(MappingError::Reserved {
+                    key: win,
+                    action: Some(A_BTN)
+                })
+            );
+        }
+        for k in [KeyId::ALTGR_FAKE_CTRL, KeyId::new(0), KeyId::new(0x80)] {
+            assert_eq!(
+                m.bind_replacing(k, A_BTN),
+                Err(MappingError::Unmappable {
+                    key: k,
+                    action: Some(A_BTN)
+                })
+            );
+        }
+        assert_eq!(m, pred, "A má dál obě klávesy");
+    }
+
+    #[test]
+    fn vyprazdneni_vstupu() {
+        let mut m = Mapping::default();
+        m.bind(KeyId::X, A_BTN).unwrap();
+        assert_eq!(m.unbind_target(A_BTN), Ok(2));
+        assert_eq!(m.keys_for(A_BTN).count(), 0);
+        assert_eq!(m.target(KeyId::SPACE), None);
+        assert_eq!(m.target(KeyId::X), None);
+        assert_eq!(m.len(), 23);
+        // Prázdný vstup: nic, žádná chyba.
+        let pred = m.clone();
+        assert_eq!(m.unbind_target(A_BTN), Ok(0));
+        assert_eq!(m.unbind_target(na(P1, UP)), Ok(0));
+        assert_eq!(m, pred);
+    }
+
+    #[test]
+    fn vyprazdneni_poslednich_vazeb_se_odmitne() {
+        let mut m = Mapping::new(
+            KeyId::SCROLL_LOCK,
+            [(KeyId::W, na(P1, UP)), (KeyId::I, na(P1, UP))],
+        )
+        .unwrap();
+        let pred = m.clone();
+        assert_eq!(m.unbind_target(na(P1, UP)), Err(MappingError::WouldBeEmpty));
+        assert_eq!(m, pred, "všechno, nebo nic");
+        // Tatáž akce na jiném ovladači je jiný vstup.
+        assert_eq!(m.unbind_target(UP), Ok(0));
+    }
+
+    #[test]
+    fn vychozi_pro_prvni_ovladac_nebere_klavesy_jinym() {
+        let mut m = Mapping::default();
+        // Druhý ovladač má W (z ls_up prvního) a X; první si mezitím
+        // přemapoval mezerník na B.
+        m.bind(KeyId::W, na(P1, UP)).unwrap();
+        m.bind(KeyId::X, na(P1, A_BTN)).unwrap();
+        m.bind(KeyId::SPACE, PadAction::first(Action::Button(PadButton::B)))
+            .unwrap();
+        let d = m.defaults_for_first_pad();
+        assert_eq!(d.target(KeyId::W), Some(na(P1, UP)), "W zůstane druhému");
+        assert_eq!(d.keys_for(UP).count(), 0, "ls_up prvního zůstane prázdné");
+        assert_eq!(d.target(KeyId::X), Some(na(P1, A_BTN)));
+        assert_eq!(d.target(KeyId::SPACE), Some(A_BTN), "mezerník zpět na A");
+        assert_eq!(
+            d.keys_for(PadAction::first(Action::Button(PadButton::B)))
+                .count(),
+            1
+        );
+        assert_eq!(d.pad_bindings(PadId::FIRST).count(), 23);
+        assert_eq!(d.pad_bindings(P1).count(), 2, "druhý beze změny");
+        assert_eq!(d.toggle_key(), m.toggle_key());
+        assert_eq!(Mapping::new(d.toggle_key(), d.bindings()).unwrap(), d);
+    }
+
+    #[test]
+    fn vychozi_pro_prvni_ovladac_preskoci_zkratku() {
+        // Zkratka na F (výchozí klávesa tlačítka X): X zůstane prázdné.
+        let mut m = Mapping::default();
+        m.unbind(KeyId::F).unwrap();
+        m.set_toggle_key(KeyId::F).unwrap();
+        m.bind(KeyId::NUMPAD_8, A_BTN).unwrap();
+        let d = m.defaults_for_first_pad();
+        assert_eq!(d.toggle_key(), KeyId::F);
+        assert_eq!(d.target(KeyId::F), None);
+        assert_eq!(
+            d.keys_for(PadAction::first(Action::Button(PadButton::X)))
+                .count(),
+            0
+        );
+        assert_eq!(
+            d.target(KeyId::NUMPAD_8),
+            None,
+            "vlastní klávesa prvního pryč"
+        );
+        assert_eq!(d.len(), 23);
+        assert_eq!(Mapping::new(d.toggle_key(), d.bindings()).unwrap(), d);
+        // Na výchozím mapování nic nemění.
+        assert_eq!(
+            Mapping::default().defaults_for_first_pad(),
+            Mapping::default()
+        );
+    }
+
+    #[test]
+    fn vychozi_pro_prvni_ovladac_neni_nikdy_prazdne() {
+        // Všechny výchozí klávesy má druhý ovladač: první zůstane prázdný,
+        // druhý beze změny.
+        let d = Mapping::default();
+        let m = Mapping::new(
+            KeyId::SCROLL_LOCK,
+            d.bindings().map(|(k, t)| (k, na(P1, t))),
+        )
+        .unwrap();
+        let v = m.defaults_for_first_pad();
+        assert_eq!(v, m);
+        assert_eq!(v.pad_bindings(PadId::FIRST).count(), 0);
+        assert!(!v.is_empty());
+        // Jen první ovladač, s jedinou cizí klávesou: dostane výchozí.
+        let m = Mapping::new(KeyId::SCROLL_LOCK, [(KeyId::NUMPAD_8, UP)]).unwrap();
+        assert_eq!(m.defaults_for_first_pad(), Mapping::default());
     }
 
     #[test]

@@ -4,6 +4,8 @@
 //! cargo run -p keypad --release --example hook_selftest            (60 s)
 //! cargo run -p keypad --release --example hook_selftest -- 120     (sekund)
 //! cargo run -p keypad --release --example hook_selftest -- instalace
+//! cargo run -p keypad --release --example hook_selftest -- mereni
+//! cargo run -p keypad --release --example hook_selftest -- mereni-instalace
 //! ```
 //!
 //! Výchozí mapování (WASD, šipky, IJKL…, přepnutí Scroll Lock). Začíná
@@ -18,8 +20,22 @@
 //! o klávesách nevypisuje. Mapuje jen F23/F24 (zkratka F23) — klávesy,
 //! které nikdo nezmáčkne, takže ani na chvilku nic nepotlačí.
 //!
-//! Hook i názvy kláves jsou TYTÉŽ soubory, které používá aplikace
-//! (`#[path]`).
+//! `mereni` (Fáze 6): kolik stojí jedna událost klávesnice — touž
+//! funkcí jako callback (`hook::zmer_zpracovani`) a se skutečným
+//! výstupem aplikace (sloty padů, atomiky okna, `SetEvent`), bez živé
+//! detekce i s ní (okno v popředí). Hook se do systému NEinstaluje,
+//! klávesy jsou syntetické a nikam nejdou. Vypíše p50/p99 a skončí
+//! chybou, když p99 přeleze 20 µs.
+//!
+//! `mereni-instalace` (Fáze 6, riziko 2 a otázka 42): kolik stojí
+//! instalace a odebrání hooku — bez zapnutého ovladače se to děje při
+//! každém získání a ztrátě popředí oknem KeyPadu (Alt+Tab). Hook se
+//! instaluje na VLASTNÍ SKRYTÉ PLOŠE: LL hook vidí jen vstup plochy,
+//! na které běží jeho vlákno, a ta se nikdy nezobrazí — klávesnice
+//! vlastníka k němu nedojde. Callback jen předává dál.
+//!
+//! Hook, výstup, sloty i názvy kláves jsou TYTÉŽ soubory, které používá
+//! aplikace (`#[path]`).
 
 #[allow(
     dead_code,
@@ -27,8 +43,15 @@
 )]
 #[path = "../src/platform/windows/hook.rs"]
 mod hook;
+#[allow(dead_code, reason = "příklad používá jen názvy, ne krátké názvy")]
 #[path = "../src/platform/windows/klavesy.rs"]
 mod klavesy;
+#[allow(dead_code, reason = "měření potřebuje jen zápis, čtení je pro okno")]
+#[path = "../src/platform/windows/slot.rs"]
+mod slot;
+#[allow(dead_code, reason = "měření potřebuje jen zápis, čtení je pro okno")]
+#[path = "../src/platform/windows/vystup.rs"]
+mod vystup;
 
 /// Hook volá `crate::logger::mark_realtime_thread()`; příklad logger
 /// nemá (vypisuje do konzole sám).
@@ -42,7 +65,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hook::{Hook, HookPrikaz, Udalost, Vystup};
-use keypad_core::{Action, Decision, KeyId, Mapping, Mode, PadAction, PadButton, PadId};
+use keypad_core::{Action, Decision, KeyId, Mapping, Mode, PadAction, PadButton, PadId, MAX_PADS};
+use windows::core::HSTRING;
+use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::StationsAndDesktops::{
+    CreateDesktopW, SetThreadDesktop, DESKTOP_CONTROL_FLAGS,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VSC_TO_VK_EX};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CallNextHookEx, PeekMessageW, SetWindowsHookExW, UnhookWindowsHookEx, MSG, PM_REMOVE,
+    WH_KEYBOARD_LL,
+};
 
 /// Kapacita fronty z callbacku. Hlavní vlákno ji vybírá každých 20 ms;
 /// tolik událostí za tu dobu nikdo nenaťuká.
@@ -256,16 +290,198 @@ fn jen_instalace() -> ExitCode {
     }
 }
 
+/// Kolik událostí se měří (v každém režimu).
+const MERENI_N: usize = 500_000;
+/// Strop p99 ze specifikace Fáze 6 (B4).
+const MERENI_P99_NS: u64 = 20_000;
+
+/// Percentil `q` ze seřazených časů.
+fn percentil(serazene: &[u64], q: f64) -> u64 {
+    let i = ((serazene.len().saturating_sub(1)) as f64 * q).round() as usize;
+    serazene.get(i).copied().unwrap_or(0)
+}
+
+/// Virtuální klávesa, jakou by událost nesla ve skutečném callbacku:
+/// dotaz Windows na neplatnou nulu může být levnější než na skutečnou
+/// klávesu a měření by pak slibovalo víc, než platí.
+fn vk_klavesy(k: KeyId) -> u32 {
+    let scan = u32::from(k.scan) | if k.extended { 0xE000 } else { 0 };
+    // SAFETY: jen převod kódu podle rozložení klávesnice, nic nemění.
+    unsafe { MapVirtualKeyW(scan, MAPVK_VSC_TO_VK_EX) }
+}
+
+fn mereni() -> ExitCode {
+    let sloty: Result<Vec<Arc<slot::StavSlot>>, String> = (0..MAX_PADS)
+        .map(|_| slot::StavSlot::new().map(Arc::new))
+        .collect();
+    let (sloty, budik) = match (sloty, slot::Budik::new()) {
+        (Ok(s), Ok(b)) => (s, Arc::new(b)),
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("události Windows nejde vytvořit: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let sloty: [Arc<slot::StavSlot>; MAX_PADS] = std::array::from_fn(|i| Arc::clone(&sloty[i]));
+    let vystup: Arc<dyn Vystup> = Arc::new(vystup::HookVystup::new(sloty, budik));
+    // Zahřátí (cache, větvení) se nepočítá.
+    let _ = hook::zmer_zpracovani(
+        20_000,
+        Mapping::default(),
+        Arc::clone(&vystup),
+        true,
+        true,
+        vk_klavesy,
+    );
+    println!(
+        "Měření zpracování události (syntetické klávesy, hook se neinstaluje), {MERENI_N} událostí:"
+    );
+    let mut v_limitu = true;
+    // Třetí řádek jen pro rozbor: bez dotazu na stav klávesnice Windows
+    // (GetAsyncKeyState — pravidlo Win+klávesa a převzetí klávesy OS),
+    // tedy kolik stojí samotný KeyPad. Do limitu se nepočítá.
+    for (zive, stav_klavesnice, popis) in [
+        (false, true, "bez živé detekce             "),
+        (true, true, "s živou detekcí (popředí)    "),
+        (true, false, "s živou, bez GetAsyncKeyState"),
+    ] {
+        let mut casy = hook::zmer_zpracovani(
+            MERENI_N,
+            Mapping::default(),
+            Arc::clone(&vystup),
+            zive,
+            stav_klavesnice,
+            vk_klavesy,
+        );
+        casy.sort_unstable();
+        let p50 = percentil(&casy, 0.50);
+        let p99 = percentil(&casy, 0.99);
+        let p999 = percentil(&casy, 0.999);
+        let max = casy.last().copied().unwrap_or(0);
+        println!(
+            "  {popis}  p50 {p50:>6} ns   p99 {p99:>6} ns   p99,9 {p999:>7} ns   max {max:>8} ns"
+        );
+        if stav_klavesnice {
+            v_limitu &= p99 < MERENI_P99_NS;
+        }
+    }
+    if v_limitu {
+        println!("p99 pod {} µs — v pořádku", MERENI_P99_NS / 1000);
+        ExitCode::SUCCESS
+    } else {
+        println!("p99 PŘES {} µs", MERENI_P99_NS / 1000);
+        ExitCode::FAILURE
+    }
+}
+
+/// Kolikrát se hook nainstaluje a odebere v `mereni-instalace`.
+const INSTALACE_N: usize = 2_000;
+
+/// Callback měřeného hooku: nic nerozhoduje, jen předá dál.
+unsafe extern "system" fn propust(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // SAFETY: předání dalšímu hooku v řetězu se stejnými parametry.
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+/// Instalace a odebrání hooku na skryté ploše: časy v ns (instalace,
+/// odebrání) pro každé kolo. Vlákno se na plochu přesune dřív, než
+/// vytvoří jakékoli okno nebo hook (jinak `SetThreadDesktop` selže).
+fn zmer_instalace(n: usize) -> Result<Vec<(u64, u64)>, String> {
+    let jmeno = HSTRING::from(format!("KeyPadMereni{}", std::process::id()));
+    // SAFETY: nová plocha s výchozími právy; handle zůstává otevřený po
+    // celé měření (SetThreadDesktop ho potřebuje) a zavře se na konci.
+    let plocha = unsafe {
+        CreateDesktopW(
+            &jmeno,
+            None,
+            None,
+            DESKTOP_CONTROL_FLAGS(0),
+            0x1000_0000, // GENERIC_ALL
+            None,
+        )
+    }
+    .map_err(|e| format!("CreateDesktopW: {e}"))?;
+    // SAFETY: platný handle plochy; vlákno ještě nemá okna ani hooky.
+    unsafe { SetThreadDesktop(plocha) }.map_err(|e| format!("SetThreadDesktop: {e}"))?;
+    // SAFETY: modul vlastního .exe.
+    let modul = unsafe { GetModuleHandleW(None) }.map_err(|e| format!("GetModuleHandleW: {e}"))?;
+    let mut casy = Vec::with_capacity(n);
+    let mut msg = MSG::default();
+    for _ in 0..n {
+        let t0 = Instant::now();
+        // SAFETY: callback je funkce tohoto modulu a žije po celý běh.
+        let h = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(propust), Some(modul.into()), 0) }
+            .map_err(|e| format!("SetWindowsHookExW: {e}"))?;
+        let t1 = Instant::now();
+        // SAFETY: handle právě vrácený SetWindowsHookExW, odebírá se jednou.
+        let _ = unsafe { UnhookWindowsHookEx(h) };
+        let t2 = Instant::now();
+        casy.push(((t1 - t0).as_nanos() as u64, (t2 - t1).as_nanos() as u64));
+        // Vlákno s hookem má pumpovat zprávy — kdyby přece něco přišlo.
+        // SAFETY: platný ukazatel na MSG.
+        while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {}
+    }
+    // Plochu zavře až konec vlákna (je mu přiřazená); handle se zahodí
+    // s procesem. Plocha zanikne s posledním handlem a vláknem.
+    Ok(casy)
+}
+
+fn mereni_instalace() -> ExitCode {
+    let vysledek = std::thread::spawn(|| zmer_instalace(INSTALACE_N)).join();
+    let casy = match vysledek {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            eprintln!("měření nejde: {e}");
+            return ExitCode::FAILURE;
+        }
+        Err(_) => {
+            eprintln!("vlákno měření spadlo");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(
+        "Instalace a odebrání hooku klávesnice (vlastní skrytá plocha, {INSTALACE_N} kol, \
+         jen SetWindowsHookExW / UnhookWindowsHookEx):"
+    );
+    let radek = |popis: &str, mut v: Vec<u64>| {
+        v.sort_unstable();
+        println!(
+            "  {popis:<20} p50 {:>7} ns   p99 {:>7} ns   max {:>8} ns",
+            percentil(&v, 0.50),
+            percentil(&v, 0.99),
+            v.last().copied().unwrap_or(0)
+        );
+    };
+    radek("instalace", casy.iter().map(|c| c.0).collect());
+    radek("odebrání", casy.iter().map(|c| c.1).collect());
+    radek(
+        "instalace + odebrání",
+        casy.iter().map(|c| c.0 + c.1).collect(),
+    );
+    println!(
+        "Bez zapnutého ovladače: 1 instalace, když okno KeyPadu získá popředí, 1 odebrání, \
+         když ho ztratí (se schovaným oknem ani se zapnutým ovladačem žádné)."
+    );
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
     let arg = std::env::args().nth(1);
     if arg.as_deref() == Some("instalace") {
         return jen_instalace();
     }
+    if arg.as_deref() == Some("mereni") {
+        return mereni();
+    }
+    if arg.as_deref() == Some("mereni-instalace") {
+        return mereni_instalace();
+    }
     let sekund: u64 = match arg.as_deref().map(str::parse) {
         None => 60,
         Some(Ok(s)) if (1..=3600).contains(&s) => s,
         _ => {
-            eprintln!("použití: hook_selftest [sekund 1–3600 | instalace]");
+            eprintln!(
+                "použití: hook_selftest [sekund 1–3600 | instalace | mereni | mereni-instalace]"
+            );
             return ExitCode::from(2);
         }
     };

@@ -25,7 +25,7 @@ Jen Windows 10/11 x64; macOS/Linux se neřeší. UI i komentáře česky, v duch
 | `crates/core` | balíček `core`, knihovna **`keypad_core`** | jen `serde` (+ `proptest` v testech). **Žádné** `windows` / `vigem-client` / `tauri` |
 | `crates/updater` | `updater` | `windows` (WinHttp, CNG, cfgmgr32, registr — jen čtení). Kanál vydání, cesty instalace, `vigembus` (pinned instalátor + stav ovladače), `sha256` — **jediný** zdroj pravdy pro instalátor i aplikaci |
 | `crates/installer` | `installer` → `KeyPadSetup.exe` | `updater`, `windows` |
-| `src-tauri` | `keypad` → `KeyPad.exe` | `keypad-core`, `updater`, `tauri`, `windows`, `webview2-com` (jen paměť schovaného WebView, verze = ta z wry); Windows kód v `src/platform/windows/` (`hook.rs` hook klávesnice + engine, `klavesy.rs` názvy kláves, `vystup.rs` rozhodnutí enginu → sloty padů a režim okna, `slot.rs` stav padu bez zámku, `vigem.rs` vlastní klient ViGEmBus, `pad.rs` pad vlákna, `power.rs` spánek, `relace.rs` konec relace Windows, `ukonceni.rs` událost pro ukončení, `shell.rs`, `zvuk.rs` zvuk pozastavení přes WASAPI, `dll.rs` hledání DLL jen v System32) |
+| `src-tauri` | `keypad` → `KeyPad.exe` | `keypad-core`, `updater`, `tauri`, `windows`, `webview2-com` (jen paměť schovaného WebView a vypnuté zkratky prohlížeče, verze = ta z wry); `src/gamepad.rs` vlákno `keypad-okno` a příkazy okna (`gamepad/smlouva.rs` = typy smlouvy se zlatými soubory `ui/src/lib/testdata`), `src/config.rs` konfigurace a vlákno `keypad-konfig`; Windows kód v `src/platform/windows/` (`hook.rs` hook klávesnice + engine, `klavesy.rs` názvy kláves, `vystup.rs` rozhodnutí enginu → sloty padů a atomiky pro okno (režim, oznámení, živý stav, revize mapování), `slot.rs` stav padu bez zámku, `vigem.rs` vlastní klient ViGEmBus, `pad.rs` pad vlákna, `power.rs` spánek, `relace.rs` konec relace Windows, `ukonceni.rs` událost pro ukončení, `shell.rs`, `zvuk.rs` zvuk pozastavení přes WASAPI, `dll.rs` hledání DLL jen v System32) |
 | `ui/` | Svelte 5 + Vite + TypeScript | **Ne SvelteKit**, žádný router — jedno okno |
 
 - Balíček `core` má knihovnu pojmenovanou `keypad_core`: crate se jménem `core` by v závislých crates zastínil vestavěný `::core` a rozbil makra (serde derive, `format_args!`…). V `Cargo.toml` závislých crates: `keypad-core = { workspace = true }`.
@@ -36,9 +36,10 @@ Jen Windows 10/11 x64; macOS/Linux se neřeší. UI i komentáře česky, v duch
 - `Engine::new` startuje v `Disabled { PadNotConnected }` — na Klávesnici ho pustí až `enable(pad)` (připojený ovladač), na Gamepad až `capture()` (povel přepínače) nebo zkratka. Režim je zdroj pravdy (`Engine::mode()`), `UiEvent` je jen oznámení (nejvýš jedno na `Decision`).
 - Panika v hook callbacku → propustit klávesu + `reset_held(HookPanic)`, **ne** `force_keyboard` (jinak visí propuštěná klávesa v OS). Změny `crates/core` ověřuj i `PROPTEST_CASES=20000 cargo test -p core` — property test porovnává engine s nezávislým referenčním modelem.
 - GUI → backend jen přes Tauri commands; backend → GUI přes Tauri events. Z hook callbacku nikdy přímo `emit` (princip 3) — hook zapíše stav do atomik a nastaví událost Windows (`slot::Budik`), event vydá jiné vlákno (`keypad-okno`).
+- **Co smí hook callback** (a jen to): `StavSlot::zapis`; atomiky `HookVystup` (`stav`, `oznameni`, `revize`, `zive[p]` — zápis a budík jen při změně); `Budik::probud` (`SetEvent`); `GetAsyncKeyState` (jen u stisku, o kterém engine rozhoduje, `Engine::claims_new_press`, a na Win jen když ji podle callbacku Windows drží); `PostThreadMessageW` **jen** v `po_panice` do vlastní fronty. **Nesmí:** kanál, `Mutex`, alokaci ani uvolnění (drop `Box`/`Arc`), `log::`, `emit`, klon mapování. Snímek mapování pro okno klonuje jen smyčka hook vlákna na povel `Zverejni`. `callback_nealokuje` počítá alokace i uvolnění; cenu měří `hook_selftest -- mereni` (p99 pod 20 µs).
 - **Hook → pad jen přes `slot::StavSlot`** (dva atomiky s číslem zápisu + auto-reset událost), nikdy frontou crossbeamu (bere zámek sdílený s GUI a alokuje). Pad vlákno čeká na tutéž událost i kvůli příkazům — posílat mu jen přes `PadOdesilatel`/`Pady`, které ji po `send` nastaví.
 - **Každý virtuální ovladač má vlastní pad vlákno** (`Pady`, až 4, vznikají až prvním zapnutím; první hned kvůli ověření sběrnice) — `wait_ready` jednoho (až 3 s) nesmí zdržet stavy ostatních. Globální příkazy (spánek, instalátor, konec) jdou všem přes `Pady`.
-- **Hook klávesnice je v systému, jen když je zapnutý aspoň jeden ovladač** (engine mimo `Disabled`); jinak KeyPad na klávesnici nesahá. Připojení ovladače (přechod na `On`, vždy po kliknutí na přepínač) = `Povol(pad)` + `Zachytavej`; zkratka zachytávání jen pozastaví. Opakované ohlášení téhož stavu zachytávání nespouští.
+- **Hook klávesnice je v systému, jen když je zapnutý aspoň jeden ovladač** (engine mimo `Disabled`) **nebo je okno KeyPadu v popředí** (živá detekce stisků; `potreba_hooku` v `hook.rs`); jinak KeyPad na klávesnici nesahá. Popředí hlídá hook vlákno přes `EVENT_SYSTEM_FOREGROUND` (jen s viditelným oknem) a `GetAncestor(GetForegroundWindow(), GA_ROOT)` — `WindowEvent::Focused` z Tauri je fokus WebView, ne popředí. Okno jen viditelné, ale na pozadí hook nedostane (viděl by klávesy psané jinam a spolkl by Scroll Lock v celém systému). Přiřazování se přijme jen s oknem v popředí a ztráta popředí, schování okna i nepovedená instalace hooku ho zruší. Připojení ovladače (přechod na `On`, vždy po kliknutí na přepínač) = `Povol(pad)` + `Zachytavej`; zkratka zachytávání jen pozastaví. Opakované ohlášení téhož stavu zachytávání nespouští.
 - `src-tauri/capabilities/default.json` je **výčet** oprávnění, ne `core:default`. Každé nové JS API okna potřebuje své oprávnění (jinak „not allowed by ACL“); poslech událostí z backendu (Fáze 2+) = `core:event:allow-listen` + `core:event:allow-unlisten`. Vlastní příkazy aplikace oprávnění nepotřebují.
 - `tauri.conf.json` má CSP (`default-src 'self'` …) — externí URL a `data:` v release tiše selžou (dev na devUrl CSP nemá). Fonty a obrázky vždy lokálně.
 - Zavření okna KeyPad jen **schová do oznamovací oblasti** a uspí WebView (jako WinSent); ukončit jde z menu v trayi. Instalátor proto ukončuje KeyPad pojmenovanou událostí `updater::QUIT_EVENT_NAME` (uklizený konec: neutrální pad → odpojení), teprve jako záloha WM_CLOSE oknu třídy **„Tauri Window“** (pro vydání 0.1.0 bez události; kdyby se v `tauri.conf.json` nastavil `windowClassname`, upravit `crates/installer/src/proc.rs`) a nakonec `taskkill /F`.
@@ -56,7 +57,9 @@ Jen Windows 10/11 x64; macOS/Linux se neřeší. UI i komentáře česky, v duch
 - Nové závislosti přidávej přes `[workspace.dependencies]` v kořenovém `Cargo.toml`.
 - Release build aplikace **jen přes Tauri CLI** (`tools\tauri.ps1 build --no-bundle`). Holý `cargo build` vestaví jen adresu vývojového serveru — nainstalovaná aplikace by ukázala „localhost se odmítl připojit“.
 - PowerShell skripty v `tools\` musí zůstat v **UTF-8 s BOM** (PowerShell 5.1), jinak se rozsype diakritika.
-- **Zkratky KeyPadu nikdy s klávesou Win** (vlastník 30. 9.: Win+L zamyká počítač); potřebuje-li zkratka modifikátor, je to Alt. Win nejde přiřadit ani akci ovladače.
+- **Zkratky KeyPadu nikdy s klávesou Win** (vlastník 30. 9.: Win+L zamyká počítač); potřebuje-li zkratka modifikátor, je to **levý** Alt (jako volba, ROADMAP otázka 47). Win nejde mapovat, přiřadit ani použít jako zkratku (`KeyId::is_reserved`, `MappingError::Reserved`); drží-li Windows Win, každý nový stisk patří Windows (otázka 44).
+- **Konfigurace jen přes `updater::config_path()`** (`%APPDATA%\KeyPad\config.json`, JSON kvůli velikosti binárky) a zapisuje ji **jen vlákno `keypad-konfig`** (`config::Ukladac`, atomicky `.tmp` → `rename`) — nikdy hook, vlákno okna ani příkaz přímo. Soubor vzniká až první změnou; nevalidní → `config.invalid.json`; `verze` > 1 se nepřepisuje. Stav zapnutí ovladače se nikdy neukládá (princip 11). V testech jen dočasná složka (proměnná `APPDATA`), nikdy skutečný `%APPDATA%\KeyPad`.
+- **Zkratky prohlížeče ve WebView2 jsou vypnuté** (`okno::vypni_zkratky_prohlizece`, `AreBrowserAcceleratorKeysEnabled = false`; wry je má zapnuté a Tauri je nastavit neumí) — F5 a Ctrl+R by obnovily okno, Ctrl+P otevřel tisk. Okno samo navíc volá `preventDefault` na klávesy kromě Tabu (`ui/src/lib/klavesnice.ts`): mezerník je vstup A a „klikl“ by na přepínač s fokusem — připojil by ovladač (princip 11).
 - **Žádné okno přes hru v popředí** (překryv, toast, vyskakovací okno) — znamení stavu jen ikonou v oznamovací oblasti a zvukem.
 - Nejasnost ve specifikaci se nerozhoduje potichu — zapiš ji do „Otevřených otázek“ v `ROADMAP.md` (i s tím, jak to kód dělá teď).
 
@@ -71,11 +74,11 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
-# všechny brány najednou (fmt, clippy, testy, svelte-check) — před každým vydáním
+# všechny brány najednou (fmt, clippy, testy, svelte-check, bun test) — před každým vydáním (CI dělá totéž)
 powershell -ExecutionPolicy Bypass -File tools\check.ps1
 
 # frontend
-cd ui; bun install; bun run check; bun run build
+cd ui; bun install; bun run check; bun test; bun run build   # bun test = testy okna + zlaté soubory smlouvy
 
 # aplikace ve vývojovém režimu (okno + HMR)
 powershell -ExecutionPolicy Bypass -File tools\tauri.ps1 dev
@@ -99,15 +102,21 @@ powershell -ExecutionPolicy Bypass -File tools\publish.ps1
 cargo run -p keypad --release --example pad_selftest -- vse     # nebo e2e | kill | popredi | xinput
 
 # hook klávesnice bez okna (spouští VLASTNÍK: vypisuje stisky do konzole, Scroll Lock potlačí WASD…);
-# `instalace` = jen nainstalovat, přeinstalovat, odebrat — nic o klávesách nevypisuje
-cargo run -p keypad --release --example hook_selftest -- 60      # nebo instalace
+# `instalace` = jen nainstalovat, přeinstalovat, odebrat — nic o klávesách nevypisuje;
+# `mereni` = cena jedné události (syntetické klávesy, hook se neinstaluje, p99 < 20 µs);
+# `mereni-instalace` = cena instalace + odebrání hooku (na vlastní skryté ploše, otázka 42)
+cargo run -p keypad --release --example hook_selftest -- 60      # nebo instalace | mereni | mereni-instalace
+
+# okno aplikace na skryté ploše (debug build, simulovaný ovladač, CDP; ~1 min, exit 0 = OK)
+powershell -ExecutionPolicy Bypass -File tools\okno-test.ps1      # -BezBuildu, -Snimky <složka>, -Prac <složka>, -Nechat
 
 # zvuk pozastavení bez okna: `ticho` = celá cesta WASAPI s NULOVÝMI vzorky (cíl sondy podvržených DLL);
 # `pauza` / `hra` = slyšitelný dvojtón — spouští jen VLASTNÍK
 cargo run -p keypad --release --example zvuk_selftest -- ticho
 
 # aplikace bez ViGEmBus (simulace): 1 = nenainstalovaný, vypnuty = nainstalovaný a vypnutý,
-# zbytek = pozůstatek bez zařízení i záznamu v Aplikacích; bez proměnné = skutečný ovladač
+# zbytek = pozůstatek bez zařízení i záznamu v Aplikacích; pad = simulovaný připojený ovladač
+# (jen debug build); bez proměnné = skutečný ovladač
 $env:KEYPAD_BEZ_VIGEM = "1"
 # simulace staršího ViGEmBus (nabídka aktualizace); s kteroukoli z nich aplikace instalátor nespustí
 $env:KEYPAD_VIGEM_STARY = "1"
@@ -119,4 +128,6 @@ CI (`.github/workflows/build.yml`) dělá kroky 1–5 publish.ps1 (app přes `to
 
 Instalátor: `KeyPadSetup.exe` (okno; ViGEmBus nainstaluje / aktualizuje automaticky, viz princip 6; podrobnosti a kódy do `%TEMP%\KeyPadSetup.log`, okno jen krátké věty) · `/quiet` (z aplikace; ovladač také instaluje/aktualizuje; zavře se sám jen při čistém úspěchu — když se KeyPad nespustí, chybí WebView2 nebo je co hlásit, okno zůstane) · `/headless` (konzole) · `/uninstall` (`/uninstall /quiet` = sám začne i skončí; ViGEmBus nechává) · `/vigembus` (jen krok ovladače, spouští ho aplikace; `/quiet` se s ním ignoruje, `/uninstall` má přednost; exit kód podle ověřeného stavu: 0 = běží, 3010 = poběží po restartu, 1 = jinak). Ladicí přepínače jen v debug buildu: `KEYPAD_SETUP_TEST_VIGEMBUS`, `KEYPAD_SETUP_TEST_NAHLED`, `KEYPAD_SETUP_TEST_FOKUS`, `KEYPAD_SETUP_TEST_KNIHOVNY` (viz `crates/installer/src/main.rs`). **Z Git Bashe nikdy nespouštěj KeyPadSetup s lomítkovými přepínači bez `MSYS_NO_PATHCONV=1`** — MSYS z `/headless` udělá cestu a otevře se okno na ploše (stalo se); bezpečně přes PowerShell `Start-Process -ArgumentList`. Je to GUI binárka — ze skriptu `start "" /wait KeyPadSetup.exe /headless` (nebo `Start-Process -Wait -PassThru`), jinak se na ni nečeká a exit kód se ztratí. Vydání čte z `release/` v repu `iva-exe/KeyPad` (konstanty v `crates/updater/src/lib.rs`).
 
-Testování GUI: okna aplikace ani instalátoru nespouštět na ploše vlastníka a nesimulovat vstup (může mít spuštěnou hru) — na samostatné skryté ploše (`CreateDesktop` + `STARTUPINFO.lpDesktop`).
+Testování GUI: okna aplikace ani instalátoru nespouštět na ploše vlastníka a nesimulovat vstup (může mít spuštěnou hru) — na samostatné skryté ploše (`CreateDesktop` + `STARTUPINFO.lpDesktop`). Okno aplikace ověřuje **`tools\okno-test.ps1`** (PowerShell 5.1, CDP přes .NET `ClientWebSocket`, bez závislosti): debug build na skryté ploše, izolované `APPDATA`, `LOCALAPPDATA` a **`WEBVIEW2_USER_DATA_FOLDER`** (Tauri bere složku dat WebView2 ze známé složky Windows, ne z proměnné `LOCALAPPDATA` — bez ní by test psal do dat okna nainstalovaného KeyPadu; naměřeno), kliky `element.click()`, klávesy do hooku jen příkazem `test_klavesa` (klávesy psané do samotného okna — spec 1.8 — CDP `Input.dispatchKeyEvent` jen do WebView testovací instance, systémem neprojdou), před každým spuštěním kontrola, že z testovací plochy není vidět okno single-instance nainstalovaného KeyPadu (jinak exit 3, nic nespustí), konec `taskkill.exe /F /T /PID` (zavření okna ho jen schová). Exit 0 = vše prošlo; snímky okna do `-Snimky`.
+
+Ladicí proměnné **jen pro debug build**: `KEYPAD_BEZ_VIGEM=pad` = simulovaný **připojený** ovladač (zapne se, hraje, tep běží; release tuhle hodnotu bere jako „ViGEmBus chybí“), `KEYPAD_TEST_KLAVESY=1` = příkaz `test_klavesa` (syntetická klávesa do hooku stejnou funkcí jako skutečná) a hook nečte stav klávesnice, `KEYPAD_TEST_POPREDI=1` = viditelné okno platí za okno v popředí (skrytá plocha popředí nemá). Poslední dvě release nečte vůbec a příkaz `test_klavesa` v něm není. V simulaci (`KEYPAD_BEZ_VIGEM`) KeyPad nehlídá `Local\KeyPad.Ukoncit`, nespouští instalátor a nepípá.

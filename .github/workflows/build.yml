@@ -73,6 +73,14 @@ jobs:
         working-directory: ui
         run: bun run check
 
+      # Brána `uitest` z tools\check.ps1: čisté výpočty okna a tvar zlatých
+      # souborů smlouvy s backendem (ui/src/lib/testdata). Rust je hlídá
+      # v `cargo test` ze své strany, tohle z té okenní — rozjetou smlouvu
+      # tak CI chytí z obou.
+      - name: bun test
+        working-directory: ui
+        run: bun test
+
       - name: cargo fmt
         run: cargo fmt --all --check
 

@@ -12,7 +12,9 @@
 		"moduleDetection": "force",
 		"noUnusedLocals": true,
 		"noUnusedParameters": true,
-		"noFallthroughCasesInSwitch": true
+		"noFallthroughCasesInSwitch": true,
+		// Testy čtou zlaté soubory smlouvy (src/lib/testdata/*.json).
+		"resolveJsonModule": true
 	},
 	"include": ["src/**/*.ts", "src/**/*.svelte", "vite.config.ts", "svelte.config.js"]
 }

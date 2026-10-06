@@ -1,0 +1,6 @@
+{
+	"rezim": "binding",
+	"seq": 42,
+	"cil": { "pad": 1, "vstup": "a" },
+	"hook_chyba": false
+}

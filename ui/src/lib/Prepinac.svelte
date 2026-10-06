@@ -1,19 +1,23 @@
 <script lang="ts">
+	import { prehraj } from './motion';
+
 	// Přepínač zapnuto / vypnuto (role switch). Jen vzhled a ovládání
 	// — co přepnutí udělá, řeší volající. „Omezit pohyb" ve Windows
-	// vypne posun jezdce (pravidlo v app.css).
+	// vypne posun jezdce i pulz (pravidlo v app.css).
 
 	interface Props {
 		zapnuto: boolean;
 		zakazano?: boolean;
 		/** Čeká na odpověď backendu — jezdec už stojí, kam uživatel chtěl. */
 		ceka?: boolean;
+		/** Každá nová hodnota přepínačem jednou pulzne („nejdřív zapni ovladač"). */
+		pulz?: number;
 		popis: string;
 		title?: string;
 		onprepni: () => void;
 	}
 
-	let { zapnuto, zakazano = false, ceka = false, popis, title, onprepni }: Props = $props();
+	let { zapnuto, zakazano = false, ceka = false, pulz = 0, popis, title, onprepni }: Props = $props();
 </script>
 
 <button
@@ -26,6 +30,7 @@
 	{title}
 	disabled={zakazano}
 	onclick={onprepni}
+	use:prehraj={{ trida: 'kp-pulz-jednou', id: pulz }}
 >
 	<span class="jezdec"></span>
 </button>

@@ -8,7 +8,9 @@
 //! - [`Engine`] — stavový automat: událost klávesnice → [`Decision`]
 //!   (potlačit? nové stavy ovladačů? oznámení pro okno?),
 //! - [`PadState`] + [`compute_pad_state`] — stav Xbox ovladače jako čistá
-//!   funkce držených kláves; [`PadUpdates`] — které ovladače poslat.
+//!   funkce držených kláves; [`PadUpdates`] — které ovladače poslat,
+//! - [`LiveInputs`] / [`ActionSet`] — živý stav vstupů pro okno (jedno
+//!   `u32`, ať projde atomikem z hook callbacku).
 //!
 //! Tenhle crate nesmí záviset na `windows`, `vigem-client` ani `tauri`
 //! (princip 4) — hlídá to CI. Díky tomu jde celé rozhodování otestovat
@@ -20,13 +22,15 @@ mod key;
 mod mapping;
 mod pad_state;
 
-pub use action::{Action, InvalidPadId, PadAction, PadButton, PadId, StickDir, MAX_PADS};
+pub use action::{
+    Action, ActionSet, InvalidPadId, PadAction, PadButton, PadId, StickDir, MAX_PADS,
+};
 pub use engine::{
-    BindingCancel, BindingReject, Decision, DisabledReason, Engine, ForceReason, HeldKey, Mode,
-    ModeCause, Owner, ToggleReject, UiEvent, BINDING_TIMEOUT_MS, STALE_KEY_MS,
+    BindKind, BindingCancel, BindingReject, Decision, DisabledReason, Engine, ForceReason, HeldKey,
+    Mode, ModeCause, Owner, ToggleReject, UiEvent, BINDING_TIMEOUT_MS, STALE_KEY_MS,
 };
 pub use key::KeyId;
-pub use mapping::{Mapping, MappingError};
+pub use mapping::{Mapping, MappingError, Rebind};
 pub use pad_state::{
-    compute_pad_state, PadState, PadUpdates, AXIS_DIAGONAL, AXIS_MAX, TRIGGER_MAX,
+    compute_pad_state, LiveInputs, PadState, PadUpdates, AXIS_DIAGONAL, AXIS_MAX, TRIGGER_MAX,
 };

@@ -47,6 +47,12 @@ $all = @(
     [pscustomobject]@{ Name = 'ui'; Dir = $ui; Exe = 'bun'
         Args = @('run', 'check')
         Hint = 'svelte-check našel chybu v typech nebo v šabloně (výpis výš).' }
+    # Testy okna (vestavěný `bun test`, bez závislosti navíc): čisté
+    # výpočty okna a tvar zlatých souborů smlouvy s backendem
+    # (ui/src/lib/testdata) — rozjetou smlouvu chytí dřív než okno.
+    [pscustomobject]@{ Name = 'uitest'; Dir = $ui; Exe = 'bun'
+        Args = @('test')
+        Hint = 'Selhaný test okna je vypsaný výš (ui/src/lib/*.test.ts).' }
 )
 
 if ($Only) {

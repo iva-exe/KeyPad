@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::action::{Action, PadButton, PadId, StickDir, MAX_PADS};
+use crate::action::{Action, ActionSet, PadAction, PadButton, PadId, StickDir, MAX_PADS};
 
 /// Plná výchylka na ose.
 pub const AXIS_MAX: i16 = 32_767;
@@ -63,6 +63,131 @@ impl PadState {
 
     pub fn is_pressed(&self, button: PadButton) -> bool {
         self.buttons & button.mask() != 0
+    }
+
+    /// Vstupy, které hra v tomhle stavu opravdu dostává: stisknutá
+    /// tlačítka, trigger > 0 a směr každé vychýlené osy podle znaménka.
+    ///
+    /// Okno podle toho svítí čepičky „naplno" — ze stavu, který jde do
+    /// ViGEm, ne z držených kláves: u A+D hra dostává jen vítěze SOCD
+    /// a poražený směr má svítit jen obrysem.
+    pub fn active_inputs(&self) -> ActionSet {
+        let mut s = ActionSet::EMPTY;
+        for b in PadButton::ALL {
+            if self.is_pressed(b) {
+                s.insert(Action::Button(b));
+            }
+        }
+        if self.left_trigger > 0 {
+            s.insert(Action::LeftTrigger);
+        }
+        if self.right_trigger > 0 {
+            s.insert(Action::RightTrigger);
+        }
+        let osy = [
+            (
+                self.thumb_lx,
+                Action::LeftStick(StickDir::Left),
+                Action::LeftStick(StickDir::Right),
+            ),
+            (
+                self.thumb_ly,
+                Action::LeftStick(StickDir::Down),
+                Action::LeftStick(StickDir::Up),
+            ),
+            (
+                self.thumb_rx,
+                Action::RightStick(StickDir::Left),
+                Action::RightStick(StickDir::Right),
+            ),
+            (
+                self.thumb_ry,
+                Action::RightStick(StickDir::Down),
+                Action::RightStick(StickDir::Up),
+            ),
+        ];
+        for (v, zaporny, kladny) in osy {
+            if v > 0 {
+                s.insert(kladny);
+            } else if v < 0 {
+                s.insert(zaporny);
+            }
+        }
+        s
+    }
+}
+
+/// Fyzicky držené vstupy jednoho ovladače pro okno (živá detekce).
+///
+/// Bity 0–23 = [`ActionSet`] držených vstupů (i poražený směr SOCD);
+/// 24–25 LX, 26–27 LY, 28–29 RX, 30–31 RY jako znaménko výchylky po SOCD
+/// (00 = 0, 01 = +1, 10 = −1; kladné Y = nahoru jako v XInputu).
+///
+/// Jedno `u32`: počítá se v hook callbacku a do okna jde přes atomik
+/// (princip 3) — žádná alokace, žádný zámek.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct LiveInputs(u32);
+
+impl LiveInputs {
+    pub const EMPTY: LiveInputs = LiveInputs(0);
+
+    /// Držené vstupy a výchylky páček (každá složka −1, 0 nebo 1; jiná
+    /// hodnota se bere podle znaménka).
+    pub fn new(held: ActionSet, left: (i8, i8), right: (i8, i8)) -> LiveInputs {
+        LiveInputs(
+            held.bits()
+                | axis_bits(left.0) << 24
+                | axis_bits(left.1) << 26
+                | axis_bits(right.0) << 28
+                | axis_bits(right.1) << 30,
+        )
+    }
+
+    /// Fyzicky držené vstupy (včetně poraženého směru SOCD).
+    pub fn held(self) -> ActionSet {
+        ActionSet::from_bits(self.0)
+    }
+
+    /// Levá páčka po SOCD jako (x, y) ∈ {−1, 0, 1}², kladné y = nahoru.
+    pub fn left_stick(self) -> (i8, i8) {
+        (self.axis(24), self.axis(26))
+    }
+
+    /// Pravá páčka, stejně jako [`LiveInputs::left_stick`].
+    pub fn right_stick(self) -> (i8, i8) {
+        (self.axis(28), self.axis(30))
+    }
+
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// Z bitů (např. z atomiku). Neplatná dvojice bitů osy (11) se bere
+    /// jako 0 a zahodí — stejný význam má pak i stejnou hodnotu.
+    pub fn from_bits(bits: u32) -> LiveInputs {
+        let mut b = bits;
+        for shift in [24, 26, 28, 30] {
+            if (b >> shift) & 0b11 == 0b11 {
+                b &= !(0b11 << shift);
+            }
+        }
+        LiveInputs(b)
+    }
+
+    fn axis(self, shift: u32) -> i8 {
+        match (self.0 >> shift) & 0b11 {
+            0b01 => 1,
+            0b10 => -1,
+            _ => 0,
+        }
+    }
+}
+
+fn axis_bits(v: i8) -> u32 {
+    match v.signum() {
+        1 => 0b01,
+        -1 => 0b10,
+        _ => 0,
     }
 }
 
@@ -122,7 +247,7 @@ impl PadUpdates {
 }
 
 /// Nejnovější stisk každého ze čtyř směrů jedné páčky.
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct StickPresses {
     up: Option<u64>,
     down: Option<u64>,
@@ -142,12 +267,16 @@ impl StickPresses {
         *slot = Some(slot.map_or(seq, |s| s.max(seq)));
     }
 
-    /// Výchylka páčky jako (x, y).
-    fn value(&self) -> (i16, i16) {
-        let x = socd(self.left, self.right);
+    /// Směr páčky po SOCD jako (x, y) ∈ {−1, 0, 1}².
+    fn signs(&self) -> (i8, i8) {
         // **V XInput je kladné Y NAHORU** (obráceně než souřadnice
         // obrazovky): W = Up = +Y.
-        let y = socd(self.down, self.up);
+        (socd(self.left, self.right), socd(self.down, self.up))
+    }
+
+    /// Výchylka páčky jako (x, y).
+    fn value(&self) -> (i16, i16) {
+        let (x, y) = self.signs();
         let mag = if x != 0 && y != 0 {
             AXIS_DIAGONAL
         } else {
@@ -216,6 +345,31 @@ where
     (state.thumb_lx, state.thumb_ly) = left.value();
     (state.thumb_rx, state.thumb_ry) = right.value();
     state
+}
+
+/// Živý stav všech ovladačů z držených kláves: cíl každé klávesy a pořadí
+/// jejího stisku. Jeden průchod a SOCD stejně jako [`compute_pad_state`]
+/// (hlavička páčky v okně ukazuje totéž, co by dostala hra).
+///
+/// Pevná pole, nic nealokuje — volá se z hook callbacku.
+pub(crate) fn live_from(it: impl Iterator<Item = (PadAction, u64)>) -> [LiveInputs; MAX_PADS] {
+    let mut held = [ActionSet::EMPTY; MAX_PADS];
+    let mut left = [StickPresses::default(); MAX_PADS];
+    let mut right = [StickPresses::default(); MAX_PADS];
+    for (t, seq) in it {
+        let p = t.pad.index();
+        held[p].insert(t.action);
+        match t.action {
+            Action::LeftStick(dir) => left[p].press(dir, seq),
+            Action::RightStick(dir) => right[p].press(dir, seq),
+            Action::Button(_) | Action::LeftTrigger | Action::RightTrigger => {}
+        }
+    }
+    let mut out = [LiveInputs::EMPTY; MAX_PADS];
+    for (p, o) in out.iter_mut().enumerate() {
+        *o = LiveInputs::new(held[p], left[p].signs(), right[p].signs());
+    }
+    out
 }
 
 #[cfg(test)]
@@ -339,6 +493,174 @@ mod tests {
             vec![(PadId::FIRST, stav_a()), (PadId::ALL[2], PadState::NEUTRAL)],
             "vzestupně podle ovladače"
         );
+    }
+
+    #[test]
+    fn aktivni_vstupy_neutralu_jsou_prazdne() {
+        assert_eq!(PadState::NEUTRAL.active_inputs(), ActionSet::EMPTY);
+    }
+
+    #[test]
+    fn aktivni_vstupy_tlacitka_triggery_a_osy() {
+        // Každé tlačítko samo.
+        for b in PadButton::ALL {
+            let s = compute_pad_state([(Action::Button(b), 1)]);
+            assert_eq!(
+                s.active_inputs().iter().collect::<Vec<_>>(),
+                vec![Action::Button(b)],
+                "{b:?}"
+            );
+        }
+        // Všechna tlačítka a oba triggery najednou.
+        let vse = PadState {
+            buttons: PadButton::ALL.iter().fold(0, |m, b| m | b.mask()),
+            left_trigger: 1,
+            right_trigger: TRIGGER_MAX,
+            ..PadState::NEUTRAL
+        };
+        let a = vse.active_inputs();
+        for b in PadButton::ALL {
+            assert!(a.contains(Action::Button(b)), "{b:?}");
+        }
+        assert!(a.contains(Action::LeftTrigger) && a.contains(Action::RightTrigger));
+        assert_eq!(a.iter().count(), 16);
+        // Každý směr obou páček podle znaménka osy (i diagonála a i malá
+        // výchylka), protilehlý směr ne.
+        for (dir, opak) in [(Up, Down), (Down, Up), (Left, Right), (Right, Left)] {
+            for (packa, f) in [
+                (true, Action::LeftStick as fn(StickDir) -> Action),
+                (false, Action::RightStick as fn(StickDir) -> Action),
+            ] {
+                let s = compute_pad_state([(f(dir), 1)]);
+                let a = s.active_inputs();
+                assert_eq!(
+                    a.iter().collect::<Vec<_>>(),
+                    vec![f(dir)],
+                    "{dir:?} {packa}"
+                );
+                assert!(!a.contains(f(opak)));
+            }
+        }
+        let diag = compute_pad_state([(ls(Down), 1), (ls(Left), 2)]).active_inputs();
+        assert_eq!(diag.iter().collect::<Vec<_>>(), vec![ls(Down), ls(Left)]);
+        let maly = PadState {
+            thumb_rx: -1,
+            thumb_ly: 1,
+            ..PadState::NEUTRAL
+        };
+        assert_eq!(
+            maly.active_inputs().iter().collect::<Vec<_>>(),
+            vec![ls(Up), Action::RightStick(Left)]
+        );
+    }
+
+    #[test]
+    fn aktivni_vstupy_jen_vitez_socd() {
+        // A pak D: hra dostává jen vpravo.
+        let s = compute_pad_state([(ls(Left), 1), (ls(Right), 2)]);
+        assert_eq!(
+            s.active_inputs().iter().collect::<Vec<_>>(),
+            vec![ls(Right)]
+        );
+    }
+
+    #[test]
+    fn zivy_stav_bity() {
+        let mut held = ActionSet::EMPTY;
+        held.insert(ls(Left));
+        held.insert(ls(Right));
+        held.insert(Action::Button(PadButton::A));
+        let z = LiveInputs::new(held, (1, -1), (-1, 0));
+        assert_eq!(z.held(), held);
+        assert_eq!(z.left_stick(), (1, -1));
+        assert_eq!(z.right_stick(), (-1, 0));
+        assert_eq!(
+            z.bits(),
+            held.bits() | 0b01 << 24 | 0b10 << 26 | 0b10 << 28,
+            "rozložení bitů je smlouva s oknem"
+        );
+        assert_eq!(LiveInputs::from_bits(z.bits()), z);
+        assert_eq!(
+            LiveInputs::new(ActionSet::EMPTY, (0, 0), (0, 0)),
+            LiveInputs::EMPTY
+        );
+        assert_eq!(LiveInputs::default(), LiveInputs::EMPTY);
+        // Velikost složky nehraje roli, jen znaménko.
+        assert_eq!(
+            LiveInputs::new(ActionSet::EMPTY, (5, -128), (127, 0)),
+            LiveInputs::new(ActionSet::EMPTY, (1, -1), (1, 0))
+        );
+        // Neplatná dvojice 11 je 0 a hodnota se srovná.
+        let spatne = LiveInputs::from_bits(0b11 << 24 | 0b01 << 26);
+        assert_eq!(spatne.left_stick(), (0, 1));
+        assert_eq!(spatne, LiveInputs::new(ActionSet::EMPTY, (0, 1), (0, 0)));
+        for b in [0, u32::MAX, 0x5555_5555, 0xAAAA_AAAA] {
+            let z = LiveInputs::from_bits(b);
+            assert_eq!(LiveInputs::from_bits(z.bits()), z, "{b:#x}");
+            assert_eq!(
+                LiveInputs::new(z.held(), z.left_stick(), z.right_stick()),
+                z
+            );
+        }
+    }
+
+    #[test]
+    fn zivy_stav_z_drzenych_klaves() {
+        let p0 = |a| PadAction::new(PadId::FIRST, a);
+        let p1 = |a| PadAction::new(PadId::ALL[1], a);
+        // A (seq 1) a D (seq 2) na prvním: drží oba, páčka vpravo. Na
+        // druhém W a pravá páčka dolů a tlačítko — každý ovladač zvlášť.
+        let z = live_from(
+            [
+                (p0(ls(Left)), 1),
+                (p1(ls(Up)), 3),
+                (p0(ls(Right)), 2),
+                (p1(Action::RightStick(Down)), 4),
+                (p1(Action::Button(PadButton::Y)), 5),
+                (p0(Action::LeftTrigger), 6),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(
+            z[0].held().iter().collect::<Vec<_>>(),
+            vec![ls(Left), ls(Right), Action::LeftTrigger]
+        );
+        assert_eq!(z[0].left_stick(), (1, 0), "vyhrává D");
+        assert_eq!(z[0].right_stick(), (0, 0));
+        assert_eq!(
+            z[1].held().iter().collect::<Vec<_>>(),
+            vec![
+                ls(Up),
+                Action::RightStick(Down),
+                Action::Button(PadButton::Y)
+            ]
+        );
+        assert_eq!(z[1].left_stick(), (0, 1));
+        assert_eq!(z[1].right_stick(), (0, -1));
+        assert_eq!(z[2], LiveInputs::EMPTY);
+        assert_eq!(z[3], LiveInputs::EMPTY);
+        // Opačné pořadí stisků: vlevo. Pořadí ve vstupu nehraje roli.
+        let z = live_from([(p0(ls(Right)), 2), (p0(ls(Left)), 7)].into_iter());
+        assert_eq!(z[0].left_stick(), (-1, 0));
+        assert_eq!(live_from(std::iter::empty()), [LiveInputs::EMPTY; MAX_PADS]);
+    }
+
+    #[test]
+    fn zivy_stav_souhlasi_se_stavem_padu() {
+        // Hlavička páčky v okně ukazuje totéž co hra: znaménka os živého
+        // stavu = znaménka compute_pad_state ze stejných kláves.
+        let drzene = [
+            (ls(Up), 4),
+            (ls(Down), 9),
+            (ls(Right), 2),
+            (Action::RightStick(Left), 5),
+            (Action::RightStick(Right), 5),
+        ];
+        let s = compute_pad_state(drzene);
+        let z = live_from(drzene.into_iter().map(|(a, q)| (PadAction::first(a), q)));
+        let sg = |v: i16| v.signum() as i8;
+        assert_eq!(z[0].left_stick(), (sg(s.thumb_lx), sg(s.thumb_ly)));
+        assert_eq!(z[0].right_stick(), (sg(s.thumb_rx), sg(s.thumb_ry)));
     }
 
     #[test]

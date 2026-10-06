@@ -11,6 +11,7 @@
 // vidět výchozí výpis paniky a výstup Tauri.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod config;
 mod gamepad;
 mod logger;
 mod okno;
@@ -308,13 +309,24 @@ fn main() {
             update::check_update,
             update::run_update,
             gamepad::pad_status,
+            gamepad::pady,
             gamepad::rezim,
+            gamepad::klavesy,
+            gamepad::zive,
+            gamepad::prirad,
+            gamepad::zrus_prirazeni,
+            gamepad::uprav_klavesy,
+            gamepad::odeber_ovladac,
             gamepad::pad_on,
             gamepad::pad_off,
             gamepad::pad_test,
             gamepad::pad_retry,
             gamepad::install_vigembus,
-            gamepad::open_link
+            gamepad::open_link,
+            // Syntetická klávesa pro test okna na skryté ploše — release
+            // ten příkaz nemá vůbec.
+            #[cfg(debug_assertions)]
+            gamepad::test_klavesa
         ])
         .setup(|app| {
             // Okna z konfigurace Tauri vytváří těsně před tímhle voláním,
@@ -346,9 +358,14 @@ fn main() {
             // Blur na Windows 10, Mica na Windows 11 (tažení okna bez
             // zadrhávání) — proto ne pevně v tauri.conf.json.
             okno::nastav_pozadi(&w);
+            // F5, Ctrl+R, Ctrl+P… — okno je aplikace, ne prohlížeč (spec 1.8).
+            okno::vypni_zkratky_prohlizece(&w);
+            // Klávesy a ✓ Zvuk z %APPDATA%\KeyPad\config.json (Fáze 6/7).
+            // Načtení nic nezapisuje; soubor vzniká až první změnou.
+            let nacteno = config::nacti_z(updater::config_path().as_deref());
             // Ikona dřív než pad: bez ní se zavřením okna aplikace
             // ukončí (viz `tray::schovavat`) — nikdy neviditelný proces.
-            if let Err(e) = tray::nastav(app) {
+            if let Err(e) = tray::nastav(app, nacteno.konfigurace.zvuk) {
                 log::error!(
                     "ikona v oznamovací oblasti nejde vytvořit: {e} — zavření okna KeyPad ukončí"
                 );
@@ -357,26 +374,36 @@ fn main() {
             // až přepínač v okně (Fáze 2b). Stav jde do okna událostí
             // `pad-stav`, režim událostí `rezim`. Hook klávesnice se
             // nainstaluje až se zapnutým ovladačem (Fáze 4).
-            if let Err(e) = gamepad::spust(app) {
+            if let Err(e) = gamepad::spust(app, nacteno) {
                 nespusteno(
                     &format!("virtuální ovladače nejde připravit: {e}"),
-                    "KeyPad se nepodařilo spustit — Windows nedaly prostředky pro                      virtuální ovladač.
-
-Zkus to znovu, případně po restartu počítače.
-
+                    "KeyPad se nepodařilo spustit — Windows nedaly prostředky pro \
+                     virtuální ovladač.\n\n\
+                     Zkus to znovu, případně po restartu počítače.\n\n\
                      Podrobnosti jsou v logu (keypad.log).",
                 );
             }
-            let handle = app.handle().clone();
-            let ukonceni = platform::windows::ukonceni::hlidej(move || {
-                // Stejná cesta jako „Ukončit" v nabídce: na hlavním vlákně.
-                let h = handle.clone();
-                let _ = handle.run_on_main_thread(move || {
-                    tray::ukonci(&h, "instalátor");
+            // Okno je po startu vidět (tauri.conf.json): hook dostane jeho
+            // HWND a hlídá popředí (živé klávesy, Fáze 6).
+            let videt = w.is_visible().unwrap_or(true) && !w.is_minimized().unwrap_or(false);
+            gamepad::okno_videt(app.handle(), videt);
+            if gamepad::simulace(app.handle()) {
+                // Testovací instance (KEYPAD_BEZ_VIGEM) běží vedle
+                // nainstalovaného KeyPadu vlastníka: pojmenovaná událost
+                // ukončení je sdílená (auto-reset) a patří jemu.
+                log::warn!("simulace ViGEmBus — ukončení z instalátoru se nehlídá");
+            } else {
+                let handle = app.handle().clone();
+                let ukonceni = platform::windows::ukonceni::hlidej(move || {
+                    // Stejná cesta jako „Ukončit" v nabídce: na hlavním vlákně.
+                    let h = handle.clone();
+                    let _ = handle.run_on_main_thread(move || {
+                        tray::ukonci(&h, "instalátor");
+                    });
                 });
-            });
-            if let Err(e) = ukonceni {
-                log::error!("{e} — instalátor KeyPad při aktualizaci ukončí natvrdo");
+                if let Err(e) = ukonceni {
+                    log::error!("{e} — instalátor KeyPad při aktualizaci ukončí natvrdo");
+                }
             }
             let handle = app.handle().clone();
             let relace = platform::windows::relace::hlidej(move |duvod| {
@@ -399,16 +426,24 @@ Zkus to znovu, případně po restartu počítače.
             }
             Ok(())
         })
-        .on_window_event(|window, udalost| {
+        .on_window_event(|window, udalost| match udalost {
             // Zavření okna (křížek, Alt+F4, WM_CLOSE) = schovat do
             // oznamovací oblasti; pad (zapnutý i vypnutý) a aplikace
             // běží dál. Jen hlavní okno a jen když je kam ho schovat.
-            if let tauri::WindowEvent::CloseRequested { api, .. } = udalost {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
                 if window.label() == "main" && tray::schovavat() {
                     api.prevent_close();
                     tray::schovej(window);
                 }
             }
+            // Minimalizace a obnovení chodí jako změna velikosti (WM_SIZE):
+            // minimalizované okno živé klávesy neukazuje ani nepřiřazuje.
+            tauri::WindowEvent::Resized(_) if window.label() == "main" => {
+                let videt =
+                    window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(false);
+                gamepad::okno_videt(window.app_handle(), videt);
+            }
+            _ => {}
         })
         .build(tauri::generate_context!());
 
@@ -453,8 +488,9 @@ Zkus to znovu, případně po restartu počítače.
     });
 }
 
-/// Počítadlo alokací pro testy: callback hooku nesmí alokovat
-/// (princip 3) a test to musí umět dokázat, ne jen tvrdit.
+/// Počítadlo alokací pro testy: callback hooku nesmí alokovat ani
+/// uvolňovat (princip 3; uvolnění = drop `Box`/`Arc`, taky volání
+/// alokátoru se zámkem haldy) a test to musí umět dokázat, ne jen tvrdit.
 ///
 /// Počítá se po vláknech — testy běží souběžně a cizí alokace by se
 /// jinak započítaly. `thread_local!` s `const` a bez destruktoru sám
@@ -485,6 +521,7 @@ mod testy_alokace {
             unsafe { System.realloc(ptr, l, n) }
         }
         unsafe fn dealloc(&self, ptr: *mut u8, l: Layout) {
+            let _ = POCET.try_with(|p| p.set(p.get() + 1));
             unsafe { System.dealloc(ptr, l) }
         }
     }
@@ -492,7 +529,7 @@ mod testy_alokace {
     #[global_allocator]
     static ALOKATOR: Pocitadlo = Pocitadlo;
 
-    /// Alokace na tomhle vlákně od jeho startu.
+    /// Alokace a uvolnění na tomhle vlákně od jeho startu.
     pub fn pocet() -> u64 {
         POCET.with(Cell::get)
     }
@@ -503,6 +540,7 @@ mod testy_alokace {
         let v = std::hint::black_box(vec![1u8; 16]);
         assert_eq!(pocet(), pred + 1);
         drop(v);
+        assert_eq!(pocet(), pred + 2, "i uvolnění");
     }
 }
 

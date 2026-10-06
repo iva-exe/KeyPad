@@ -1,0 +1,341 @@
+{
+	"rev": 12,
+	"vstupy": [
+		"ls_up",
+		"ls_down",
+		"ls_left",
+		"ls_right",
+		"rs_up",
+		"rs_down",
+		"rs_left",
+		"rs_right",
+		"a",
+		"b",
+		"x",
+		"y",
+		"lb",
+		"rb",
+		"l3",
+		"r3",
+		"start",
+		"back",
+		"dpad_up",
+		"dpad_down",
+		"dpad_left",
+		"dpad_right",
+		"lt",
+		"rt"
+	],
+	"zkratka": {
+		"scan": 70,
+		"e0": false,
+		"nazev": "Scroll Lock",
+		"kratky": "Scrol"
+	},
+	"vazby": [
+		{
+			"pad": 0,
+			"vstup": "lt",
+			"klavesa": {
+				"scan": 2,
+				"e0": false,
+				"nazev": "+",
+				"kratky": "+"
+			}
+		},
+		{
+			"pad": 0,
+			"vstup": "rt",
+			"klavesa": {
+				"scan": 4,
+				"e0": false,
+				"nazev": "š",
+				"kratky": "š"
+			}
+		},
+		{
+			"pad": 0,
+			"vstup": "back",
+			"klavesa": {
+				"scan": 14,
+				"e0": false,
+				"nazev": "Backspace",
+				"kratky": "⌫"
+			}
+		},
+		{
+			"pad": 0,
+			"vstup": "lb",
+			"klavesa": {
+				"scan": 16,
+				"e0": false,
+				"nazev": "Q",
+				"kratky": "Q"
+			}
+		},
+		{
+			"pad": 0,
+			"vstup": "ls_up",
+			"klavesa": {
+				"scan": 17,
+				"e0": false,
+				"nazev": "W",
+				"kratky": "W"
+			}
+		},
+		{
+			"pad": 0,
+			"vstup": "rb",
+			"klavesa": {
+				"scan": 18,
+				"e0": false,
+				"nazev": "E",
+				"kratky": "E"
+			}
+		},
+		{
+			"pad": 0,
+			"vstup": "y",
+			"klavesa": {
+				"scan": 19,
+				"e0": false,
+				"nazev": "R",
+				"kratky": "R"
+			}
+		},
+		{
+			"pad": 0,
+			"vstup": "dpad_up",
+			"klavesa": {
+				"scan": 23,
+				"e0": false,
+				"nazev": "I",
+				"kratky": "I"
+			}
+		},
+		{
+			"pad": 0,
+			"vstup": "start",
+			"klavesa": {
+				"scan": 28,
+				"e0": false,
+				"nazev": "Enter",
+				"kratky": "↵"
+			}
+		},
+		{
+			"pad": 0,
+			"vstup": "ls_left",
+			"klavesa": {
+				"scan": 30,
+				"e0": false,
+				"nazev": "A",
+				"kratky": "A"
+			}
+		},
+		{
+			"pad": 0,
+			"vstup": "ls_down",
+			"klavesa": {
+				"scan": 31,
+				"e0": false,
+				"nazev": "S",
+				"kratky": "S"
+			}
+		},
+		{
+			"pad": 0,
+			"vstup": "ls_right",
+			"klavesa": {
+				"scan": 32,
+				"e0": false,
+				"nazev": "D",
+				"kratky": "D"
+			}
+		},
+		{
+			"pad": 0,
+			"vstup": "x",
+			"klavesa": {
+				"scan": 33,
+				"e0": false,
+				"nazev": "F",
+				"kratky": "F"
+			}
+		},
+		{
+			"pad": 0,
+			"vstup": "dpad_left",
+			"klavesa": {
+				"scan": 36,
+				"e0": false,
+				"nazev": "J",
+				"kratky": "J"
+			}
+		},
+		{
+			"pad": 0,
+			"vstup": "dpad_down",
+			"klavesa": {
+				"scan": 37,
+				"e0": false,
+				"nazev": "K",
+				"kratky": "K"
+			}
+		},
+		{
+			"pad": 0,
+			"vstup": "dpad_right",
+			"klavesa": {
+				"scan": 38,
+				"e0": false,
+				"nazev": "L",
+				"kratky": "L"
+			}
+		},
+		{
+			"pad": 0,
+			"vstup": "l3",
+			"klavesa": {
+				"scan": 42,
+				"e0": false,
+				"nazev": "Shift",
+				"kratky": "⇧"
+			}
+		},
+		{
+			"pad": 0,
+			"vstup": "b",
+			"klavesa": {
+				"scan": 46,
+				"e0": false,
+				"nazev": "C",
+				"kratky": "C"
+			}
+		},
+		{
+			"pad": 0,
+			"vstup": "r3",
+			"klavesa": {
+				"scan": 47,
+				"e0": false,
+				"nazev": "V",
+				"kratky": "V"
+			}
+		},
+		{
+			"pad": 0,
+			"vstup": "lb",
+			"klavesa": {
+				"scan": 56,
+				"e0": false,
+				"nazev": "Alt",
+				"kratky": "Alt"
+			}
+		},
+		{
+			"pad": 0,
+			"vstup": "a",
+			"klavesa": {
+				"scan": 57,
+				"e0": false,
+				"nazev": "Mezerník",
+				"kratky": "␣"
+			}
+		},
+		{
+			"pad": 1,
+			"vstup": "ls_up",
+			"klavesa": {
+				"scan": 72,
+				"e0": false,
+				"nazev": "Num 8",
+				"kratky": "Num 8"
+			}
+		},
+		{
+			"pad": 1,
+			"vstup": "ls_left",
+			"klavesa": {
+				"scan": 75,
+				"e0": false,
+				"nazev": "Num 4",
+				"kratky": "Num 4"
+			}
+		},
+		{
+			"pad": 1,
+			"vstup": "ls_down",
+			"klavesa": {
+				"scan": 76,
+				"e0": false,
+				"nazev": "Num 5",
+				"kratky": "Num 5"
+			}
+		},
+		{
+			"pad": 1,
+			"vstup": "ls_right",
+			"klavesa": {
+				"scan": 77,
+				"e0": false,
+				"nazev": "Num 6",
+				"kratky": "Num 6"
+			}
+		},
+		{
+			"pad": 1,
+			"vstup": "a",
+			"klavesa": {
+				"scan": 82,
+				"e0": false,
+				"nazev": "Num 0",
+				"kratky": "Num 0"
+			}
+		},
+		{
+			"pad": 0,
+			"vstup": "rs_up",
+			"klavesa": {
+				"scan": 72,
+				"e0": true,
+				"nazev": "Šipka nahoru",
+				"kratky": "↑"
+			}
+		},
+		{
+			"pad": 0,
+			"vstup": "rs_left",
+			"klavesa": {
+				"scan": 75,
+				"e0": true,
+				"nazev": "Šipka vlevo",
+				"kratky": "←"
+			}
+		},
+		{
+			"pad": 0,
+			"vstup": "rs_right",
+			"klavesa": {
+				"scan": 77,
+				"e0": true,
+				"nazev": "Šipka vpravo",
+				"kratky": "→"
+			}
+		},
+		{
+			"pad": 0,
+			"vstup": "rs_down",
+			"klavesa": {
+				"scan": 80,
+				"e0": true,
+				"nazev": "Šipka dolů",
+				"kratky": "↓"
+			}
+		}
+	],
+	"zpet": true,
+	"konfigurace": "ok",
+	"zaloha": null,
+	"chyby": []
+}

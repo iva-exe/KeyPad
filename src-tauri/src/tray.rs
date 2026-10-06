@@ -84,18 +84,12 @@ impl Oblast {
 }
 
 /// Ikona v oznamovací oblasti: levý klik otevře okno, pravý nabídku.
-pub fn nastav(app: &tauri::App) -> tauri::Result<()> {
+/// `zvuk` = zaškrtnutí „Zvuk" z uložené konfigurace.
+pub fn nastav(app: &tauri::App, zvuk: bool) -> tauri::Result<()> {
     let otevrit = MenuItem::with_id(app, "otevrit", "Otevřít KeyPad", true, None::<&str>)?;
     // Bez zapnutého ovladače není co pozastavit — povolí ji až hra.
     let pauza = MenuItem::with_id(app, "pauza", TEXT_POZASTAVIT, false, None::<&str>)?;
-    let zvuk = CheckMenuItem::with_id(
-        app,
-        "zvuk",
-        "Zvuk",
-        true,
-        crate::gamepad::ZVUK_VYCHOZI,
-        None::<&str>,
-    )?;
+    let zvuk = CheckMenuItem::with_id(app, "zvuk", "Zvuk", true, zvuk, None::<&str>)?;
     let oddelovac = PredefinedMenuItem::separator(app)?;
     let ukoncit = MenuItem::with_id(app, "ukoncit", "Ukončit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&otevrit, &pauza, &zvuk, &oddelovac, &ukoncit])?;
@@ -203,12 +197,16 @@ pub fn ukaz_okno(app: &AppHandle) -> bool {
     let _ = w.show();
     let _ = w.unminimize();
     crate::okno::do_popredi(&w);
+    // Hook dostane HWND: popředí, živé klávesy (Fáze 6).
+    crate::gamepad::okno_videt(app, true);
     true
 }
 
 /// Schová okno do oznamovací oblasti a uspí webview.
 pub fn schovej(w: &tauri::Window) {
     let _ = w.hide();
+    // Schované okno nic neukazuje ani nepřiřazuje (Fáze 6).
+    crate::gamepad::okno_videt(w.app_handle(), false);
     if let Some(ww) = w.app_handle().get_webview_window(w.label()) {
         uspi_webview(&ww, true);
     }

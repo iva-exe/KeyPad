@@ -1,0 +1,4 @@
+# `bun test`: moduly s runami (*.svelte.ts) přeloží kompilátor Svelte
+# (src/bun-svelte.ts) — testy tak zkoušejí skutečné stavy okna, ne kopii.
+[test]
+preload = ["./src/bun-svelte.ts"]
