@@ -48,6 +48,12 @@ proptest = "1"
 # tabulky stačí na čitelné backtraces v logu.
 debug = "line-tables-only"
 
+# Cizí knihovny bez ladicích informací: v backtrace z logu jde o náš kód
+# a řádky cizích rámců nic neřeknou. Velikost target/ to stáhne nejvíc
+# (windows-rs, tauri), rychlost ani chování to nemění.
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 lto = "thin"
 # panic ZŮSTÁVÁ "unwind" (výchozí) — schválně NE "abort" jako ve WinSentu.

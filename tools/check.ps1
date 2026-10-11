@@ -29,6 +29,12 @@ Set-Location $root
 # se rozsypala. Do okna konzole píše PowerShell Unicode napřímo.
 if ([Console]::IsOutputRedirected) { [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false) }
 
+# Nejdřív strop velikosti target\ (tools\uklid.ps1): cargo do něj jen
+# přidává a bez úklidu narostl až na 18 GB. Na začátku, ne na konci —
+# úklid na konci by smazal, co brány právě postavily.
+$psExe = Join-Path $PSHOME $(if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' })
+& $psExe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tools\uklid.ps1')
+
 $ui = Join-Path $root 'ui'
 
 # -q u clippy a testů: bez něj zaplní obrazovku stovky řádků

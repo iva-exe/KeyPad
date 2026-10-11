@@ -56,6 +56,7 @@ Jen Windows 10/11 x64; macOS/Linux se neřeší. UI i komentáře česky, v duch
 - Aktualizace se v aplikaci nabízí jen **novější** verze (`updater::is_newer`) a jen kopii běžící z instalační složky; `raw` CDN drží `version.txt` až 5 min, takže „jiná" by hned po aktualizaci nabízela tu předchozí.
 - Release profil má `panic = "unwind"` a **musí** ho mít: hook callback (Fáze 3) běží v `catch_unwind`.
 - Nové závislosti přidávej přes `[workspace.dependencies]` v kořenovém `Cargo.toml`.
+- **Složka projektu má zůstat malá** (vlastník 11. 10.: `target\` narostl na 18 GB, disk C: je skoro plný). `target\` hlídá `tools\uklid.ps1` (limit 6 GB; čisté sestavení bran + vydání má 4,6 GB), cizí knihovny se v dev profilu staví bez ladicích informací (`[profile.dev.package."*"] debug = false`). Sondy, mutanty a srovnávací sestavení jen ve scratchpadu a **hned po použití smazat** — žádný další `CARGO_TARGET_DIR` ani kopie repa nesmí zůstat ležet; ve výsledku napsat, co se smazalo.
 - Release build aplikace **jen přes Tauri CLI** (`tools\tauri.ps1 build --no-bundle`). Holý `cargo build` vestaví jen adresu vývojového serveru — nainstalovaná aplikace by ukázala „localhost se odmítl připojit“.
 - PowerShell skripty v `tools\` musí zůstat v **UTF-8 s BOM** (PowerShell 5.1), jinak se rozsype diakritika.
 - **Zkratky KeyPadu nikdy s klávesou Win** (vlastník 30. 9.: Win+L zamyká počítač); potřebuje-li zkratka modifikátor, je to **levý** Alt (jako volba, ROADMAP otázka 47). Win nejde mapovat, přiřadit ani použít jako zkratku (`KeyId::is_reserved`, `MappingError::Reserved`); drží-li Windows Win, každý nový stisk patří Windows (otázka 44; podle událostí Win, nejvýš 5 s od poslední z nich). Zkratka pozastavení (výběr pod ⓘ) jen **F1–F24 kromě F4** (Alt+F4), **Scroll Lock** a **Pause** (`KeyId::is_toggle_candidate`, jinak `NotToggleKey`); ručně zapsaná jiná v `config.json` platí dál s varováním v okně.
@@ -77,6 +78,9 @@ cargo fmt --all
 
 # všechny brány najednou (fmt, clippy, testy, svelte-check, bun test) — před každým vydáním (CI dělá totéž)
 powershell -ExecutionPolicy Bypass -File tools\check.ps1
+
+# úklid target\ nad limitem 6 GB (check.ps1 ho pouští sám na začátku); -Vse = všechno hned
+powershell -ExecutionPolicy Bypass -File tools\uklid.ps1
 
 # frontend
 cd ui; bun install; bun run check; bun test; bun run build   # bun test = testy okna + zlaté soubory smlouvy
